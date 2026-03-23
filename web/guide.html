@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>凯尔希状态机 - 使用指南</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260324">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide" class="active">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/settings">设定管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h2>这是什么</h2>
+      <div class="detail-content">
+凯尔希状态机是一个带时间感知的记忆系统，面向对话场景提供：
+1) 对话开始前的状态推演（get_current_state）
+2) 对话结束后的反思与事件沉淀（reflect_on_conversation）
+3) 对话中的记忆检索（recall_memories / recall_key_records）
+4) 阶段性回顾（periodic_review）
+5) 自动化记忆整理（向量同步、人格演化、冷压缩）
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>主要功能总览</h2>
+      <div class="guide-grid">
+        <div class="list-item" style="cursor:default">
+          <div><span class="tag">仪表盘</span></div>
+          <div class="list-preview">查看最新状态快照、环境信息、自动化执行报告、Token 汇总。</div>
+        </div>
+        <div class="list-item" style="cursor:default">
+          <div><span class="tag">状态历史</span></div>
+          <div class="list-preview">浏览/检索快照，支持勾选导出、批量删除、手动创建快照。</div>
+        </div>
+        <div class="list-item" style="cursor:default">
+          <div><span class="tag">事件历史</span></div>
+          <div class="list-preview">管理事件锚点，支持编辑、分类筛选、归档视图与批量操作。</div>
+        </div>
+        <div class="list-item" style="cursor:default">
+          <div><span class="tag">关键记录</span></div>
+          <div class="list-preview">保存长期可复用信息（日期/物品/协作/医疗建议）并按类型检索。</div>
+        </div>
+        <div class="list-item" style="cursor:default">
+          <div><span class="tag">设定管理</span></div>
+          <div class="list-preview">维护 L1/L2 设定、Prompt 模板、API 覆盖配置与自动化参数。</div>
+        </div>
+        <div class="list-item" style="cursor:default">
+          <div><span class="tag">人格演化 + 向量管理</span></div>
+          <div class="list-preview">执行演化预览/应用，管理向量同步、冷压缩与重建索引。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>记忆结构如何运作</h2>
+      <div class="detail-content">
+分层记忆结构：
+- L1 稳定底层：角色背景、用户背景，长期稳定，不参与自动演化
+- L2 动态层：角色人格、关系动态，可被事件驱动逐步更新
+
+时间线记忆：
+- 状态快照（snapshot）：刻画某一时段的心理与关系状态
+- 事件锚点（event）：可检索的重要事件，带关键词与分类
+- 关键记录（key record）：结构化、可复用的长期事实
+
+向量记忆：
+- 已归档事件、超过阈值天数的快照会进入向量化队列
+- 检索时融合语义相似度、时间衰减、重要性/印象深度
+- 冷记忆压缩会把旧向量摘要合并，降低噪声并节省检索成本
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>快速开始</h2>
+      <div class="detail-content">
+1. 安装依赖
+   pip install -r requirements.txt
+
+2. 配置模型（可先用 config.yaml，后续在“设定管理”覆盖）
+   llm.api_base / llm.api_key / llm.model
+
+3. 启动服务
+   python -m server.main
+
+4. 打开管理界面
+   http://localhost:8000
+
+5. 联调入口
+   - MCP SSE: http://localhost:8000/mcp/sse
+   - REST API: http://localhost:8000/api/
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>如何接入 MCP（推荐顺序）</h2>
+      <div class="detail-content">
+对话开始：
+1) 调用 get_current_state(current_time, last_interaction_time)
+2) 将返回文本注入到角色系统提示，作为当前内心状态
+
+对话进行中：
+1) 遇到“回忆/关联”需求时调用 recall_memories(query, top_k)
+2) 遇到结构化事实需求时优先 recall_key_records
+
+对话结束：
+1) 先调用 summarize_conversation(conversation_text) 生成标准摘要
+2) 再调用 reflect_on_conversation(conversation_summary)
+3) 将新增快照/事件持久化到记忆库
+
+建议：
+- 开启自动化后，get_current_state / reflect_on_conversation 会自动触发向量整理与演化判定
+- 关键记录优先承载“可执行信息”（例如用药、计划、清单、协作规则）
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>常见 Q&A</h2>
+      <div class="detail-content">
+Q1：为什么有时 recall_memories 结果不多？
+A：先检查向量参数与数据量，确认已执行“同步候选向量”；必要时调大 vector_search_top_k。
+
+Q2：为什么某些旧事件在默认列表里看不到？
+A：它们可能已归档。可在事件历史中启用“包含归档”，或在演化页执行“重算归档状态”。
+
+Q3：Prompt 改了不生效？
+A：在设定页点击“保存全部设定”，并确认修改的是对应模板键；运行中的调用会使用数据库最新值。
+
+Q4：如何避免向量库膨胀？
+A：定期执行冷记忆压缩，调好冷记忆阈值、分组大小、每次最大分组数。
+
+Q5：接入方最小可用能力是什么？
+A：至少实现 get_current_state + reflect_on_conversation；有余力再接 recall_memories 与关键记录工具。
+      </div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+
+  <script src="/static/app.js?v=20260324"></script>
+</body>
+</html>

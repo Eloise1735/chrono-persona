@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>凯尔希状态机 - 关键记录</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260324">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records" class="active">关键记录</a>
+    <a href="/settings">设定管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div style="display:flex; gap:12px; margin-bottom:16px; align-items:center; flex-wrap:wrap;">
+      <input
+        type="text"
+        id="key-record-search-input"
+        placeholder="搜索标题/内容/标签…"
+        style="flex:1; min-width:220px;"
+        onkeydown="if(event.key==='Enter')searchKeyRecords()"
+      >
+      <select id="key-record-type-filter" style="max-width:220px;" onchange="loadKeyRecords()">
+        <option value="">全部类型</option>
+        <option value="important_date">关键日期</option>
+        <option value="important_item">关键物品</option>
+        <option value="key_collaboration">关键协作</option>
+        <option value="medical_advice">医疗建议</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:6px;color:var(--text-dim);font-size:13px;">
+        <input type="checkbox" id="key-record-include-archived" onchange="loadKeyRecords()">
+        显示归档记录
+      </label>
+      <button class="btn btn-primary" onclick="searchKeyRecords()">搜索</button>
+      <button class="btn" onclick="openAddKeyRecordModal()">添加关键记录</button>
+    </div>
+
+    <div class="card" style="padding:0">
+      <div id="key-record-list"><div class="loading">加载中…</div></div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+
+  <script src="/static/app.js?v=20260324"></script>
+  <script>initKeyRecordsPage();</script>
+</body>
+</html>

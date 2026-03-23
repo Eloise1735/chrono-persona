@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>凯尔希状态机 - 设定管理</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260324">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/settings" class="active">设定管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="tabs">
+      <div class="tab active" data-tab="persona" onclick="switchSettingsTab('persona')">人格设定</div>
+      <div class="tab" data-tab="prompts" onclick="switchSettingsTab('prompts')">Prompt与参数</div>
+    </div>
+
+    <div id="settings-tab-persona">
+      <div class="card">
+        <h2>L1 稳定底层（不参与自动演化）</h2>
+        <div class="form-group">
+          <label>角色背景事实（L1_character_background）
+            <span class="help-tip" title="角色长期稳定设定，不会被自动演化流程覆盖。" data-tip="角色长期稳定设定，不会被自动演化流程覆盖。用于定义身份、经历、原则等底层事实。">?</span>
+          </label>
+          <textarea id="setting-L1_character_background"></textarea>
+        </div>
+        <div class="form-group">
+          <label>用户背景事实（L1_user_background）
+            <span class="help-tip" title="用户长期稳定设定，不会被自动演化流程覆盖。" data-tip="用户长期稳定设定，不会被自动演化流程覆盖。用于定义用户身份、偏好与关键背景信息。">?</span>
+          </label>
+          <textarea id="setting-L1_user_background"></textarea>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>L2 动态演化（可自动更新）</h2>
+        <div class="form-group">
+          <label>角色人格状态（L2_character_personality）
+            <span class="help-tip" title="角色当前可演化人格层，会在演化流程中被更新。" data-tip="角色当前可演化人格层，会在演化流程中被更新。建议写成可追踪变化的段落，避免与 L1 重复。">?</span>
+          </label>
+          <textarea id="setting-L2_character_personality"></textarea>
+        </div>
+        <div class="form-group">
+          <label>关系动态模式（L2_relationship_dynamics）
+            <span class="help-tip" title="角色与用户关系的动态描述，会随事件演化更新。" data-tip="角色与用户关系的动态描述，会随事件演化更新。用于约束对话中的关系语气与互动倾向。">?</span>
+          </label>
+          <textarea id="setting-L2_relationship_dynamics"></textarea>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="savePersonaSettings()">保存人格设定</button>
+          <button class="btn" onclick="loadSettingsPage()">刷新</button>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="settings-tab-prompts" style="display:none;">
+      <div class="card">
+        <h2>Prompt 模板</h2>
+        <div class="grid-2">
+        <div class="form-group">
+          <div class="label-row">
+            <label>状态快照生成模板
+              <span class="help-tip" title="作用位置：在 get_current_state 里，每个时间检查点用于生成新的状态快照文本。" data-tip="作用位置：在 get_current_state 里，每个时间检查点用于生成新的状态快照文本。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_snapshot_generation')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_snapshot_generation"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>事件锚点生成模板
+              <span class="help-tip" title="作用位置：在 get_current_state 里，状态快照生成后用于判断是否记录事件锚点。" data-tip="作用位置：在 get_current_state 里，状态快照生成后用于判断是否记录事件锚点。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_event_anchor')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_event_anchor"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>对话结束快照模板
+              <span class="help-tip" title="作用位置：在 reflect_on_conversation 中，用对话摘要更新对话后的内心状态快照。" data-tip="作用位置：在 reflect_on_conversation 中，用对话摘要更新对话后的内心状态快照。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_reflect_snapshot')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_reflect_snapshot"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>对话结束事件模板
+              <span class="help-tip" title="作用位置：在 reflect_on_conversation 中，基于对话后快照总结可记录事件。" data-tip="作用位置：在 reflect_on_conversation 中，基于对话后快照总结可记录事件。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_reflect_event')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_reflect_event"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>对话摘要生成模板
+              <span class="help-tip" title="作用位置：在 summarize_conversation 中，将原始对话整理为可用于反思的 conversation_summary。" data-tip="作用位置：在 summarize_conversation 中，将原始对话整理为可用于反思的 conversation_summary。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_conversation_summary')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_conversation_summary"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>阶段性回顾模板
+              <span class="help-tip" title="作用位置：在阶段性回顾功能中，基于选定时间段的快照与事件生成生活/关系发展回顾。" data-tip="作用位置：在阶段性回顾功能中，基于选定时间段的快照与事件生成生活/关系发展回顾。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_periodic_review')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_periodic_review"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>人格演化总结模板
+              <span class="help-tip" title="作用位置：在演化预览中，基于事件评分生成 L2 人格与关系模式的新版本。" data-tip="作用位置：在演化预览中，基于事件评分生成 L2 人格与关系模式的新版本。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_evolution_summary')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_evolution_summary"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>事件评分模板
+              <span class="help-tip" title="作用位置：在演化预览中，先对近期事件打分（重要性/印象深度），再决定更新与归档。" data-tip="作用位置：在演化预览中，先对近期事件打分（重要性/印象深度），再决定更新与归档。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_event_scoring')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_event_scoring"></textarea>
+        </div>
+        <div class="form-group">
+          <div class="label-row">
+            <label>环境信息生成模板
+              <span class="help-tip" title="作用位置：每个时间单位先将该模板发给 LLM 生成环境摘要，再注入 {environment} 供快照和事件锚点使用。" data-tip="作用位置：每个时间单位先将该模板发给 LLM 生成环境摘要，再注入 {environment} 供快照和事件锚点使用。">?</span>
+            </label>
+            <button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_environment_generation')">填入默认示例</button>
+          </div>
+          <textarea id="setting-prompt_environment_generation"></textarea>
+        </div>
+        </div>
+        <div class="card" style="margin-top: 12px;">
+          <details>
+            <summary style="cursor: pointer; font-size: 16px; font-weight: bold; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; outline: none; user-select: none;">占位符使用指南</summary>
+            <div class="detail-content" style="margin-top: 12px;">
+{environment}：当前环境摘要（时间、地点、活动、氛围）<br>
+{previous_snapshot}：上一条状态快照内容<br>
+{recent_events}：指定时间范围内的事件锚点列表<br>
+{memory_context}：记忆检索结果（按相关度与新近度排序）<br>
+{current_snapshot}：当前回合刚生成的状态快照<br>
+{conversation_summary}：本次对话摘要<br>
+{conversation_text}：本次原始对话全文（用于先生成摘要）<br>
+{system_layers}：L1+L2 分层设定文本（稳定底层 + 动态演化）<br>
+{character_personality}：当前 L2 角色人格文本<br>
+{relationship_dynamics}：当前 L2 关系模式文本<br>
+{scored_events}：已评分的事件列表（用于人格演化）<br>
+{events}：原始事件列表（用于事件评分）<br><br>
+{time_range}：阶段性回顾的起止日期范围<br>
+{snapshots_timeline}：阶段内状态快照时间线<br>
+{events_timeline}：阶段内事件时间线<br>
+{stats_summary}：阶段内事件/快照统计摘要<br><br>
+环境模板可用：{time}、{date}、{weekday}、{time_period}、{continuity}、{latest_snapshot}、{previous_env}<br><br>
+建议：不要删除你要使用的占位符；可以调整语气、结构和输出要求。
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>自定义 API 配置（覆盖 config.yaml）</h2>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>LLM API Base（llm_api_base）
+              <span class="help-tip" title="对话模型的 OpenAI 兼容接口地址。" data-tip="对话模型的 OpenAI 兼容接口地址。保存后会优先于 config.yaml 生效。">?</span>
+            </label>
+            <input type="text" id="setting-llm_api_base" placeholder="https://yunwu.ai/v1">
+          </div>
+          <div class="form-group">
+            <label>LLM API Key（llm_api_key）
+              <span class="help-tip" title="对话模型访问密钥。" data-tip="对话模型访问密钥。建议使用独立服务密钥，避免与其他系统共用高权限 Key。">?</span>
+            </label>
+            <input type="text" id="setting-llm_api_key" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>LLM 模型名（llm_model）
+              <span class="help-tip" title="用于状态生成、事件总结、演化等任务的主模型名称。" data-tip="用于状态生成、事件总结、演化等任务的主模型名称。需与 API 提供商可用模型一致。">?</span>
+            </label>
+            <input type="text" id="setting-llm_model" placeholder="gemini-3.1-flash-lite-preview">
+          </div>
+          <div class="form-group">
+            <label>Embedding API Base（vector_embedding_api_base）
+              <span class="help-tip" title="向量化服务接口地址。" data-tip="向量化服务接口地址。若留空或不可用，系统会回退到本地 deterministic embedding。">?</span>
+            </label>
+            <input type="text" id="setting-vector_embedding_api_base" placeholder="https://yunwu.ai/v1">
+          </div>
+          <div class="form-group">
+            <label>Embedding API Key（vector_embedding_api_key）
+              <span class="help-tip" title="向量化服务访问密钥。" data-tip="向量化服务访问密钥。仅用于 embedding 请求，不影响主 LLM 调用。">?</span>
+            </label>
+            <input type="text" id="setting-vector_embedding_api_key" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Embedding 模型名（vector_embedding_model）
+              <span class="help-tip" title="向量化所使用的 embedding 模型名称。" data-tip="向量化所使用的 embedding 模型名称。建议与目标维度和 API 服务能力匹配。">?</span>
+            </label>
+            <input type="text" id="setting-vector_embedding_model" placeholder="text-embedding-3-small">
+          </div>
+        </div>
+        <div class="list-meta">
+          以上配置保存后立即生效，优先级高于 config.yaml；重启服务后仍会保留在数据库设置中。
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>自定义参数</h2>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>最小时间单位（min_time_unit_hours）
+              <span class="help-tip" title="决定跨时间生成状态快照时每个检查点的时间跨度（小时）。值越小，生成的 daily 快照越多。" data-tip="决定跨时间生成状态快照时每个检查点的时间跨度（小时）。值越小，生成的 daily 快照越多。">?</span>
+            </label>
+            <input type="text" id="setting-min_time_unit_hours">
+          </div>
+          <div class="form-group">
+            <label>热记忆条数（inject_hot_events_limit）
+              <span class="help-tip" title="生成可注入上下文时，「近期事件（热记忆）」最多包含几条最新事件（未归档）。便于测试上下文长度与召回。" data-tip="生成可注入上下文时，「近期事件（热记忆）」最多包含几条最新事件（未归档）。便于测试上下文长度与召回。">?</span>
+            </label>
+            <input type="text" id="setting-inject_hot_events_limit" placeholder="3">
+          </div>
+          <div class="form-group">
+            <label>本地回退维度（vector_embedding_dim）
+              <span class="help-tip" title="本地回退 embedding 的向量维度。" data-tip="本地回退 embedding 的向量维度。仅在远端 embedding 不可用时生效，建议保持与历史数据一致。">?</span>
+            </label>
+            <input type="text" id="setting-vector_embedding_dim">
+          </div>
+          <div class="form-group">
+            <label>向量同步批次（vector_sync_batch_size）
+              <span class="help-tip" title="每批向量化处理的条目数量。" data-tip="每批向量化处理的条目数量。值越大吞吐越高，但单次请求耗时和失败重试成本也更高。">?</span>
+            </label>
+            <input type="text" id="setting-vector_sync_batch_size">
+          </div>
+          <div class="form-group">
+            <label>快照向量化阈值天数（vector_snapshot_days_threshold）
+              <span class="help-tip" title="超过该天数的快照才进入向量化队列。" data-tip="超过该天数的快照才进入向量化队列。用于控制近期快照保留在时间线、远期快照转入向量检索。">?</span>
+            </label>
+            <input type="text" id="setting-vector_snapshot_days_threshold">
+          </div>
+          <div class="form-group">
+            <label>向量检索 TopK（vector_search_top_k）
+              <span class="help-tip" title="每次向量检索返回的候选数量上限。" data-tip="每次向量检索返回的候选数量上限。值太小可能漏召回，值太大可能增加噪声与上下文占用。">?</span>
+            </label>
+            <input type="text" id="setting-vector_search_top_k">
+          </div>
+          <div class="form-group">
+            <label>冷记忆阈值天数（vector_cold_days_threshold）
+              <span class="help-tip" title="超过该天数的向量视为冷记忆候选。" data-tip="超过该天数的向量视为冷记忆候选，可参与压缩合并，减少历史噪声。">?</span>
+            </label>
+            <input type="text" id="setting-vector_cold_days_threshold">
+          </div>
+          <div class="form-group">
+            <label>压缩最小分组（vector_compaction_group_size）
+              <span class="help-tip" title="冷压缩时每组至少包含的旧向量条目数。" data-tip="冷压缩时每组至少包含的旧向量条目数。过小会导致摘要碎片化，过大可能错过可压缩机会。">?</span>
+            </label>
+            <input type="text" id="setting-vector_compaction_group_size">
+          </div>
+          <div class="form-group">
+            <label>每次最大压缩分组（vector_compaction_max_groups）
+              <span class="help-tip" title="单次压缩任务最多处理的分组数。" data-tip="单次压缩任务最多处理的分组数。用于限制任务时长，避免一次性改动过大。">?</span>
+            </label>
+            <input type="text" id="setting-vector_compaction_max_groups">
+          </div>
+          <div class="form-group">
+            <label>自动化总开关（automation_enabled）
+              <span class="help-tip" title="控制自动记忆整理流程是否启用。" data-tip="控制自动记忆整理流程是否启用。关闭后 get_current_state / reflect_on_conversation 不再自动触发后处理。">?</span>
+            </label>
+            <input type="text" id="setting-automation_enabled" placeholder="true / false">
+          </div>
+          <div class="form-group">
+            <label>自动向量同步（automation_vector_sync）
+              <span class="help-tip" title="自动流程中是否执行向量同步。" data-tip="自动流程中是否执行向量同步。建议保持开启，确保新事件和老快照及时进入检索池。">?</span>
+            </label>
+            <input type="text" id="setting-automation_vector_sync" placeholder="true / false">
+          </div>
+          <div class="form-group">
+            <label>自动人格演化（automation_auto_evolution）
+              <span class="help-tip" title="自动流程中是否按阈值触发人格演化。" data-tip="自动流程中是否按阈值触发人格演化。开启后会在满足条件时自动应用 L2 更新与归档策略。">?</span>
+            </label>
+            <input type="text" id="setting-automation_auto_evolution" placeholder="true / false">
+          </div>
+          <div class="form-group">
+            <label>自动冷压缩（automation_cold_compaction）
+              <span class="help-tip" title="自动流程中是否执行冷记忆压缩。" data-tip="自动流程中是否执行冷记忆压缩。建议与压缩间隔配合使用，避免频繁重复压缩。">?</span>
+            </label>
+            <input type="text" id="setting-automation_cold_compaction" placeholder="true / false">
+          </div>
+          <div class="form-group">
+            <label>自动冷压缩最小间隔小时（automation_compaction_min_interval_hours）
+              <span class="help-tip" title="两次自动冷压缩之间的最小时间间隔（小时）。" data-tip="两次自动冷压缩之间的最小时间间隔（小时）。可防止在短时间内重复触发压缩任务。">?</span>
+            </label>
+            <input type="text" id="setting-automation_compaction_min_interval_hours">
+          </div>
+        </div>
+        <div class="btn-group" style="margin-top: 12px;">
+          <button class="btn btn-primary" onclick="saveAllSettings()">保存全部设定</button>
+          <button class="btn btn-danger" onclick="resetAllSettings()">恢复全部默认</button>
+          <button class="btn" onclick="loadSettingsPage()">刷新</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>一键批量导入</h2>
+        <div class="list-meta" style="margin-bottom:8px;">
+          支持一次导入：设定（L1/L2/Prompt/参数）、状态快照、事件锚点、关键记录。
+        </div>
+        <div class="form-group">
+          <label>导入 JSON 文件</label>
+          <input type="file" id="bulk-import-file" accept=".json,application/json">
+        </div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="bulk-import-overwrite-settings" checked>
+              覆盖已有设定（settings）
+            </label>
+          </div>
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="bulk-import-upsert-key-records" checked>
+              关键记录按 类型+标题 upsert
+            </label>
+          </div>
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="bulk-import-sync-vectors" checked>
+              导入后自动同步向量
+            </label>
+          </div>
+        </div>
+        <div class="btn-group" style="margin-top: 8px;">
+          <button class="btn btn-primary" onclick="importBulkJson()">开始一键导入</button>
+          <button class="btn" onclick="downloadBulkImportTemplate()">下载导入模板</button>
+        </div>
+        <div id="bulk-import-result" class="detail-content" style="margin-top:10px; max-height:260px;">等待导入</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+
+  <script src="/static/app.js?v=20260325"></script>
+  <script>loadSettingsPage();</script>
+</body>
+</html>

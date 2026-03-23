@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+aiosqlite
+httpx
+mcp[cli]
+pyyaml
+pydantic
+pydantic-settings
