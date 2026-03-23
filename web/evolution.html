@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>凯尔希状态机 - 人格演化</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260324">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/settings">设定管理</a>
+    <a href="/evolution" class="active">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="card" style="margin-bottom: 12px;">
+      <h2>演化参数</h2>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>事件阈值（evolution_event_threshold）
+            <span class="help-tip" title="表示触发人格演化建议所需的新事件数量。达到该数量后，系统会提示你可执行人格演化。" data-tip="表示触发人格演化建议所需的新事件数量。达到该数量后，系统会提示你可执行人格演化。">?</span>
+          </label>
+          <input type="text" id="setting-evolution_event_threshold">
+        </div>
+        <div class="form-group">
+          <label>归档阈值（archive_importance_threshold）
+            <span class="help-tip" title="事件重要性低于该分数时，会在演化应用后被标记为归档，不再参与默认检索。" data-tip="事件重要性低于该分数时，会在演化应用后被标记为归档，不再参与默认检索。">?</span>
+          </label>
+          <input type="text" id="setting-archive_importance_threshold">
+        </div>
+      </div>
+      <div class="btn-group" style="margin-top: 8px;">
+        <button class="btn btn-primary" onclick="saveEvolutionSettings()">保存演化参数</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>演化控制台</h2>
+      <div id="evolution-status" class="detail-content">加载中…</div>
+      <div class="btn-group" style="margin-top:12px;">
+        <button class="btn" onclick="previewEvolution()">预览人格更新</button>
+        <button class="btn btn-primary" onclick="applyEvolution()">确认应用演化</button>
+        <button class="btn" onclick="recalculateArchiveStatus()">重算归档状态</button>
+      </div>
+      <div class="form-group" style="margin-top:12px;">
+        <label>重算日期范围（可选）</label>
+        <div class="btn-group">
+          <input type="date" id="recalc-start-date" style="max-width: 180px;" aria-label="重算起始日期">
+          <input type="date" id="recalc-end-date" style="max-width: 180px;" aria-label="重算结束日期">
+        </div>
+        <div class="list-meta" style="margin-top:6px;">
+          留空表示全量重算；可仅填起始或结束日期，作为开区间范围。
+        </div>
+      </div>
+      <div class="list-meta" style="margin-top:8px;">
+        归档阈值默认只影响“当次演化”；若要让新阈值同步历史事件，请手动点击“重算归档状态”。
+      </div>
+      <div id="evolution-preview" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+
+  <script src="/static/app.js?v=20260324"></script>
+  <script>loadSettingsPage();</script>
+</body>
+</html>

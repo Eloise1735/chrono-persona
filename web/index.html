@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>凯尔希状态机 - 仪表盘</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260324">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/" class="active">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/settings">设定管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="btn-group" style="margin-bottom: 16px;">
+      <button class="btn btn-primary" onclick="openTestPanel()">测试状态机</button>
+      <button class="btn" onclick="openPeriodicReviewPanel()">阶段性回顾</button>
+      <button class="btn" onclick="triggerSnapshot()">手动创建快照</button>
+      <button class="btn" onclick="openAddEventModal()">添加事件锚点</button>
+    </div>
+
+    <div class="card">
+      <h2>当前状态快照</h2>
+      <div id="latest-snapshot">
+        <div class="loading">加载中…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>环境信息</h2>
+      <div id="env-info">
+        <div class="empty">暂无环境信息</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>自动化记忆整理</h2>
+      <div class="tabs" id="automation-tabs" style="margin-bottom:12px;">
+        <div class="tab active" data-tab="latest" onclick="switchAutomationTab('latest')">最近一次执行</div>
+        <div class="tab" data-tab="history" onclick="switchAutomationTab('history')">历史记录</div>
+      </div>
+      <div id="automation-latest-panel">
+        <div id="automation-latest"><div class="loading">加载中…</div></div>
+      </div>
+      <div id="automation-history-panel" style="display:none;">
+        <div class="btn-group" style="margin-bottom:8px;">
+          <button class="btn" onclick="loadAutomationHistory()">刷新历史</button>
+        </div>
+        <div id="automation-history"><div class="loading">加载中…</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <details id="token-summary-details">
+        <summary style="cursor:pointer; font-size:16px; font-weight:bold; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px;">
+          Token 汇总
+        </summary>
+        <div id="token-summary" style="margin-top:12px;">
+          <div class="loading">加载中…</div>
+        </div>
+        <div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">
+          <div class="list-meta" style="margin-bottom:8px;">模型费用配置（USD / 1M tokens）</div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label>模型名</label>
+              <input id="pricing-model" type="text" placeholder="如: gpt-4o-mini">
+            </div>
+            <div class="form-group">
+              <label>输入价格（prompt）</label>
+              <input id="pricing-prompt" type="number" step="0.0001" min="0" placeholder="0.1500">
+            </div>
+            <div class="form-group">
+              <label>输出价格（completion）</label>
+              <input id="pricing-completion" type="number" step="0.0001" min="0" placeholder="0.6000">
+            </div>
+          </div>
+          <div class="btn-group" style="margin-top:8px;">
+            <button class="btn btn-primary" onclick="saveModelPricingFromDashboard()">保存/更新</button>
+            <button class="btn" onclick="loadModelPricingForDashboard()">刷新配置</button>
+          </div>
+          <div id="token-pricing-list" style="margin-top:8px;">
+            <div class="loading">加载中…</div>
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+
+  <script src="/static/app.js?v=20260324"></script>
+  <script>initDashboardPage();</script>
+</body>
+</html>
