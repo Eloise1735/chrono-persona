@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 关键记录</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260324">
+  <link rel="stylesheet" href="/static/style.css?v=20260325">
 </head>
 <body>
   <nav>
@@ -20,27 +20,26 @@
   </nav>
 
   <div class="container">
-    <div style="display:flex; gap:12px; margin-bottom:16px; align-items:center; flex-wrap:wrap;">
+    <div class="search-bar">
       <input
         type="text"
         id="key-record-search-input"
-        placeholder="搜索标题/内容/标签…"
-        style="flex:1; min-width:220px;"
+        placeholder="搜索标题 / 内容 / 标签…"
         onkeydown="if(event.key==='Enter')searchKeyRecords()"
       >
-      <select id="key-record-type-filter" style="max-width:220px;" onchange="loadKeyRecords()">
+      <select id="key-record-type-filter" style="max-width:180px;" onchange="loadKeyRecords()">
         <option value="">全部类型</option>
         <option value="important_date">关键日期</option>
         <option value="important_item">关键物品</option>
         <option value="key_collaboration">关键协作</option>
         <option value="medical_advice">医疗建议</option>
       </select>
-      <label style="display:flex;align-items:center;gap:6px;color:var(--text-dim);font-size:13px;">
-        <input type="checkbox" id="key-record-include-archived" onchange="loadKeyRecords()">
-        显示归档记录
-      </label>
       <button class="btn btn-primary" onclick="searchKeyRecords()">搜索</button>
-      <button class="btn" onclick="openAddKeyRecordModal()">添加关键记录</button>
+      <button class="btn" onclick="openAddKeyRecordModal()">添加记录</button>
+      <label class="checkbox-label">
+        <input type="checkbox" id="key-record-include-archived" onchange="loadKeyRecords()">
+        显示归档
+      </label>
     </div>
 
     <div class="card" style="padding:0">
@@ -50,7 +49,7 @@
 
   <div class="status-bar" id="status-bar">就绪</div>
 
-  <script src="/static/app.js?v=20260324"></script>
+  <script src="/static/app.js?v=20260325"></script>
   <script>initKeyRecordsPage();</script>
 </body>
 </html>

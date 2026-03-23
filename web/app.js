@@ -1822,7 +1822,15 @@ let currentSettingsTab = 'persona';
 
 function setInputValue(id, value) {
   const el = document.getElementById(id);
-  if (el) el.value = value || '';
+  if (!el) return;
+  if (el.tagName === 'SELECT') {
+    const strVal = String(value || '').toLowerCase();
+    const opt = Array.from(el.options).find(o => o.value === strVal);
+    if (opt) el.value = strVal;
+    else if (value !== undefined && value !== null && value !== '') el.value = value;
+  } else {
+    el.value = value || '';
+  }
 }
 
 async function loadSettingsPage() {
@@ -2020,8 +2028,10 @@ function switchSettingsTab(tab) {
   $$('.tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
   const persona = document.getElementById('settings-tab-persona');
   const prompts = document.getElementById('settings-tab-prompts');
+  const importTab = document.getElementById('settings-tab-import');
   if (persona) persona.style.display = tab === 'persona' ? 'block' : 'none';
   if (prompts) prompts.style.display = tab === 'prompts' ? 'block' : 'none';
+  if (importTab) importTab.style.display = tab === 'import' ? 'block' : 'none';
 }
 
 async function loadEvolutionStatus() {

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 向量管理</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260324">
+  <link rel="stylesheet" href="/static/style.css?v=20260325">
 </head>
 <body>
   <nav>
@@ -23,86 +23,96 @@
     <div class="card">
       <h2>向量库统计</h2>
       <div id="vector-stats"><div class="loading">加载中…</div></div>
-      <div class="btn-group" style="margin-top:12px;">
-        <button class="btn" onclick="loadVectorStats()">刷新统计</button>
-        <button class="btn btn-primary" onclick="runVectorSync(false)">同步候选向量</button>
-        <button class="btn" onclick="runVectorCompaction(true)">压缩预览</button>
-        <button class="btn btn-primary" onclick="runVectorCompaction(false)">执行冷记忆压缩</button>
-        <button class="btn btn-danger" onclick="runVectorSync(true)">全量重建索引</button>
+      <div class="card-section">
+        <div class="btn-group">
+          <button class="btn" onclick="loadVectorStats()">刷新统计</button>
+          <button class="btn btn-primary" onclick="runVectorSync(false)">同步候选向量</button>
+          <button class="btn" onclick="runVectorCompaction(true)">压缩预览</button>
+          <button class="btn btn-primary" onclick="runVectorCompaction(false)">执行冷记忆压缩</button>
+          <button class="btn btn-danger" onclick="runVectorSync(true)">全量重建索引</button>
+        </div>
       </div>
     </div>
 
     <div class="card">
       <h2>向量化参数</h2>
-      <div class="grid-2">
-        <div class="form-group">
-          <label>Embedding API Base
-            <span class="help-tip" title="向量化服务的 API 地址。" data-tip="向量化服务的 API 地址。为空或不可用时会回退到本地 deterministic embedding。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_embedding_api_base" placeholder="https://api.openai.com/v1">
-        </div>
-        <div class="form-group">
-          <label>Embedding API Key
-            <span class="help-tip" title="向量化服务访问密钥。" data-tip="向量化服务访问密钥，仅用于 embedding 请求。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_embedding_api_key" placeholder="sk-...">
-        </div>
-        <div class="form-group">
-          <label>Embedding 模型名
-            <span class="help-tip" title="用于文本向量化的模型名称。" data-tip="用于文本向量化的模型名称。需与提供商可用模型一致。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_embedding_model" placeholder="text-embedding-3-small">
-        </div>
-        <div class="form-group">
-          <label>本地回退维度
-            <span class="help-tip" title="本地回退 embedding 的向量维度。" data-tip="本地回退 embedding 的向量维度。建议保持固定，避免不同维度混用。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_embedding_dim" placeholder="256">
-        </div>
-        <div class="form-group">
-          <label>Embedding 超时（秒）
-            <span class="help-tip" title="单次 embedding 请求的超时时间。" data-tip="单次 embedding 请求的超时时间（秒）。过短容易失败，过长会拖慢批处理。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_embedding_timeout_sec" placeholder="15">
-        </div>
-        <div class="form-group">
-          <label>每批向量化数量
-            <span class="help-tip" title="每次同步任务中单批处理条目数。" data-tip="每次同步任务中单批处理条目数。可在吞吐与稳定性间权衡。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_sync_batch_size" placeholder="200">
-        </div>
-        <div class="form-group">
-          <label>快照向量化阈值（天）
-            <span class="help-tip" title="超过该天数的快照会进入向量化候选。" data-tip="超过该天数的快照会进入向量化候选，较新的快照优先保留在时间线语境。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_snapshot_days_threshold" placeholder="14">
-        </div>
-        <div class="form-group">
-          <label>默认检索 TopK
-            <span class="help-tip" title="向量检索默认返回数量。" data-tip="向量检索默认返回数量。数值越大召回更全，但可能引入更多低相关内容。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_search_top_k" placeholder="5">
-        </div>
-        <div class="form-group">
-          <label>冷记忆阈值（天）
-            <span class="help-tip" title="超过该天数的向量会成为冷压缩候选。" data-tip="超过该天数的向量会成为冷压缩候选，用于历史记忆降噪与收敛。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_cold_days_threshold" placeholder="180">
-        </div>
-        <div class="form-group">
-          <label>压缩最小分组数
-            <span class="help-tip" title="每个压缩分组最少包含的旧向量数量。" data-tip="每个压缩分组最少包含的旧向量数量。组太小会导致摘要过碎。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_compaction_group_size" placeholder="8">
-        </div>
-        <div class="form-group">
-          <label>每次最大压缩分组
-            <span class="help-tip" title="单次压缩任务最多处理的分组上限。" data-tip="单次压缩任务最多处理的分组上限。用于限制一次任务规模与执行时长。">?</span>
-          </label>
-          <input type="text" id="vector-setting-vector_compaction_max_groups" placeholder="20">
+      <div class="field-group">
+        <div class="field-group-title">API 连接</div>
+        <div class="grid-3">
+          <div class="form-group">
+            <label>Embedding API Base
+              <span class="help-tip" data-tip="向量化服务的 API 地址。为空或不可用时会回退到本地 deterministic embedding。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_embedding_api_base" placeholder="https://api.openai.com/v1">
+          </div>
+          <div class="form-group">
+            <label>Embedding API Key
+              <span class="help-tip" data-tip="向量化服务访问密钥，仅用于 embedding 请求。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_embedding_api_key" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Embedding 模型名
+              <span class="help-tip" data-tip="用于文本向量化的模型名称。需与提供商可用模型一致。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_embedding_model" placeholder="text-embedding-3-small">
+          </div>
         </div>
       </div>
-      <div class="btn-group" style="margin-top: 12px;">
+      <div class="field-group">
+        <div class="field-group-title">运行配置</div>
+        <div class="grid-3">
+          <div class="form-group">
+            <label>本地回退维度
+              <span class="help-tip" data-tip="本地回退 embedding 的向量维度。建议保持固定，避免不同维度混用。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_embedding_dim" placeholder="256">
+          </div>
+          <div class="form-group">
+            <label>超时时间（秒）
+              <span class="help-tip" data-tip="单次 embedding 请求的超时时间（秒）。过短容易失败，过长会拖慢批处理。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_embedding_timeout_sec" placeholder="15">
+          </div>
+          <div class="form-group">
+            <label>每批向量化数量
+              <span class="help-tip" data-tip="每次同步任务中单批处理条目数。可在吞吐与稳定性间权衡。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_sync_batch_size" placeholder="200">
+          </div>
+          <div class="form-group">
+            <label>快照向量化阈值（天）
+              <span class="help-tip" data-tip="超过该天数的快照会进入向量化候选，较新的快照优先保留在时间线语境。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_snapshot_days_threshold" placeholder="14">
+          </div>
+          <div class="form-group">
+            <label>默认检索 TopK
+              <span class="help-tip" data-tip="向量检索默认返回数量。数值越大召回更全，但可能引入更多低相关内容。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_search_top_k" placeholder="5">
+          </div>
+          <div class="form-group">
+            <label>冷记忆阈值（天）
+              <span class="help-tip" data-tip="超过该天数的向量会成为冷压缩候选，用于历史记忆降噪与收敛。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_cold_days_threshold" placeholder="180">
+          </div>
+          <div class="form-group">
+            <label>压缩最小分组数
+              <span class="help-tip" data-tip="每个压缩分组最少包含的旧向量数量。组太小会导致摘要过碎。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_compaction_group_size" placeholder="8">
+          </div>
+          <div class="form-group">
+            <label>每次最大压缩分组
+              <span class="help-tip" data-tip="单次压缩任务最多处理的分组上限。用于限制一次任务规模与执行时长。">?</span>
+            </label>
+            <input type="text" id="vector-setting-vector_compaction_max_groups" placeholder="20">
+          </div>
+        </div>
+      </div>
+      <div class="btn-group" style="margin-top: 4px;">
         <button class="btn btn-primary" onclick="saveVectorSettings()">保存向量参数</button>
         <button class="btn" onclick="loadVectorSettings()">刷新参数</button>
       </div>
@@ -111,13 +121,13 @@
     <div class="card" style="padding:0">
       <div style="padding:16px 16px 0 16px;">
         <h2>向量条目</h2>
-        <div class="btn-group" style="margin-bottom:12px;">
-          <select id="vector-filter-source-type" onchange="loadVectorEntries()" style="max-width:180px;">
+        <div class="btn-group" style="margin-bottom:14px;">
+          <select id="vector-filter-source-type" onchange="loadVectorEntries()" style="max-width:160px;">
             <option value="">全部来源</option>
             <option value="event">事件</option>
             <option value="snapshot">快照</option>
           </select>
-          <select id="vector-filter-status" onchange="loadVectorEntries()" style="max-width:180px;">
+          <select id="vector-filter-status" onchange="loadVectorEntries()" style="max-width:160px;">
             <option value="active">active</option>
             <option value="deleted">deleted</option>
             <option value="">全部状态</option>
@@ -131,7 +141,7 @@
 
   <div class="status-bar" id="status-bar">就绪</div>
 
-  <script src="/static/app.js?v=20260324"></script>
+  <script src="/static/app.js?v=20260325"></script>
   <script>initVectorsPage();</script>
 </body>
 </html>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 事件历史</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260324">
+  <link rel="stylesheet" href="/static/style.css?v=20260325">
 </head>
 <body>
   <nav>
@@ -20,35 +20,35 @@
   </nav>
 
   <div class="container">
-    <div style="display:flex; gap:12px; margin-bottom:16px; align-items:center; flex-wrap:wrap;">
-      <input type="text" id="search-input" placeholder="搜索标题/关键词/内容…"
-             style="flex:1; min-width:220px;" onkeydown="if(event.key==='Enter')runSearch()">
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="搜索标题 / 关键词 / 内容…"
+             onkeydown="if(event.key==='Enter')runSearch()">
       <button class="btn btn-primary" onclick="runSearch()">搜索</button>
       <button class="btn" onclick="openAddEventModal()">添加事件</button>
-      <label style="display:flex;align-items:center;gap:6px;color:var(--text-dim);font-size:13px;">
+      <label class="checkbox-label">
         <input type="checkbox" id="toggle-archived" onchange="toggleArchivedEvents()">
-        显示已归档事件
+        显示已归档
       </label>
     </div>
 
     <div class="events-layout">
       <aside class="events-sidebar card">
         <h2>分类筛选</h2>
-        <div class="list-meta" style="margin-bottom:8px;">未勾选任何分类时，默认浏览全部事件。</div>
+        <div class="list-meta" style="margin-bottom:10px;">未勾选时显示全部事件。</div>
         <div id="event-category-filter" class="category-filter-list"></div>
-        <div class="btn-group" style="margin-top:10px;">
-          <button class="btn" onclick="clearEventCategoryFilter()">清空筛选（全部）</button>
+        <div style="margin-top:10px;">
+          <button class="btn" style="width:100%;" onclick="clearEventCategoryFilter()">清空筛选</button>
         </div>
       </aside>
 
       <section class="events-main">
-        <div class="card" style="margin-bottom:16px;">
+        <div class="card" style="margin-bottom:14px;">
           <div class="btn-group">
             <button class="btn" id="toggle-manage-btn" onclick="toggleHistoryManageMode()">开启选择管理</button>
-            <button class="btn" onclick="selectAllHistoryItems()">全选当前列表</button>
+            <button class="btn" onclick="selectAllHistoryItems()">全选</button>
             <button class="btn" onclick="clearHistorySelection()">清空选择</button>
             <button class="btn btn-danger" onclick="deleteSelectedHistoryItems()">删除勾选</button>
-            <select id="history-export-format" style="max-width:120px;">
+            <select id="history-export-format" style="max-width:100px;">
               <option value="txt">TXT</option>
               <option value="md">MD</option>
               <option value="json">JSON</option>
@@ -67,7 +67,7 @@
 
   <div class="status-bar" id="status-bar">就绪</div>
 
-  <script src="/static/app.js?v=20260324"></script>
+  <script src="/static/app.js?v=20260325"></script>
   <script>initEventsHistoryPage();</script>
 </body>
 </html>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 状态历史</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260324">
+  <link rel="stylesheet" href="/static/style.css?v=20260325">
 </head>
 <body>
   <nav>
@@ -20,20 +20,20 @@
   </nav>
 
   <div class="container">
-    <div style="display:flex; gap:12px; margin-bottom:16px; align-items:center;">
+    <div class="search-bar">
       <input type="text" id="search-input" placeholder="搜索快照内容…"
-             style="flex:1" onkeydown="if(event.key==='Enter')runSearch()">
+             onkeydown="if(event.key==='Enter')runSearch()">
       <button class="btn btn-primary" onclick="runSearch()">搜索</button>
       <button class="btn" onclick="triggerSnapshot()">手动创建快照</button>
     </div>
 
-    <div class="card" style="margin-bottom:16px;">
+    <div class="card" style="margin-bottom:14px;">
       <div class="btn-group">
         <button class="btn" id="toggle-manage-btn" onclick="toggleHistoryManageMode()">开启选择管理</button>
-        <button class="btn" onclick="selectAllHistoryItems()">全选当前列表</button>
+        <button class="btn" onclick="selectAllHistoryItems()">全选</button>
         <button class="btn" onclick="clearHistorySelection()">清空选择</button>
         <button class="btn btn-danger" onclick="deleteSelectedHistoryItems()">删除勾选</button>
-        <select id="history-export-format" style="max-width:120px;">
+        <select id="history-export-format" style="max-width:100px;">
           <option value="txt">TXT</option>
           <option value="md">MD</option>
           <option value="json">JSON</option>
@@ -50,7 +50,7 @@
 
   <div class="status-bar" id="status-bar">就绪</div>
 
-  <script src="/static/app.js?v=20260324"></script>
+  <script src="/static/app.js?v=20260325"></script>
   <script>initSnapshotsHistoryPage();</script>
 </body>
 </html>
