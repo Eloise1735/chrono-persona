@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -341,6 +342,21 @@ class Database:
             rows = await cur.fetchall()
             return [EventAnchor(**dict(r)) for r in rows]
 
+    async def get_recent_events_by_event_time(
+        self,
+        limit: int = 50,
+        include_archived: bool = False,
+    ) -> list[EventAnchor]:
+        sql = "SELECT * FROM event_anchors WHERE 1=1"
+        params: list = []
+        if not include_archived:
+            sql += " AND archived = 0"
+        sql += " ORDER BY date DESC, created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [EventAnchor(**dict(r)) for r in rows]
+
     async def get_event_by_id(self, event_id: int) -> EventAnchor | None:
         async with self.conn.execute(
             "SELECT * FROM event_anchors WHERE id = ?", (event_id,)
@@ -371,6 +387,22 @@ class Database:
             (event_id,),
         )
         await self.conn.commit()
+
+    async def get_events_without_vector(
+        self,
+        limit: int = 200,
+        include_archived: bool = True,
+    ) -> list[EventAnchor]:
+        sql = """SELECT * FROM event_anchors
+                 WHERE embedding_vector_id IS NULL"""
+        params: list = []
+        if not include_archived:
+            sql += " AND archived = 0"
+        sql += " ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [EventAnchor(**dict(r)) for r in rows]
 
     async def get_archived_events_without_vector(self, limit: int = 200) -> list[EventAnchor]:
         async with self.conn.execute(
@@ -660,10 +692,21 @@ class Database:
         record_type: str | None = None,
         include_archived: bool = False,
     ) -> list[KeyRecord]:
-        pattern = f"%{query}%"
-        sql = """SELECT * FROM key_records
-                 WHERE (title LIKE ? OR content_text LIKE ? OR tags LIKE ? OR content_json LIKE ?)"""
-        params: list = [pattern, pattern, pattern, pattern]
+        raw_query = (query or "").strip()
+        if not raw_query:
+            return []
+        keywords = [k.strip() for k in re.split(r"[\s,，。;；、|/]+", raw_query) if k.strip()]
+        if not keywords:
+            keywords = [raw_query]
+        conditions = []
+        params: list = []
+        for kw in keywords:
+            pattern = f"%{kw}%"
+            conditions.append("(title LIKE ? OR content_text LIKE ? OR tags LIKE ? OR content_json LIKE ?)")
+            params.extend([pattern, pattern, pattern, pattern])
+        where = " OR ".join(conditions)
+        sql = f"""SELECT * FROM key_records
+                 WHERE ({where})"""
         if record_type:
             sql += " AND type = ?"
             params.append(record_type)

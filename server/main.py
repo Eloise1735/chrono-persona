@@ -10,6 +10,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from starlette.requests import Request
 
 from server.config import load_config
 from server.database import Database
@@ -75,8 +76,11 @@ async def lifespan(app: FastAPI):
         llm_client=llm,
     )
 
-    logger.info("State machine ready. MCP tools registered.")
-    yield
+    # streamable_http_app() is mounted below; its Starlette lifespan is not run when nested
+    # under FastAPI, so we must start the session manager here or Streamable HTTP returns 500.
+    async with mcp.session_manager.run():
+        logger.info("State machine ready. MCP tools registered.")
+        yield
 
     await llm.close()
     await db.close()
@@ -84,6 +88,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Kelsey State Machine", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def normalize_mcp_streamable_http_path(request: Request, call_next):
+    """RikkaHub / FastMCP path quirks: avoid 307 on /mcp-http and 404 on /mcp-http/."""
+    if request.scope["type"] == "http":
+        path = request.scope["path"]
+        if path in ("/mcp-http", "/mcp-http/"):
+            request.scope["path"] = "/mcp-http/mcp"
+        elif path == "/mcp-http/mcp/":
+            request.scope["path"] = "/mcp-http/mcp"
+    return await call_next(request)
+
 
 app.include_router(api_router)
 

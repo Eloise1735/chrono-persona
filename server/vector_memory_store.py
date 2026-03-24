@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from datetime import datetime
 
 import httpx
@@ -67,40 +68,45 @@ class VectorMemoryStore(MemoryStore):
         cfg = await self.get_runtime_config()
         actual_top_k = max(1, int(top_k or cfg["search_top_k"]))
         qvec, _provider = await self._embed_text(query, cfg)
-        if not qvec:
-            return []
+        qvec = self._normalize_vector(qvec)
 
-        rows = await self._db.get_active_memory_vectors(limit=5000)
-        if not rows:
-            return []
-
-        now = datetime.utcnow()
         scored: list[tuple[float, dict]] = []
-        event_cache: dict[int, object] = {}
-        snapshot_cache: dict[int, object] = {}
-        for row in rows:
-            vec = self._loads_vector(row.get("vector_json"))
-            if len(vec) != len(qvec):
-                continue
-            cosine = self._cosine_similarity(qvec, vec)
-            if cosine <= 0:
-                continue
-            recency = self._recency_boost(row.get("updated_at"), now)
-            importance = await self._importance_boost(
-                row=row,
-                event_cache=event_cache,
-                snapshot_cache=snapshot_cache,
-            )
-            final_score = 0.72 * cosine + 0.18 * recency + 0.10 * importance
-            scored.append((final_score, row))
+        if qvec:
+            rows = await self._db.get_active_memory_vectors(limit=5000)
+            now = datetime.utcnow()
+            event_cache: dict[int, object] = {}
+            snapshot_cache: dict[int, object] = {}
+            for row in rows:
+                vec = self._normalize_vector(self._loads_vector(row.get("vector_json")))
+                if len(vec) != len(qvec):
+                    continue
+                cosine = self._cosine_similarity(qvec, vec)
+                if cosine <= 0:
+                    continue
+                recency = self._recency_boost(row.get("updated_at"), now)
+                importance = await self._importance_boost(
+                    row=row,
+                    event_cache=event_cache,
+                    snapshot_cache=snapshot_cache,
+                )
+                final_score = 0.72 * cosine + 0.18 * recency + 0.10 * importance
+                scored.append((final_score, row))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+            scored.sort(key=lambda x: x[0], reverse=True)
         selected = scored[:actual_top_k]
         result: list[MemoryEntry] = []
         for score, row in selected:
             entry = await self._entry_from_vector_row(row, score)
             if entry:
                 result.append(entry)
+
+        if len(result) < actual_top_k:
+            extras = await self._keyword_fallback_entries(
+                query=query,
+                limit=actual_top_k - len(result),
+                excluded_ids={entry.id for entry in result},
+            )
+            result.extend(extras)
 
         await self._db.record_memory_recalls([e.id for e in result])
         return result
@@ -152,22 +158,19 @@ class VectorMemoryStore(MemoryStore):
         batch_size = max(1, cfg["sync_batch_size"])
         snapshot_days = max(1, cfg["snapshot_days_threshold"])
 
-        archived_events = await self._db.get_archived_events_without_vector(limit=batch_size)
+        pending_events = await self._db.get_events_without_vector(
+            limit=batch_size,
+            include_archived=True,
+        )
         old_snapshots = await self._db.get_snapshots_older_than_days_without_vector(
             days=snapshot_days,
             limit=batch_size,
         )
         event_count = 0
         snapshot_count = 0
-        for ev in archived_events:
-            entry_id = f"event_{ev.id}"
-            await self.store(
-                entry_id,
-                ev.description,
-                {"source_type": "event", "source_id": ev.id, "date": ev.date},
-            )
-            await self._db.mark_event_vectorized(int(ev.id), entry_id)
-            event_count += 1
+        for ev in pending_events:
+            if await self.upsert_event_vector(int(ev.id or 0)):
+                event_count += 1
         for snap in old_snapshots:
             entry_id = f"snapshot_{snap.id}"
             await self.store(
@@ -188,6 +191,26 @@ class VectorMemoryStore(MemoryStore):
             "batch_size": batch_size,
             "snapshot_days_threshold": snapshot_days,
         }
+
+    async def upsert_event_vector(self, event_id: int) -> bool:
+        if event_id <= 0:
+            return False
+        event = await self._db.get_event_by_id(event_id)
+        if not event:
+            return False
+        entry_id = f"event_{event_id}"
+        vector_text = self._build_event_vector_text(event)
+        await self.store(
+            entry_id,
+            vector_text,
+            {
+                "source_type": "event",
+                "source_id": event_id,
+                "date": event.date,
+            },
+        )
+        await self._db.mark_event_vectorized(event_id, entry_id)
+        return True
 
     async def get_vector_stats(self) -> dict:
         total = await self._db.count_memory_vectors()
@@ -317,7 +340,7 @@ class VectorMemoryStore(MemoryStore):
                 if data and isinstance(data, list):
                     emb = data[0].get("embedding")
                     if isinstance(emb, list) and emb:
-                        return [float(x) for x in emb], "api"
+                        return self._normalize_vector([float(x) for x in emb]), "api"
             except Exception:
                 pass
         return self._local_embedding(text, dim), "local"
@@ -325,16 +348,43 @@ class VectorMemoryStore(MemoryStore):
     @staticmethod
     def _local_embedding(text: str, dim: int) -> list[float]:
         buckets = [0.0] * dim
-        tokens = [t for t in text.lower().strip().split() if t]
+        tokens = VectorMemoryStore._tokenize_local_text(text)
         if not tokens:
-            return buckets
+            return []
         for token in tokens:
             digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
             idx = int(digest[:8], 16) % dim
             sign = -1.0 if int(digest[8:10], 16) % 2 else 1.0
             buckets[idx] += sign
-        norm = math.sqrt(sum(v * v for v in buckets)) or 1.0
-        return [v / norm for v in buckets]
+        return VectorMemoryStore._normalize_vector(buckets)
+
+    @staticmethod
+    def _normalize_vector(vec: list[float]) -> list[float]:
+        if not vec:
+            return []
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm <= 0:
+            return []
+        return [float(v) / norm for v in vec]
+
+    @staticmethod
+    def _tokenize_local_text(text: str) -> list[str]:
+        raw = (text or "").lower().strip()
+        if not raw:
+            return []
+        chunks = re.findall(r"[\u4e00-\u9fff]+|[a-z0-9_]+", raw)
+        tokens: list[str] = []
+        for chunk in chunks:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", chunk):
+                # Keep original chunk and add short n-grams to improve CJK recall.
+                tokens.append(chunk)
+                if len(chunk) >= 2:
+                    tokens.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
+                if len(chunk) >= 3:
+                    tokens.extend(chunk[i : i + 3] for i in range(len(chunk) - 2))
+            else:
+                tokens.append(chunk)
+        return tokens
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -458,6 +508,181 @@ class VectorMemoryStore(MemoryStore):
         if source_type == "summary":
             return 0.68
         return 0.45
+
+    @staticmethod
+    def _build_event_vector_text(event: object) -> str:
+        title = str(getattr(event, "title", "") or "").strip()
+        description = str(getattr(event, "description", "") or "").strip()
+        keywords = VectorMemoryStore._parse_json_list(getattr(event, "trigger_keywords", "[]"))
+        categories = VectorMemoryStore._parse_json_list(getattr(event, "categories", "[]"))
+        parts = [description]
+        if title:
+            parts.append(f"title: {title}")
+        if keywords:
+            parts.append("keywords: " + ", ".join(keywords))
+        if categories:
+            parts.append("categories: " + ", ".join(categories))
+        return "\n".join([p for p in parts if p])
+
+    async def _keyword_fallback_entries(
+        self,
+        query: str,
+        limit: int,
+        excluded_ids: set[str],
+    ) -> list[MemoryEntry]:
+        if limit <= 0:
+            return []
+        keywords = self._extract_keywords(query)
+        if not keywords:
+            return []
+
+        candidate_limit = max(limit * 6, 30)
+        now = datetime.utcnow()
+        entries: list[MemoryEntry] = []
+
+        events = await self._db.search_events_by_keywords(
+            keywords,
+            limit=candidate_limit,
+            include_archived=False,
+        )
+        for ev in events:
+            source_id = int(ev.id or 0)
+            if source_id <= 0:
+                continue
+            entry_id = f"event_{source_id}"
+            if entry_id in excluded_ids:
+                continue
+            kw_list = self._parse_json_list(ev.trigger_keywords)
+            categories = self._parse_json_list(ev.categories)
+            relevance = self._keyword_relevance(
+                query_keywords=keywords,
+                text_parts=[str(ev.title or ""), str(ev.description or "")],
+                trigger_keywords=kw_list,
+            )
+            if relevance <= 0:
+                continue
+            recency = self._recency_boost(ev.date or ev.created_at, now)
+            importance = self._event_importance(ev)
+            final_score = 0.72 * relevance + 0.18 * recency + 0.10 * importance
+            entries.append(
+                MemoryEntry(
+                    id=entry_id,
+                    text=str(ev.description or ""),
+                    source_type="event",
+                    source_id=source_id,
+                    metadata={
+                        "date": ev.date,
+                        "source": ev.source,
+                        "title": ev.title,
+                        "categories": categories,
+                        "keywords": kw_list,
+                        "score": round(final_score, 4),
+                        "retrieval_mode": "keyword_fallback",
+                    },
+                    score=final_score,
+                )
+            )
+
+        snapshots = await self._db.search_snapshots_by_keywords(keywords, limit=candidate_limit)
+        for snap in snapshots:
+            source_id = int(snap.id or 0)
+            if source_id <= 0:
+                continue
+            entry_id = f"snapshot_{source_id}"
+            if entry_id in excluded_ids:
+                continue
+            relevance = self._keyword_relevance(
+                query_keywords=keywords,
+                text_parts=[str(snap.content or "")],
+                trigger_keywords=[],
+            )
+            if relevance <= 0:
+                continue
+            recency = self._recency_boost(snap.created_at, now)
+            final_score = 0.82 * relevance + 0.18 * recency
+            entries.append(
+                MemoryEntry(
+                    id=entry_id,
+                    text=str(snap.content or ""),
+                    source_type="snapshot",
+                    source_id=source_id,
+                    metadata={
+                        "created_at": snap.created_at,
+                        "type": snap.type,
+                        "score": round(final_score, 4),
+                        "retrieval_mode": "keyword_fallback",
+                    },
+                    score=final_score,
+                )
+            )
+
+        entries.sort(key=lambda item: item.score, reverse=True)
+        if len(entries) <= limit:
+            return entries
+        return entries[:limit]
+
+    @staticmethod
+    def _extract_keywords(query: str) -> list[str]:
+        raw = (query or "").strip()
+        if not raw:
+            return []
+        base_tokens = [
+            t.strip()
+            for t in re.split(r"[\s,\uFF0C\u3002;\uFF1B\u3001/|]+", raw)
+            if t and t.strip()
+        ]
+        expanded: list[str] = []
+        for token in base_tokens:
+            expanded.append(token)
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                # Support loose Chinese phrase matching, e.g. "博士的日常" -> "博士".
+                parts = [p.strip() for p in token.split("的") if p.strip()]
+                for part in parts:
+                    if len(part) >= 2:
+                        expanded.append(part)
+        # Keep order while deduplicating and cap size to avoid SQL bloat.
+        deduped = list(dict.fromkeys(expanded))
+        return deduped[:12]
+
+    @staticmethod
+    def _parse_json_list(raw: object) -> list[str]:
+        if not raw:
+            return []
+        try:
+            data = json.loads(str(raw))
+            if isinstance(data, list):
+                return [str(v).strip() for v in data if str(v).strip()]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _keyword_relevance(
+        query_keywords: list[str],
+        text_parts: list[str],
+        trigger_keywords: list[str],
+    ) -> float:
+        if not query_keywords:
+            return 0.0
+        texts = " ".join(text_parts).lower()
+        trigger = {str(k).lower() for k in trigger_keywords if str(k).strip()}
+        hit = 0.0
+        for kw in query_keywords:
+            kw_lower = kw.lower()
+            if not kw_lower:
+                continue
+            if kw_lower in trigger:
+                hit += 1.0
+            elif kw_lower in texts:
+                hit += 0.72
+        return hit / max(len(query_keywords), 1)
+
+    @staticmethod
+    def _event_importance(event: object) -> float:
+        importance = float(getattr(event, "importance_score", 5.0) or 5.0)
+        depth = float(getattr(event, "impression_depth", 5.0) or 5.0)
+        blended = 0.7 * importance + 0.3 * depth
+        return max(0.1, min(1.0, blended / 10.0))
 
     @staticmethod
     def _group_old_vectors(candidates: list[dict], group_size: int, max_groups: int) -> list[dict]:

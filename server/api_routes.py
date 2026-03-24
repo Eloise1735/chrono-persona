@@ -23,6 +23,7 @@ from server.models import (
     UpdateVectorSettingsRequest,
     VectorSyncRequest,
     VectorCompactRequest,
+    VectorBatchDeleteRequest,
     UpdateRuntimeLLMRequest,
     UpsertModelPricingRequest,
     BulkImportRequest,
@@ -440,9 +441,13 @@ async def create_event(req: CreateEventRequest):
         categories=json.dumps(categories, ensure_ascii=False),
     )
     event_id = await _db.insert_event(event)
-    sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
-    if callable(sync_method):
-        await sync_method()
+    upsert_event_vector = getattr(_memory_store, "upsert_event_vector", None)
+    if callable(upsert_event_vector):
+        await upsert_event_vector(int(event_id))
+    else:
+        sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
+        if callable(sync_method):
+            await sync_method()
     return {"id": event_id, "message": "Event created"}
 
 
@@ -493,10 +498,13 @@ async def update_event(event_id: int, req: UpdateEventRequest):
 
     if fields:
         await _db.update_event(event_id, **fields)
-    if req.archived == 1:
-        sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
-        if callable(sync_method):
-            await sync_method()
+        upsert_event_vector = getattr(_memory_store, "upsert_event_vector", None)
+        if callable(upsert_event_vector):
+            await upsert_event_vector(event_id)
+        elif req.archived == 1:
+            sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
+            if callable(sync_method):
+                await sync_method()
     return {"message": "Event updated"}
 
 
@@ -576,6 +584,60 @@ async def delete_vector_entry(entry_id: str):
     if not ok:
         raise HTTPException(404, "Vector entry not found")
     return {"message": "Vector entry deleted"}
+
+
+@router.post("/vectors/entries/batch-delete")
+async def batch_delete_vector_entries(req: VectorBatchDeleteRequest):
+    store = _ensure_vector_store()
+    deleted = 0
+    failed = 0
+    processed_ids: list[str] = []
+    if req.entry_ids:
+        seen = set()
+        entry_ids = []
+        for raw in req.entry_ids:
+            entry_id = str(raw or "").strip()
+            if not entry_id or entry_id in seen:
+                continue
+            seen.add(entry_id)
+            entry_ids.append(entry_id)
+        if req.limit > 0:
+            entry_ids = entry_ids[: req.limit]
+        for entry_id in entry_ids:
+            if await store.remove_vector(entry_id):
+                deleted += 1
+                processed_ids.append(entry_id)
+            else:
+                failed += 1
+        return {
+            "message": "Vector batch delete completed",
+            "deleted": deleted,
+            "failed": failed,
+            "processed_entry_ids": processed_ids,
+        }
+
+    items = await store.list_vectors(
+        offset=0,
+        limit=max(1, int(req.limit)),
+        source_type=req.source_type,
+        status=req.status,
+        tier=req.tier,
+    )
+    for item in items:
+        entry_id = str(item.get("entry_id") or "").strip()
+        if not entry_id:
+            continue
+        if await store.remove_vector(entry_id):
+            deleted += 1
+            processed_ids.append(entry_id)
+        else:
+            failed += 1
+    return {
+        "message": "Vector batch delete completed",
+        "deleted": deleted,
+        "failed": failed,
+        "processed_entry_ids": processed_ids,
+    }
 
 
 @router.get("/vectors/settings")
@@ -826,7 +888,11 @@ async def list_settings():
     for item in items:
         category = item.get("category", "system")
         grouped.setdefault(category, []).append(item)
-    return {"items": items, "grouped": grouped}
+    defaults = {
+        key: meta.get("value", "")
+        for key, meta in DEFAULT_SETTINGS.items()
+    }
+    return {"items": items, "grouped": grouped, "defaults": defaults}
 
 
 @router.get("/settings/{key}")
