@@ -1,10 +1,10 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 仪表盘</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260325">
+  <link rel="stylesheet" href="/static/style.css?v=20260326">
 </head>
 <body>
   <nav>
@@ -29,16 +29,12 @@
 
     <div class="card">
       <h2>当前状态快照</h2>
-      <div id="latest-snapshot">
-        <div class="loading">加载中…</div>
-      </div>
+      <div id="latest-snapshot"><div class="loading">加载中...</div></div>
     </div>
 
     <div class="card">
       <h2>当前环境信息</h2>
-      <div id="env-info">
-        <div class="empty">暂无环境信息</div>
-      </div>
+      <div id="env-info"><div class="empty">暂无环境信息</div></div>
     </div>
 
     <div class="card">
@@ -48,29 +44,27 @@
         <div class="tab" data-tab="history" onclick="switchAutomationTab('history')">历史记录</div>
       </div>
       <div id="automation-latest-panel">
-        <div id="automation-latest"><div class="loading">加载中…</div></div>
+        <div id="automation-latest"><div class="loading">加载中...</div></div>
       </div>
       <div id="automation-history-panel" style="display:none;">
         <div class="btn-group" style="margin-bottom:10px;">
           <button class="btn" onclick="loadAutomationHistory()">刷新历史</button>
         </div>
-        <div id="automation-history"><div class="loading">加载中…</div></div>
+        <div id="automation-history"><div class="loading">加载中...</div></div>
       </div>
     </div>
 
     <div class="card">
       <details id="token-summary-details">
-        <summary style="font-size:13px; font-weight:600; color:var(--text-dim);">
-          Token 用量汇总
-        </summary>
+        <summary style="font-size:13px; font-weight:600; color:var(--text-dim);">Token 用量汇总</summary>
         <div style="margin-top:14px;">
-          <div id="token-summary"><div class="loading">加载中…</div></div>
+          <div id="token-summary"><div class="loading">加载中...</div></div>
           <div class="card-section">
-            <div class="list-meta" style="margin-bottom:10px;">模型费用配置（USD / 1M tokens）</div>
+            <div class="list-meta" style="margin-bottom:10px;">模型计费配置（USD / 1M tokens）</div>
             <div class="grid-3">
               <div class="form-group">
                 <label>模型名</label>
-                <input id="pricing-model" type="text" placeholder="如: gpt-4o-mini">
+                <input id="pricing-model" type="text" placeholder="例如 gpt-4o-mini">
               </div>
               <div class="form-group">
                 <label>输入价格（prompt）</label>
@@ -85,9 +79,7 @@
               <button class="btn btn-primary" onclick="saveModelPricingFromDashboard()">保存/更新</button>
               <button class="btn" onclick="loadModelPricingForDashboard()">刷新配置</button>
             </div>
-            <div id="token-pricing-list" style="margin-top:12px;">
-              <div class="loading">加载中…</div>
-            </div>
+            <div id="token-pricing-list" style="margin-top:12px;"><div class="loading">加载中...</div></div>
           </div>
         </div>
       </details>
@@ -96,7 +88,7 @@
 
   <div class="status-bar" id="status-bar">就绪</div>
 
-  <script src="/static/app.js?v=20260325"></script>
+  <script src="/static/app.js?v=20260326"></script>
   <script>initDashboardPage();</script>
 </body>
 </html>

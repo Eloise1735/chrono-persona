@@ -1,10 +1,10 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 事件历史</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260325">
+  <link rel="stylesheet" href="/static/style.css?v=20260326">
 </head>
 <body>
   <nav>
@@ -21,8 +21,7 @@
 
   <div class="container">
     <div class="search-bar">
-      <input type="text" id="search-input" placeholder="搜索标题 / 关键词 / 内容…"
-             onkeydown="if(event.key==='Enter')runSearch()">
+      <input type="text" id="search-input" placeholder="搜索标题 / 关键词 / 内容..." onkeydown="if(event.key==='Enter')runSearch()">
       <button class="btn btn-primary" onclick="runSearch()">搜索</button>
       <button class="btn" onclick="openAddEventModal()">添加事件</button>
       <label class="checkbox-label">
@@ -36,9 +35,7 @@
         <h2>分类筛选</h2>
         <div class="list-meta" style="margin-bottom:10px;">未勾选时显示全部事件。</div>
         <div id="event-category-filter" class="category-filter-list"></div>
-        <div style="margin-top:10px;">
-          <button class="btn" style="width:100%;" onclick="clearEventCategoryFilter()">清空筛选</button>
-        </div>
+        <div style="margin-top:10px;"><button class="btn" style="width:100%;" onclick="clearEventCategoryFilter()">清空筛选</button></div>
       </aside>
 
       <section class="events-main">
@@ -58,16 +55,13 @@
           <div class="list-meta" id="history-selection-summary" style="margin-top:8px;">管理模式未开启</div>
         </div>
 
-        <div class="card" style="padding:0">
-          <div id="data-list"><div class="loading">加载中…</div></div>
-        </div>
+        <div class="card" style="padding:0"><div id="data-list"><div class="loading">加载中...</div></div></div>
       </section>
     </div>
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-
-  <script src="/static/app.js?v=20260325"></script>
+  <script src="/static/app.js?v=20260326"></script>
   <script>initEventsHistoryPage();</script>
 </body>
 </html>

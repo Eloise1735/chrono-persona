@@ -1,10 +1,10 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>凯尔希状态机 - 状态历史</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260325">
+  <link rel="stylesheet" href="/static/style.css?v=20260326">
 </head>
 <body>
   <nav>
@@ -21,8 +21,7 @@
 
   <div class="container">
     <div class="search-bar">
-      <input type="text" id="search-input" placeholder="搜索快照内容…"
-             onkeydown="if(event.key==='Enter')runSearch()">
+      <input type="text" id="search-input" placeholder="搜索快照内容..." onkeydown="if(event.key==='Enter')runSearch()">
       <button class="btn btn-primary" onclick="runSearch()">搜索</button>
       <button class="btn" onclick="triggerSnapshot()">手动创建快照</button>
     </div>
@@ -44,13 +43,12 @@
     </div>
 
     <div class="card" style="padding:0">
-      <div id="data-list"><div class="loading">加载中…</div></div>
+      <div id="data-list"><div class="loading">加载中...</div></div>
     </div>
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-
-  <script src="/static/app.js?v=20260325"></script>
+  <script src="/static/app.js?v=20260326"></script>
   <script>initSnapshotsHistoryPage();</script>
 </body>
 </html>
