@@ -1,147 +1,151 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>凯尔希状态机 - 向量管理</title>
+  <title>鍑皵甯岀姸鎬佹満 - 鍚戦噺绠＄悊</title>
   <link rel="stylesheet" href="/static/style.css?v=20260325">
 </head>
 <body>
   <nav>
     <span class="logo">Kal'tsit State Machine</span>
-    <a href="/">仪表盘</a>
-    <a href="/guide">使用指南</a>
-    <a href="/snapshots-history">状态历史</a>
-    <a href="/events-history">事件历史</a>
-    <a href="/key-records">关键记录</a>
-    <a href="/settings">设定管理</a>
-    <a href="/evolution">人格演化</a>
-    <a href="/vectors" class="active">向量管理</a>
+    <a href="/">浠〃鐩?/a>
+    <a href="/guide">浣跨敤鎸囧崡</a>
+    <a href="/snapshots-history">鐘舵€佸巻鍙?/a>
+    <a href="/events-history">浜嬩欢鍘嗗彶</a>
+    <a href="/key-records">鍏抽敭璁板綍</a>
+    <a href="/settings">璁惧畾绠＄悊</a>
+    <a href="/evolution">浜烘牸婕斿寲</a>
+    <a href="/vectors" class="active">鍚戦噺绠＄悊</a>
   </nav>
 
   <div class="container">
     <div class="card">
-      <h2>向量库统计</h2>
-      <div id="vector-stats"><div class="loading">加载中…</div></div>
+      <h2>鍚戦噺搴撶粺璁?/h2>
+      <div id="vector-stats"><div class="loading">鍔犺浇涓€?/div></div>
       <div class="card-section">
         <div class="btn-group">
-          <button class="btn" onclick="loadVectorStats()">刷新统计</button>
-          <button class="btn btn-primary" onclick="runVectorSync(false)">同步候选向量</button>
-          <button class="btn" onclick="runVectorCompaction(true)">压缩预览</button>
-          <button class="btn btn-primary" onclick="runVectorCompaction(false)">执行冷记忆压缩</button>
-          <button class="btn btn-danger" onclick="runVectorSync(true)">全量重建索引</button>
+          <button class="btn" onclick="loadVectorStats()">鍒锋柊缁熻</button>
+          <button class="btn btn-primary" onclick="runVectorSync(false)">鍚屾鍊欓€夊悜閲?/button>
+          <button class="btn" onclick="runVectorCompaction(true)">鍘嬬缉棰勮</button>
+          <button class="btn btn-primary" onclick="runVectorCompaction(false)">鎵ц鍐疯蹇嗗帇缂?/button>
+          <button class="btn btn-danger" onclick="runVectorSync(true)">鍏ㄩ噺閲嶅缓绱㈠紩</button>
         </div>
       </div>
     </div>
 
     <div class="card">
-      <h2>向量化参数</h2>
+      <h2>鍚戦噺鍖栧弬鏁?/h2>
       <div class="field-group">
-        <div class="field-group-title">API 连接</div>
+        <div class="field-group-title">API 杩炴帴</div>
         <div class="grid-3">
           <div class="form-group">
             <label>Embedding API Base
-              <span class="help-tip" data-tip="向量化服务的 API 地址。为空或不可用时会回退到本地 deterministic embedding。">?</span>
+              <span class="help-tip" data-tip="鍚戦噺鍖栨湇鍔＄殑 API 鍦板潃銆備负绌烘垨涓嶅彲鐢ㄦ椂浼氬洖閫€鍒版湰鍦?deterministic embedding銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_embedding_api_base" placeholder="https://api.openai.com/v1">
           </div>
           <div class="form-group">
             <label>Embedding API Key
-              <span class="help-tip" data-tip="向量化服务访问密钥，仅用于 embedding 请求。">?</span>
+              <span class="help-tip" data-tip="鍚戦噺鍖栨湇鍔¤闂瘑閽ワ紝浠呯敤浜?embedding 璇锋眰銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_embedding_api_key" placeholder="sk-...">
           </div>
           <div class="form-group">
-            <label>Embedding 模型名
-              <span class="help-tip" data-tip="用于文本向量化的模型名称。需与提供商可用模型一致。">?</span>
+            <label>Embedding 妯″瀷鍚?
+              <span class="help-tip" data-tip="鐢ㄤ簬鏂囨湰鍚戦噺鍖栫殑妯″瀷鍚嶇О銆傞渶涓庢彁渚涘晢鍙敤妯″瀷涓€鑷淬€?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_embedding_model" placeholder="text-embedding-3-small">
           </div>
         </div>
       </div>
       <div class="field-group">
-        <div class="field-group-title">运行配置</div>
+        <div class="field-group-title">杩愯閰嶇疆</div>
         <div class="grid-3">
           <div class="form-group">
-            <label>本地回退维度
-              <span class="help-tip" data-tip="本地回退 embedding 的向量维度。建议保持固定，避免不同维度混用。">?</span>
+            <label>鏈湴鍥為€€缁村害
+              <span class="help-tip" data-tip="鏈湴鍥為€€ embedding 鐨勫悜閲忕淮搴︺€傚缓璁繚鎸佸浐瀹氾紝閬垮厤涓嶅悓缁村害娣风敤銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_embedding_dim" placeholder="256">
           </div>
           <div class="form-group">
-            <label>超时时间（秒）
-              <span class="help-tip" data-tip="单次 embedding 请求的超时时间（秒）。过短容易失败，过长会拖慢批处理。">?</span>
+            <label>瓒呮椂鏃堕棿锛堢锛?
+              <span class="help-tip" data-tip="鍗曟 embedding 璇锋眰鐨勮秴鏃舵椂闂达紙绉掞級銆傝繃鐭鏄撳け璐ワ紝杩囬暱浼氭嫋鎱㈡壒澶勭悊銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_embedding_timeout_sec" placeholder="15">
           </div>
           <div class="form-group">
-            <label>每批向量化数量
-              <span class="help-tip" data-tip="每次同步任务中单批处理条目数。可在吞吐与稳定性间权衡。">?</span>
+            <label>姣忔壒鍚戦噺鍖栨暟閲?
+              <span class="help-tip" data-tip="姣忔鍚屾浠诲姟涓崟鎵瑰鐞嗘潯鐩暟銆傚彲鍦ㄥ悶鍚愪笌绋冲畾鎬ч棿鏉冭　銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_sync_batch_size" placeholder="200">
           </div>
           <div class="form-group">
-            <label>快照向量化阈值（天）
-              <span class="help-tip" data-tip="超过该天数的快照会进入向量化候选，较新的快照优先保留在时间线语境。">?</span>
+            <label>蹇収鍚戦噺鍖栭槇鍊硷紙澶╋級
+              <span class="help-tip" data-tip="瓒呰繃璇ュぉ鏁扮殑蹇収浼氳繘鍏ュ悜閲忓寲鍊欓€夛紝杈冩柊鐨勫揩鐓т紭鍏堜繚鐣欏湪鏃堕棿绾胯澧冦€?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_snapshot_days_threshold" placeholder="14">
           </div>
           <div class="form-group">
-            <label>默认检索 TopK
-              <span class="help-tip" data-tip="向量检索默认返回数量。数值越大召回更全，但可能引入更多低相关内容。">?</span>
+            <label>榛樿妫€绱?TopK
+              <span class="help-tip" data-tip="鍚戦噺妫€绱㈤粯璁よ繑鍥炴暟閲忋€傛暟鍊艰秺澶у彫鍥炴洿鍏紝浣嗗彲鑳藉紩鍏ユ洿澶氫綆鐩稿叧鍐呭銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_search_top_k" placeholder="5">
           </div>
           <div class="form-group">
-            <label>冷记忆阈值（天）
-              <span class="help-tip" data-tip="超过该天数的向量会成为冷压缩候选，用于历史记忆降噪与收敛。">?</span>
+            <label>鍐疯蹇嗛槇鍊硷紙澶╋級
+              <span class="help-tip" data-tip="瓒呰繃璇ュぉ鏁扮殑鍚戦噺浼氭垚涓哄喎鍘嬬缉鍊欓€夛紝鐢ㄤ簬鍘嗗彶璁板繂闄嶅櫔涓庢敹鏁涖€?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_cold_days_threshold" placeholder="180">
           </div>
           <div class="form-group">
-            <label>压缩最小分组数
-              <span class="help-tip" data-tip="每个压缩分组最少包含的旧向量数量。组太小会导致摘要过碎。">?</span>
+            <label>鍘嬬缉鏈€灏忓垎缁勬暟
+              <span class="help-tip" data-tip="姣忎釜鍘嬬缉鍒嗙粍鏈€灏戝寘鍚殑鏃у悜閲忔暟閲忋€傜粍澶皬浼氬鑷存憳瑕佽繃纰庛€?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_compaction_group_size" placeholder="8">
           </div>
           <div class="form-group">
-            <label>每次最大压缩分组
-              <span class="help-tip" data-tip="单次压缩任务最多处理的分组上限。用于限制一次任务规模与执行时长。">?</span>
+            <label>姣忔鏈€澶у帇缂╁垎缁?
+              <span class="help-tip" data-tip="鍗曟鍘嬬缉浠诲姟鏈€澶氬鐞嗙殑鍒嗙粍涓婇檺銆傜敤浜庨檺鍒朵竴娆′换鍔¤妯′笌鎵ц鏃堕暱銆?>?</span>
             </label>
             <input type="text" id="vector-setting-vector_compaction_max_groups" placeholder="20">
           </div>
         </div>
       </div>
       <div class="btn-group" style="margin-top: 4px;">
-        <button class="btn btn-primary" onclick="saveVectorSettings()">保存向量参数</button>
-        <button class="btn" onclick="loadVectorSettings()">刷新参数</button>
+        <button class="btn btn-primary" onclick="saveVectorSettings()">淇濆瓨鍚戦噺鍙傛暟</button>
+        <button class="btn" onclick="loadVectorSettings()">鍒锋柊鍙傛暟</button>
       </div>
     </div>
 
     <div class="card" style="padding:0">
       <div style="padding:16px 16px 0 16px;">
-        <h2>向量条目</h2>
+        <h2>鍚戦噺鏉＄洰</h2>
         <div class="btn-group" style="margin-bottom:14px;">
           <select id="vector-filter-source-type" onchange="loadVectorEntries()" style="max-width:160px;">
-            <option value="">全部来源</option>
-            <option value="event">事件</option>
-            <option value="snapshot">快照</option>
+            <option value="">鍏ㄩ儴鏉ユ簮</option>
+            <option value="event">浜嬩欢</option>
+            <option value="snapshot">蹇収</option>
           </select>
           <select id="vector-filter-status" onchange="loadVectorEntries()" style="max-width:160px;">
             <option value="active">active</option>
             <option value="deleted">deleted</option>
-            <option value="">全部状态</option>
+            <option value="">鍏ㄩ儴鐘舵€?/option>
           </select>
           <button class="btn" onclick="loadVectorEntries()">刷新列表</button>
+          <button class="btn" onclick="toggleSelectAllVisibleVectors()">全选/全不选</button>
+          <button class="btn btn-danger" onclick="bulkDeleteSelectedVectors()">批量删除选中</button>
+          <button class="btn btn-danger" onclick="bulkDeleteFilteredVectors()">按筛选批量删除</button>
         </div>
       </div>
-      <div id="vector-entry-list"><div class="loading">加载中…</div></div>
+      <div id="vector-entry-list"><div class="loading">鍔犺浇涓€?/div></div>
     </div>
   </div>
 
-  <div class="status-bar" id="status-bar">就绪</div>
+  <div class="status-bar" id="status-bar">灏辩华</div>
 
   <script src="/static/app.js?v=20260325"></script>
   <script>initVectorsPage();</script>
 </body>
 </html>
+

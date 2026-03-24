@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from server.config import AppConfig
 from server.database import Database
@@ -56,8 +56,8 @@ class StateMachine:
         self, current_time: str, last_interaction_time: str
     ) -> str:
         self.llm.begin_usage_tracking()
-        now = datetime.fromisoformat(current_time)
-        last = datetime.fromisoformat(last_interaction_time)
+        now = self._parse_iso_datetime(current_time)
+        last = self._parse_iso_datetime(last_interaction_time)
         interval = now - last
         min_unit_hours = await self._get_min_time_unit_hours()
         min_time_unit = timedelta(hours=min_unit_hours)
@@ -230,16 +230,17 @@ class StateMachine:
         )
 
     async def _build_recent_events_text(self, limit: int = 2) -> str:
-        events = await self.db.get_all_events(offset=0, limit=max(1, limit), include_archived=False)
+        events = await self.db.get_recent_events_by_event_time(
+            limit=max(1, limit),
+            include_archived=False,
+        )
         if not events:
             return "（暂无近期事件）"
         lines: list[str] = []
-        # get_all_events uses id DESC, which already represents newest first.
+        # Use event's own time field first, then created_at/id as tie-breakers.
         for event in events:
             title = (event.title or "").strip() or "未命名事件"
             desc = (event.description or "").strip()
-            if len(desc) > 80:
-                desc = desc[:80].rstrip() + "..."
             lines.append(f"- [{event.date}] {title}：{desc}")
         return "\n".join(lines)
 
@@ -380,7 +381,10 @@ class StateMachine:
         prompt_template = await self.prompt_manager.get_prompt(KEY_PROMPT_EVENT_ANCHOR)
         prompt = prompt_template.format(
             current_snapshot=snapshot_content,
-            environment=env.get("summary", ""),
+            environment=(
+                "【客观事件来源（优先据此抽取事实）】\n"
+                f"{env.get('summary', '')}"
+            ),
             memory_context=memory_text,
             system_layers=await self.prompt_manager.get_system_layers_text(),
         )
@@ -406,14 +410,44 @@ class StateMachine:
         keywords: list[str] = []
         categories: list[str] = []
 
-        desc_match = re.search(r"事件描述[：:]\s*(.+?)(?:\n|关键词)", response, re.DOTALL)
-        if desc_match:
-            description = desc_match.group(1).strip()
-        else:
-            lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
-            description = lines[0] if lines else response.strip()
+        objective_text = ""
+        impression_text = ""
+        objective_match = re.search(
+            r"客观记录[：:]\s*(.+?)(?:\n(?:主观印象|关键词|分类)[：:]|$)",
+            response,
+            re.DOTALL,
+        )
+        if objective_match:
+            objective_text = objective_match.group(1).strip()
 
-        title_match = re.search(r"标题[：:]\s*(.+?)(?:\n|事件描述|关键词|分类)", response, re.DOTALL)
+        impression_match = re.search(
+            r"主观印象[：:]\s*(.+?)(?:\n(?:关键词|分类)[：:]|$)",
+            response,
+            re.DOTALL,
+        )
+        if impression_match:
+            impression_text = impression_match.group(1).strip()
+
+        # Backward compatible with old prompt format using "事件描述".
+        if not objective_text and not impression_text:
+            desc_match = re.search(r"事件描述[：:]\s*(.+?)(?:\n|关键词|分类|$)", response, re.DOTALL)
+            if desc_match:
+                description = desc_match.group(1).strip()
+            else:
+                lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
+                description = lines[0] if lines else response.strip()
+        elif objective_text and impression_text:
+            description = f"客观记录：{objective_text}\n主观印象：{impression_text}"
+        elif objective_text:
+            description = f"客观记录：{objective_text}"
+        else:
+            description = f"主观印象：{impression_text}"
+
+        title_match = re.search(
+            r"标题[：:]\s*(.+?)(?:\n|客观记录|主观印象|事件描述|关键词|分类|$)",
+            response,
+            re.DOTALL,
+        )
         if title_match:
             title = title_match.group(1).strip()
 
@@ -430,7 +464,7 @@ class StateMachine:
         if not description:
             return
         if not title:
-            title = make_event_title(description, keywords, categories)
+            title = make_event_title(objective_text or description, keywords, categories)
         if not categories:
             categories = classify_event(description, keywords)
 
@@ -445,6 +479,12 @@ class StateMachine:
         )
         event_id = await self.db.insert_event(event)
         logger.info("Saved event anchor #%d: %s", event_id, description[:50])
+        upsert_event_vector = getattr(self.memory, "upsert_event_vector", None)
+        if callable(upsert_event_vector):
+            try:
+                await upsert_event_vector(int(event_id))
+            except Exception as exc:
+                logger.warning("Event vector upsert skipped for #%d: %s", event_id, exc)
 
     async def _enforce_snapshot_limit(self):
         overflow = await self.db.get_oldest_snapshots_beyond_limit(self.max_snapshots)
@@ -612,3 +652,14 @@ class StateMachine:
         except (TypeError, ValueError):
             value = 3
         return max(1, min(value, 50))
+
+    @staticmethod
+    def _parse_iso_datetime(value: str) -> datetime:
+        text = (value or "").strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        # Normalize to naive UTC to avoid aware/naive subtraction errors.
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt

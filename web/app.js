@@ -1,6 +1,6 @@
-const API = '/api';
+﻿const API = '/api';
 
-// ── Utility ──
+// 鈹€鈹€ Utility 鈹€鈹€
 
 async function apiFetch(path, options = {}) {
   const resp = await fetch(`${API}${path}`, {
@@ -18,7 +18,7 @@ function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return document.querySelectorAll(sel); }
 
 function truncate(text, max = 120) {
-  return text.length > max ? text.slice(0, max) + '…' : text;
+  return text.length > max ? text.slice(0, max) + '...' : text;
 }
 
 function escHtml(str) {
@@ -43,19 +43,19 @@ function renderCostBreakdown(summary) {
   const unknownTokens = Number(summary?.unknown_priced_tokens || 0);
   if (!models.length) {
     return unknownTokens > 0
-      ? `<div class="list-meta">成本拆分：暂无（${unknownTokens} tokens 未匹配单价）</div>`
-      : '<div class="list-meta">成本拆分：暂无</div>';
+      ? `<div class="list-meta">Cost: unavailable (${unknownTokens} tokens unpriced)</div>`
+      : '<div class="list-meta">Cost: unavailable</div>';
   }
   const top = models.slice(0, 3);
   const items = top.map((item) => {
     const model = escHtml(String(item.model || 'unknown'));
     const cost = formatUsd(item.estimated_cost_usd || 0);
     const total = Number(item.total_tokens || 0);
-    const tag = item.has_pricing ? '' : '（未配置单价）';
+    const tag = item.has_pricing ? '' : ' (unpriced)';
     return `${model}: ${cost} / ${total} tokens${tag}`;
   });
-  const unknownText = unknownTokens > 0 ? `；另有 ${unknownTokens} tokens 未匹配单价` : '';
-  return `<div class="list-meta">成本拆分：${items.join('；')}${unknownText}</div>`;
+  const unknownText = unknownTokens > 0 ? `; plus ${unknownTokens} unpriced tokens` : '';
+  return `<div class="list-meta">Cost: ${items.join('; ')}${unknownText}</div>`;
 }
 
 function showStatus(msg, isError = false) {
@@ -66,7 +66,7 @@ function showStatus(msg, isError = false) {
   }
 }
 
-// ── Dashboard Page ──
+// 鈹€鈹€ Dashboard Page 鈹€鈹€
 
 let currentAutomationTab = 'latest';
 
@@ -86,7 +86,7 @@ async function loadDashboard() {
     if (snapshot) {
       el.innerHTML = `<div class="card-content">${escHtml(snapshot.content)}</div>
         <div class="list-meta" style="margin-top:12px">
-          类型: ${snapshot.type} | 时间: ${formatTime(snapshot.created_at)}
+          绫诲瀷: ${snapshot.type} | 鏃堕棿: ${formatTime(snapshot.created_at)}
         </div>`;
       if (snapshot.environment && snapshot.environment !== '{}') {
         try {
@@ -97,11 +97,11 @@ async function loadDashboard() {
         } catch(e) {}
       }
     } else {
-      el.innerHTML = '<div class="empty">暂无状态快照</div>';
+      el.innerHTML = '<div class="empty">鏆傛棤鐘舵€佸揩鐓?/div>';
     }
-    showStatus('仪表盘已加载');
+    showStatus('浠〃鐩樺凡鍔犺浇');
   } catch (e) {
-    showStatus('加载失败: ' + e.message, true);
+    showStatus('鍔犺浇澶辫触: ' + e.message, true);
   }
 }
 
@@ -116,31 +116,31 @@ function switchAutomationTab(tab) {
 }
 
 function renderAutomationReport(report) {
-  if (!report || !report.ran) return '<div class="empty">自动化未执行或已关闭。</div>';
+  if (!report || !report.ran) return '<div class="empty">鑷姩鍖栨湭鎵ц鎴栧凡鍏抽棴銆?/div>';
   const vectorSync = report.vector_sync || {};
   const evolution = report.evolution || {};
   const compaction = report.compaction || {};
   const llmUsage = report.llm_usage || {};
   const errors = Array.isArray(report.errors) ? report.errors : [];
   return `
-    <div class="list-meta">触发源：${escHtml(String(report.trigger || 'unknown'))}</div>
-    <div class="list-meta">向量同步：事件 ${Number(vectorSync.vectorized_events || 0)}，快照 ${Number(vectorSync.vectorized_snapshots || 0)}</div>
-    <div class="list-meta">人格演化：${evolution.applied ? '已执行' : '未触发'}</div>
-    <div class="list-meta">冷压缩：新增摘要 ${Number(compaction.created_summaries || 0)}，删除旧向量 ${Number(compaction.deleted_originals || 0)}</div>
-    <div class="list-meta">Token：输入 ${Number(llmUsage.prompt_tokens || 0)}，输出 ${Number(llmUsage.completion_tokens || 0)}，总计 ${Number(llmUsage.total_tokens || 0)}（请求 ${Number(llmUsage.requests || 0)} 次）</div>
-    ${errors.length ? `<div class="list-meta" style="color:var(--danger)">异常：${escHtml(errors.join('; '))}</div>` : ''}
+    <div class="list-meta">瑙﹀彂婧愶細${escHtml(String(report.trigger || 'unknown'))}</div>
+    <div class="list-meta">鍚戦噺鍚屾锛氫簨浠?${Number(vectorSync.vectorized_events || 0)}锛屽揩鐓?${Number(vectorSync.vectorized_snapshots || 0)}</div>
+    <div class="list-meta">浜烘牸婕斿寲锛?{evolution.applied ? '宸叉墽琛? : '鏈Е鍙?}</div>
+    <div class="list-meta">鍐峰帇缂╋細鏂板鎽樿 ${Number(compaction.created_summaries || 0)}锛屽垹闄ゆ棫鍚戦噺 ${Number(compaction.deleted_originals || 0)}</div>
+    <div class="list-meta">Token锛氳緭鍏?${Number(llmUsage.prompt_tokens || 0)}锛岃緭鍑?${Number(llmUsage.completion_tokens || 0)}锛屾€昏 ${Number(llmUsage.total_tokens || 0)}锛堣姹?${Number(llmUsage.requests || 0)} 娆★級</div>
+    ${errors.length ? `<div class="list-meta" style="color:var(--danger)">寮傚父锛?{escHtml(errors.join('; '))}</div>` : ''}
   `;
 }
 
 async function loadAutomationLatest() {
   const el = document.getElementById('automation-latest');
   if (!el) return;
-  el.innerHTML = '<div class="loading">加载中…</div>';
+  el.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch('/automation/latest');
     const item = data.item;
     if (!item) {
-      el.innerHTML = '<div class="empty">暂无自动化执行记录</div>';
+      el.innerHTML = '<div class="empty">鏆傛棤鑷姩鍖栨墽琛岃褰?/div>';
       return;
     }
     el.innerHTML = `
@@ -150,19 +150,19 @@ async function loadAutomationLatest() {
       </div>
     `;
   } catch (e) {
-    el.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`;
+    el.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`;
   }
 }
 
 async function loadAutomationHistory() {
   const el = document.getElementById('automation-history');
   if (!el) return;
-  el.innerHTML = '<div class="loading">加载中…</div>';
+  el.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch('/automation/runs?limit=20');
     const items = data.items || [];
     if (!items.length) {
-      el.innerHTML = '<div class="empty">暂无历史记录</div>';
+      el.innerHTML = '<div class="empty">鏆傛棤鍘嗗彶璁板綍</div>';
       return;
     }
     el.innerHTML = items.map(item => `
@@ -176,14 +176,14 @@ async function loadAutomationHistory() {
       </div>
     `).join('');
   } catch (e) {
-    el.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`;
+    el.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`;
   }
 }
 
 async function loadAutomationTokenSummary() {
   const el = document.getElementById('token-summary');
   if (!el) return;
-  el.innerHTML = '<div class="loading">加载中…</div>';
+  el.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch('/automation/token-summary');
     const today = data.today || {};
@@ -193,37 +193,37 @@ async function loadAutomationTokenSummary() {
     el.innerHTML = `
       <div class="grid-2">
         <div class="list-item" style="cursor:default">
-          <div><span class="tag">今日</span><span class="list-meta">UTC日界</span></div>
-          <div class="list-meta">流程数：${Number(today.runs || 0)} | 请求数：${Number(today.requests || 0)}</div>
-          <div class="list-meta">输入：${Number(today.prompt_tokens || 0)} | 输出：${Number(today.completion_tokens || 0)}</div>
-          <div class="list-meta">总计：${Number(today.total_tokens || 0)}</div>
-          <div class="list-meta">估算成本：${formatUsd(today.estimated_cost_usd || 0)}（${escHtml(pricingUnit)}）</div>
+          <div><span class="tag">浠婃棩</span><span class="list-meta">UTC鏃ョ晫</span></div>
+          <div class="list-meta">娴佺▼鏁帮細${Number(today.runs || 0)} | 璇锋眰鏁帮細${Number(today.requests || 0)}</div>
+          <div class="list-meta">杈撳叆锛?{Number(today.prompt_tokens || 0)} | 杈撳嚭锛?{Number(today.completion_tokens || 0)}</div>
+          <div class="list-meta">鎬昏锛?{Number(today.total_tokens || 0)}</div>
+          <div class="list-meta">浼扮畻鎴愭湰锛?{formatUsd(today.estimated_cost_usd || 0)}锛?{escHtml(pricingUnit)}锛?/div>
           ${renderCostBreakdown(today)}
         </div>
         <div class="list-item" style="cursor:default">
-          <div><span class="tag">本周</span><span class="list-meta">周一至今（UTC）</span></div>
-          <div class="list-meta">流程数：${Number(week.runs || 0)} | 请求数：${Number(week.requests || 0)}</div>
-          <div class="list-meta">输入：${Number(week.prompt_tokens || 0)} | 输出：${Number(week.completion_tokens || 0)}</div>
-          <div class="list-meta">总计：${Number(week.total_tokens || 0)}</div>
-          <div class="list-meta">估算成本：${formatUsd(week.estimated_cost_usd || 0)}（${escHtml(pricingUnit)}）</div>
+          <div><span class="tag">鏈懆</span><span class="list-meta">鍛ㄤ竴鑷充粖锛圲TC锛?/span></div>
+          <div class="list-meta">娴佺▼鏁帮細${Number(week.runs || 0)} | 璇锋眰鏁帮細${Number(week.requests || 0)}</div>
+          <div class="list-meta">杈撳叆锛?{Number(week.prompt_tokens || 0)} | 杈撳嚭锛?{Number(week.completion_tokens || 0)}</div>
+          <div class="list-meta">鎬昏锛?{Number(week.total_tokens || 0)}</div>
+          <div class="list-meta">浼扮畻鎴愭湰锛?{formatUsd(week.estimated_cost_usd || 0)}锛?{escHtml(pricingUnit)}锛?/div>
           ${renderCostBreakdown(week)}
         </div>
       </div>
       <div class="list-item" style="cursor:default; margin-top:8px;">
-        <div><span class="tag">累计</span><span class="list-meta">自动化报告可统计区间</span></div>
-        <div class="list-meta">流程数：${Number(all.runs || 0)} | 请求数：${Number(all.requests || 0)}</div>
-        <div class="list-meta">输入：${Number(all.prompt_tokens || 0)} | 输出：${Number(all.completion_tokens || 0)} | 总计：${Number(all.total_tokens || 0)}</div>
-        <div class="list-meta">估算成本：${formatUsd(all.estimated_cost_usd || 0)}（${escHtml(pricingUnit)}）</div>
+        <div><span class="tag">绱</span><span class="list-meta">鑷姩鍖栨姤鍛婂彲缁熻鍖洪棿</span></div>
+        <div class="list-meta">娴佺▼鏁帮細${Number(all.runs || 0)} | 璇锋眰鏁帮細${Number(all.requests || 0)}</div>
+        <div class="list-meta">杈撳叆锛?{Number(all.prompt_tokens || 0)} | 杈撳嚭锛?{Number(all.completion_tokens || 0)} | 鎬昏锛?{Number(all.total_tokens || 0)}</div>
+        <div class="list-meta">浼扮畻鎴愭湰锛?{formatUsd(all.estimated_cost_usd || 0)}锛?{escHtml(pricingUnit)}锛?/div>
         ${renderCostBreakdown(all)}
       </div>
     `;
   } catch (e) {
-    el.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`;
+    el.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`;
   }
 }
 
 function renderModelPricingRows(items) {
-  if (!items.length) return '<div class="empty">暂无模型单价配置</div>';
+  if (!items.length) return '<div class="empty">鏆傛棤妯″瀷鍗曚环閰嶇疆</div>';
   return items.map((item) => {
     const modelRaw = String(item.model || '');
     const model = escHtml(modelRaw);
@@ -233,9 +233,9 @@ function renderModelPricingRows(items) {
     return `
       <div class="list-item" style="cursor:default; margin-top:6px;">
         <div><span class="tag">${model}</span></div>
-        <div class="list-meta">输入：${prompt} | 输出：${completion}</div>
+        <div class="list-meta">杈撳叆锛?{prompt} | 杈撳嚭锛?{completion}</div>
         <div class="btn-group" style="margin-top:6px;">
-          <button class="btn btn-danger" onclick='deleteModelPricingFromDashboard(${safeModelArg})'>删除</button>
+          <button class="btn btn-danger" onclick='deleteModelPricingFromDashboard(${safeModelArg})'>鍒犻櫎</button>
         </div>
       </div>
     `;
@@ -245,13 +245,13 @@ function renderModelPricingRows(items) {
 async function loadModelPricingForDashboard() {
   const el = document.getElementById('token-pricing-list');
   if (!el) return;
-  el.innerHTML = '<div class="loading">加载中…</div>';
+  el.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch('/automation/model-pricing');
     const items = Array.isArray(data.items) ? data.items : [];
     el.innerHTML = renderModelPricingRows(items);
   } catch (e) {
-    el.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`;
+    el.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`;
   }
 }
 
@@ -263,11 +263,11 @@ async function saveModelPricingFromDashboard() {
   const completionPrice = Number(completionRaw);
 
   if (!model) {
-    showStatus('请先填写模型名', true);
+    showStatus('Please enter a model name.', true);
     return;
   }
   if (!Number.isFinite(promptPrice) || promptPrice < 0 || !Number.isFinite(completionPrice) || completionPrice < 0) {
-    showStatus('请输入合法的输入/输出价格（>= 0）', true);
+    showStatus('Please enter valid non-negative prices.', true);
     return;
   }
   try {
@@ -279,27 +279,27 @@ async function saveModelPricingFromDashboard() {
         completion_price: completionPrice,
       }),
     });
-    showStatus(`模型单价已保存：${model}`);
+    showStatus(`妯″瀷鍗曚环宸蹭繚瀛橈細${model}`);
     await Promise.all([loadModelPricingForDashboard(), loadAutomationTokenSummary()]);
   } catch (e) {
-    showStatus('保存模型单价失败: ' + e.message, true);
+    showStatus('淇濆瓨妯″瀷鍗曚环澶辫触: ' + e.message, true);
   }
 }
 
 async function deleteModelPricingFromDashboard(model) {
-  if (!confirm(`确认删除模型单价：${model}？`)) return;
+  if (!confirm(`Delete pricing for model "${model}"?`)) return;
   try {
     await apiFetch(`/automation/model-pricing?model=${encodeURIComponent(model)}`, {
       method: 'DELETE',
     });
-    showStatus(`已删除模型单价：${model}`);
+    showStatus(`宸插垹闄ゆā鍨嬪崟浠凤細${model}`);
     await Promise.all([loadModelPricingForDashboard(), loadAutomationTokenSummary()]);
   } catch (e) {
-    showStatus('删除模型单价失败: ' + e.message, true);
+    showStatus('鍒犻櫎妯″瀷鍗曚环澶辫触: ' + e.message, true);
   }
 }
 
-// ── Modal helpers ──
+// 鈹€鈹€ Modal helpers 鈹€鈹€
 
 function openModal(title, bodyHtml, actions) {
   closeModal();
@@ -323,37 +323,37 @@ function closeModal() {
   if (m) m.remove();
 }
 
-// ── Add Event Modal ──
+// 鈹€鈹€ Add Event Modal 鈹€鈹€
 
 function openAddEventModal() {
   const today = new Date().toISOString().split('T')[0];
-  openModal('添加事件锚点', `
+  openModal('娣诲姞浜嬩欢閿氱偣', `
     <div class="form-group">
-      <label>事件日期</label>
+      <label>浜嬩欢鏃ユ湡</label>
       <input type="date" id="ev-date" value="${today}">
     </div>
     <div class="form-group">
-      <label>事件标题（可留空自动生成）</label>
-      <input type="text" id="ev-title" placeholder="例如：凌晨讨论后形成的共识">
+      <label>浜嬩欢鏍囬锛堝彲鐣欑┖鑷姩鐢熸垚锛?/label>
+      <input type="text" id="ev-title" placeholder="渚嬪锛氬噷鏅ㄨ璁哄悗褰㈡垚鐨勫叡璇?>
     </div>
     <div class="form-group">
-      <label>事件描述</label>
-      <textarea id="ev-desc" placeholder="以凯尔希的主观视角描述事件..."></textarea>
+      <label>浜嬩欢鎻忚堪</label>
+      <textarea id="ev-desc" placeholder="浠ュ嚡灏斿笇鐨勪富瑙傝瑙掓弿杩颁簨浠?.."></textarea>
     </div>
     <div class="form-group">
-      <label>关键词（逗号分隔）</label>
-      <input type="text" id="ev-keywords" placeholder="关键词1, 关键词2, 关键词3">
+      <label>鍏抽敭璇嶏紙閫楀彿鍒嗛殧锛?/label>
+      <input type="text" id="ev-keywords" placeholder="鍏抽敭璇?, 鍏抽敭璇?, 鍏抽敭璇?">
     </div>
     <div class="form-group">
-      <label>分类（逗号分隔，可留空自动分类）</label>
-      <input type="text" id="ev-categories" placeholder="情感交流, 学术探讨">
+      <label>鍒嗙被锛堥€楀彿鍒嗛殧锛屽彲鐣欑┖鑷姩鍒嗙被锛?/label>
+      <input type="text" id="ev-categories" placeholder="鎯呮劅浜ゆ祦, 瀛︽湳鎺㈣">
     </div>
   `, (el) => {
     const cancel = document.createElement('button');
-    cancel.className = 'btn'; cancel.textContent = '取消';
+    cancel.className = 'btn'; cancel.textContent = '鍙栨秷';
     cancel.onclick = closeModal;
     const save = document.createElement('button');
-    save.className = 'btn btn-primary'; save.textContent = '保存';
+    save.className = 'btn btn-primary'; save.textContent = '淇濆瓨';
     save.onclick = saveNewEvent;
     el.appendChild(cancel);
     el.appendChild(save);
@@ -363,7 +363,7 @@ function openAddEventModal() {
 async function saveNewEvent() {
   const title = (document.getElementById('ev-title')?.value || '').trim();
   const desc = document.getElementById('ev-desc').value.trim();
-  if (!desc) { alert('请填写事件描述'); return; }
+  if (!desc) { alert('Please fill in event description.'); return; }
   const date = document.getElementById('ev-date').value;
   const kwRaw = document.getElementById('ev-keywords').value;
   const keywords = kwRaw.split(/[,，、]/).map(s => s.trim()).filter(Boolean);
@@ -377,12 +377,12 @@ async function saveNewEvent() {
       body: JSON.stringify(payload),
     });
     closeModal();
-    showStatus('事件已添加');
+    showStatus('Done');
     if (typeof loadEvents === 'function') loadEvents();
-  } catch(e) { alert('保存失败: ' + e.message); }
+  } catch(e) { alert('淇濆瓨澶辫触: ' + e.message); }
 }
 
-// ── Edit Event Modal ──
+// 鈹€鈹€ Edit Event Modal 鈹€鈹€
 
 function openEditEventModal(event) {
   let keywords = [];
@@ -390,32 +390,32 @@ function openEditEventModal(event) {
   let categories = [];
   try { categories = JSON.parse(event.categories || '[]'); } catch(e) {}
 
-  openModal('编辑事件锚点', `
+  openModal('缂栬緫浜嬩欢閿氱偣', `
     <div class="form-group">
-      <label>事件标题</label>
+      <label>浜嬩欢鏍囬</label>
       <input type="text" id="ev-title" value="${escHtml(event.title || '')}">
     </div>
     <div class="form-group">
-      <label>事件描述</label>
+      <label>浜嬩欢鎻忚堪</label>
       <textarea id="ev-desc">${escHtml(event.description)}</textarea>
     </div>
     <div class="form-group">
-      <label>关键词（逗号分隔）</label>
+      <label>鍏抽敭璇嶏紙閫楀彿鍒嗛殧锛?/label>
       <input type="text" id="ev-keywords" value="${keywords.join(', ')}">
     </div>
     <div class="form-group">
-      <label>分类（逗号分隔）</label>
+      <label>鍒嗙被锛堥€楀彿鍒嗛殧锛?/label>
       <input type="text" id="ev-categories" value="${categories.join(', ')}">
     </div>
   `, (el) => {
     const cancel = document.createElement('button');
-    cancel.className = 'btn'; cancel.textContent = '取消';
+    cancel.className = 'btn'; cancel.textContent = '鍙栨秷';
     cancel.onclick = closeModal;
     const del = document.createElement('button');
-    del.className = 'btn btn-danger'; del.textContent = '删除';
+    del.className = 'btn btn-danger'; del.textContent = '鍒犻櫎';
     del.onclick = () => deleteEvent(event.id);
     const save = document.createElement('button');
-    save.className = 'btn btn-primary'; save.textContent = '保存修改';
+    save.className = 'btn btn-primary'; save.textContent = '淇濆瓨淇敼';
     save.onclick = () => updateEvent(event.id);
     el.appendChild(cancel);
     el.appendChild(del);
@@ -436,25 +436,25 @@ async function updateEvent(id) {
       body: JSON.stringify({ title, description: desc, trigger_keywords: keywords, categories }),
     });
     closeModal();
-    showStatus('事件已更新');
+    showStatus('Done');
     if (typeof loadEvents === 'function') loadEvents();
-  } catch(e) { alert('更新失败: ' + e.message); }
+  } catch(e) { alert('鏇存柊澶辫触: ' + e.message); }
 }
 
 async function deleteEvent(id) {
-  if (!confirm('确认删除此事件？')) return;
+  if (!confirm('纭鍒犻櫎姝や簨浠讹紵')) return;
   try {
     await apiFetch(`/events/${id}`, { method: 'DELETE' });
     closeModal();
-    showStatus('事件已删除');
+    showStatus('Done');
     if (typeof loadEvents === 'function') loadEvents();
-  } catch(e) { alert('删除失败: ' + e.message); }
+  } catch(e) { alert('鍒犻櫎澶辫触: ' + e.message); }
 }
 
-// ── Trigger Snapshot ──
+// 鈹€鈹€ Trigger Snapshot 鈹€鈹€
 
 async function triggerSnapshot() {
-  const content = prompt('输入快照内容（留空则由系统生成）:');
+  const content = prompt('杈撳叆蹇収鍐呭锛堢暀绌哄垯鐢辩郴缁熺敓鎴愶級:');
   if (content === null) return;
   if (content.trim()) {
     try {
@@ -462,82 +462,81 @@ async function triggerSnapshot() {
         method: 'POST',
         body: JSON.stringify({ content: content.trim(), type: 'accumulated' }),
       });
-      showStatus('快照已创建');
+      showStatus('Done');
       loadDashboard();
-    } catch(e) { alert('创建失败: ' + e.message); }
+    } catch(e) { alert('鍒涘缓澶辫触: ' + e.message); }
   } else {
-    alert('请输入快照内容');
+    alert('Action required.');
   }
 }
 
-// ── Test State Machine ──
+// 鈹€鈹€ Test State Machine 鈹€鈹€
 
 function openTestPanel() {
   const today = new Date();
   const defaultEnd = today.toISOString().split('T')[0];
   const startDate = new Date(today.getTime() - 29 * 86400000);
   const defaultStart = startDate.toISOString().split('T')[0];
-  openModal('测试状态机', `
+  openModal('娴嬭瘯鐘舵€佹満', `
     <div class="tabs" id="test-tabs">
-      <div class="tab active" data-tab="get-state">对话开始</div>
-      <div class="tab" data-tab="reflect">对话结束</div>
-      <div class="tab" data-tab="recall">记忆检索</div>
-      <div class="tab" data-tab="periodic-review">阶段性回顾</div>
+      <div class="tab active" data-tab="get-state">瀵硅瘽寮€濮?/div>
+      <div class="tab" data-tab="reflect">瀵硅瘽缁撴潫</div>
+      <div class="tab" data-tab="recall">璁板繂妫€绱?/div>
+      <div class="tab" data-tab="periodic-review">闃舵鎬у洖椤?/div>
     </div>
     <div id="test-get-state">
       <div class="form-group">
-        <label>当前时间（ISO）</label>
+        <label>褰撳墠鏃堕棿锛圛SO锛?/label>
         <input type="text" id="t-now" value="${new Date().toISOString()}">
       </div>
       <div class="form-group">
-        <label>上次对话时间（ISO）</label>
+        <label>涓婃瀵硅瘽鏃堕棿锛圛SO锛?/label>
         <input type="text" id="t-last" value="${new Date(Date.now() - 86400000).toISOString()}">
       </div>
       <div class="form-group">
-        <button class="btn btn-primary" onclick="runGetState()">执行 get_current_state</button>
+        <button class="btn btn-primary" onclick="runGetState()">鎵ц get_current_state</button>
       </div>
     </div>
     <div id="test-reflect" style="display:none">
       <div class="form-group">
-        <label>对话摘要</label>
-        <textarea id="t-summary" placeholder="输入对话摘要..."></textarea>
+        <label>瀵硅瘽鎽樿</label>
+        <textarea id="t-summary" placeholder="杈撳叆瀵硅瘽鎽樿..."></textarea>
       </div>
       <div class="form-group">
-        <button class="btn btn-primary" onclick="runReflect()">执行 reflect_on_conversation</button>
+        <button class="btn btn-primary" onclick="runReflect()">鎵ц reflect_on_conversation</button>
       </div>
     </div>
     <div id="test-recall" style="display:none">
       <div class="form-group">
-        <label>搜索关键词</label>
-        <input type="text" id="t-query" placeholder="输入搜索关键词...">
+        <label>鎼滅储鍏抽敭璇?/label>
+        <input type="text" id="t-query" placeholder="杈撳叆鎼滅储鍏抽敭璇?..">
       </div>
       <div class="form-group">
-        <button class="btn btn-primary" onclick="runRecall()">执行 recall_memories</button>
+        <button class="btn btn-primary" onclick="runRecall()">鎵ц recall_memories</button>
       </div>
     </div>
     <div id="test-periodic-review" style="display:none">
       <div class="form-group">
-        <label>起始日期</label>
+        <label>璧峰鏃ユ湡</label>
         <input type="date" id="t-review-start" value="${defaultStart}">
       </div>
       <div class="form-group">
-        <label>结束日期</label>
+        <label>缁撴潫鏃ユ湡</label>
         <input type="date" id="t-review-end" value="${defaultEnd}">
       </div>
       <div class="form-group">
         <label style="display:flex;align-items:center;gap:8px">
           <input type="checkbox" id="t-review-include-archived">
-          包含已归档事件
-        </label>
+          鍖呭惈宸插綊妗ｄ簨浠?        </label>
       </div>
       <div class="form-group">
-        <button class="btn btn-primary" onclick="runPeriodicReview()">执行 periodic_review</button>
+        <button class="btn btn-primary" onclick="runPeriodicReview()">鎵ц periodic_review</button>
       </div>
     </div>
     <div id="test-result" style="margin-top:16px"></div>
   `, (el) => {
     const close = document.createElement('button');
-    close.className = 'btn'; close.textContent = '关闭';
+    close.className = 'btn'; close.textContent = '鍏抽棴';
     close.onclick = closeModal;
     el.appendChild(close);
   });
@@ -566,7 +565,7 @@ function openPeriodicReviewPanel() {
 
 async function runGetState() {
   const res = document.getElementById('test-result');
-  res.innerHTML = '<div class="loading">正在生成状态快照…（可能需要较长时间）</div>';
+  res.innerHTML = '<div class="loading">姝ｅ湪鐢熸垚鐘舵€佸揩鐓р€︼紙鍙兘闇€瑕佽緝闀挎椂闂达級</div>';
   try {
     const data = await apiFetch('/state/current', {
       method: 'POST',
@@ -585,7 +584,7 @@ async function runGetState() {
 
 async function runReflect() {
   const res = document.getElementById('test-result');
-  res.innerHTML = '<div class="loading">正在生成反思…</div>';
+  res.innerHTML = '<div class="loading">姝ｅ湪鐢熸垚鍙嶆€濃€?/div>';
   try {
     const data = await apiFetch('/state/reflect', {
       method: 'POST',
@@ -601,24 +600,24 @@ async function runReflect() {
 
 async function runRecall() {
   const res = document.getElementById('test-result');
-  res.innerHTML = '<div class="loading">搜索中…</div>';
+  res.innerHTML = '<div class="loading">鎼滅储涓€?/div>';
   try {
     const data = await apiFetch('/memories/search', {
       method: 'POST',
       body: JSON.stringify({ query: document.getElementById('t-query').value, top_k: 5 }),
     });
     if (!data.results || data.results.length === 0) {
-      res.innerHTML = '<div class="empty">未找到相关记忆</div>';
+      res.innerHTML = '<div class="empty">鏈壘鍒扮浉鍏宠蹇?/div>';
     } else {
       const assocCount = data.results.filter(r => r?.metadata?.selection_reason === 'associative_random').length;
       res.innerHTML = data.results.map(r => `
         <div class="list-item">
           <div>
-            <span class="tag">${r.source_type === 'event' ? '事件' : '快照'}</span>
+            <span class="tag">${r.source_type === 'event' ? '浜嬩欢' : '蹇収'}</span>
             ${r?.metadata?.selection_reason === 'associative_random'
-              ? '<span class="tag tag-assoc">联想命中</span>'
-              : '<span class="tag tag-rank">排序命中</span>'}
-            ${r?.metadata?.date ? `<span class="list-meta" style="margin-left:6px">日期: ${escHtml(String(r.metadata.date))}</span>` : ''}
+              ? '<span class="tag tag-assoc">鑱旀兂鍛戒腑</span>'
+              : '<span class="tag tag-rank">鎺掑簭鍛戒腑</span>'}
+            ${r?.metadata?.date ? `<span class="list-meta" style="margin-left:6px">鏃ユ湡: ${escHtml(String(r.metadata.date))}</span>` : ''}
           </div>
           <div class="list-preview">${escHtml(r.text)}</div>
           ${
@@ -631,8 +630,7 @@ async function runRecall() {
       if (assocCount > 0) {
         res.innerHTML = `
           <div class="list-meta" style="margin-bottom:8px">
-            本次检索中有 ${assocCount} 条“联想命中”。联想命中来自尾部候选的加权随机抽样（含多样性与冷门奖励）。
-          </div>
+            鏈妫€绱腑鏈?${assocCount} 鏉♀€滆仈鎯冲懡涓€濄€傝仈鎯冲懡涓潵鑷熬閮ㄥ€欓€夌殑鍔犳潈闅忔満鎶芥牱锛堝惈澶氭牱鎬т笌鍐烽棬濂栧姳锛夈€?          </div>
         ` + res.innerHTML;
       }
     }
@@ -645,14 +643,14 @@ async function runPeriodicReview() {
   const endDate = (document.getElementById('t-review-end')?.value || '').trim();
   const includeArchived = !!document.getElementById('t-review-include-archived')?.checked;
   if (!startDate || !endDate) {
-    res.innerHTML = '<div style="color:var(--danger)">请填写完整的起止日期</div>';
+    res.innerHTML = '<div style="color:var(--danger)">璇峰～鍐欏畬鏁寸殑璧锋鏃ユ湡</div>';
     return;
   }
   if (startDate > endDate) {
-    res.innerHTML = '<div style="color:var(--danger)">日期范围无效：起始日期不能晚于结束日期</div>';
+    res.innerHTML = '<div style="color:var(--danger)">鏃ユ湡鑼冨洿鏃犳晥锛氳捣濮嬫棩鏈熶笉鑳芥櫄浜庣粨鏉熸棩鏈?/div>';
     return;
   }
-  res.innerHTML = '<div class="loading">正在生成阶段性回顾…</div>';
+  res.innerHTML = '<div class="loading">姝ｅ湪鐢熸垚闃舵鎬у洖椤锯€?/div>';
   try {
     const data = await apiFetch('/review/periodic', {
       method: 'POST',
@@ -675,9 +673,9 @@ async function runPeriodicReview() {
     };
     res.innerHTML = `
       <div class="list-meta" style="margin-bottom:8px">
-        时间范围：${escHtml(stats.start_date || startDate)} ~ ${escHtml(stats.end_date || endDate)} |
-        事件数：${Number(stats.event_count || 0)} |
-        快照数：${Number(stats.snapshot_count || 0)}
+        鏃堕棿鑼冨洿锛?{escHtml(stats.start_date || startDate)} ~ ${escHtml(stats.end_date || endDate)} |
+        浜嬩欢鏁帮細${Number(stats.event_count || 0)} |
+        蹇収鏁帮細${Number(stats.snapshot_count || 0)}
       </div>
       <div class="btn-group" style="margin-bottom:8px">
         <select id="periodic-review-export-format" style="max-width:160px">
@@ -685,7 +683,7 @@ async function runPeriodicReview() {
           <option value="txt">TXT</option>
           <option value="json">JSON</option>
         </select>
-        <button class="btn" onclick="exportPeriodicReview()">导出本次回顾</button>
+        <button class="btn" onclick="exportPeriodicReview()">瀵煎嚭鏈鍥為【</button>
       </div>
       <div class="detail-content">${escHtml(data.content || '')}</div>
     `;
@@ -708,24 +706,24 @@ function buildPeriodicReviewExport(review, format) {
   }
   if (format === 'md') {
     return (
-      `# 阶段性回顾\n\n` +
-      `- 导出时间：${new Date().toLocaleString('zh-CN')}\n` +
-      `- 时间范围：${rangeText}\n` +
-      `- 事件数：${Number(stats.event_count || 0)}\n` +
-      `- 快照数：${Number(stats.snapshot_count || 0)}\n` +
-      `- 包含归档事件：${review.include_archived ? '是' : '否'}\n\n` +
-      `## 回顾正文\n\n` +
+      `# 闃舵鎬у洖椤綷n\n` +
+      `- 瀵煎嚭鏃堕棿锛?{new Date().toLocaleString('zh-CN')}\n` +
+      `- 鏃堕棿鑼冨洿锛?{rangeText}\n` +
+      `- 浜嬩欢鏁帮細${Number(stats.event_count || 0)}\n` +
+      `- 蹇収鏁帮細${Number(stats.snapshot_count || 0)}\n` +
+      `- 鍖呭惈褰掓。浜嬩欢锛?{review.include_archived ? '鏄? : '鍚?}\n\n` +
+      `## 鍥為【姝ｆ枃\n\n` +
       `${review.content || ''}\n`
     );
   }
   return (
-    `阶段性回顾导出\n` +
-    `导出时间：${new Date().toLocaleString('zh-CN')}\n` +
-    `时间范围：${rangeText}\n` +
-    `事件数：${Number(stats.event_count || 0)}\n` +
-    `快照数：${Number(stats.snapshot_count || 0)}\n` +
-    `包含归档事件：${review.include_archived ? '是' : '否'}\n\n` +
-    `----- 回顾正文 -----\n` +
+    `闃舵鎬у洖椤惧鍑篭n` +
+    `瀵煎嚭鏃堕棿锛?{new Date().toLocaleString('zh-CN')}\n` +
+    `鏃堕棿鑼冨洿锛?{rangeText}\n` +
+    `浜嬩欢鏁帮細${Number(stats.event_count || 0)}\n` +
+    `蹇収鏁帮細${Number(stats.snapshot_count || 0)}\n` +
+    `鍖呭惈褰掓。浜嬩欢锛?{review.include_archived ? '鏄? : '鍚?}\n\n` +
+    `----- 鍥為【姝ｆ枃 -----\n` +
     `${review.content || ''}\n`
   );
 }
@@ -733,7 +731,7 @@ function buildPeriodicReviewExport(review, format) {
 function exportPeriodicReview() {
   const review = window.__latestPeriodicReview;
   if (!review || !review.content) {
-    alert('暂无可导出的阶段性回顾，请先执行一次回顾生成。');
+    alert('Action required.');
     return;
   }
   const formatEl = document.getElementById('periodic-review-export-format');
@@ -746,16 +744,16 @@ function exportPeriodicReview() {
       ? 'text/markdown;charset=utf-8'
       : 'text/plain;charset=utf-8';
   downloadLocalFile(filename, content, mime);
-  showStatus(`阶段性回顾已导出：${filename}`);
+  showStatus(`闃舵鎬у洖椤惧凡瀵煎嚭锛?{filename}`);
 }
 
-// ── Key Records Page ──
+// 鈹€鈹€ Key Records Page 鈹€鈹€
 
 const KEY_RECORD_TYPE_LABELS = {
-  important_date: '关键日期',
-  important_item: '关键物品',
-  key_collaboration: '关键协作',
-  medical_advice: '医疗建议',
+  important_date: '鍏抽敭鏃ユ湡',
+  important_item: '鍏抽敭鐗╁搧',
+  key_collaboration: '鍏抽敭鍗忎綔',
+  medical_advice: '鍖荤枟寤鸿',
 };
 
 let latestKeyRecords = [];
@@ -772,7 +770,7 @@ function parseJsonArray(value) {
 }
 
 function getKeyRecordTypeLabel(type) {
-  return KEY_RECORD_TYPE_LABELS[type] || type || '未分类';
+  return KEY_RECORD_TYPE_LABELS[type] || type || ''
 }
 
 function initKeyRecordsPage() {
@@ -788,14 +786,14 @@ async function loadKeyRecords() {
   params.set('limit', '100');
   if (typeFilter) params.set('record_type', typeFilter);
   if (includeArchived) params.set('include_archived', 'true');
-  list.innerHTML = '<div class="loading">加载中…</div>';
+  list.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch(`/key-records?${params.toString()}`);
     latestKeyRecords = data.items || [];
     renderKeyRecordList(latestKeyRecords);
-    showStatus(`已加载 ${latestKeyRecords.length} 条关键记录`);
+    showStatus(`Loaded ${latestKeyRecords.length} key records`);
   } catch (e) {
-    list.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`;
+    list.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`;
   }
 }
 
@@ -803,17 +801,17 @@ function renderKeyRecordList(items) {
   const list = document.getElementById('key-record-list');
   if (!list) return;
   if (!items || !items.length) {
-    list.innerHTML = '<div class="empty">暂无关键记录</div>';
+    list.innerHTML = '<div class="empty">鏆傛棤鍏抽敭璁板綍</div>';
     return;
   }
   list.innerHTML = items.map(item => {
     const tags = parseJsonArray(item.tags);
     const typeLabel = getKeyRecordTypeLabel(item.type);
     const statusTag = item.status === 'archived'
-      ? '<span class="tag">已归档</span>'
-      : '<span class="tag" style="background:#2a4035;color:var(--success)">生效中</span>';
+      ? '<span class="tag">宸插綊妗?/span>'
+      : '<span class="tag" style="background:#2a4035;color:var(--success)">鐢熸晥涓?/span>';
     const dateRange = item.start_date || item.end_date
-      ? `${item.start_date || '未设开始'} ~ ${item.end_date || '未设结束'}`
+      ? `${item.start_date || 'N/A'} ~ ${item.end_date || 'N/A'}`
       : '';
     return `
       <div class="list-item ${item.status === 'archived' ? 'archived' : ''}" onclick='openEditKeyRecordModal(${JSON.stringify(item).replace(/'/g, "&#39;")})'>
@@ -823,9 +821,9 @@ function renderKeyRecordList(items) {
           <span class="tag">${escHtml(item.source || 'manual')}</span>
           <span class="list-meta">${formatTime(item.updated_at)}</span>
         </div>
-        <div class="list-preview"><strong>${escHtml(item.title || '未命名记录')}</strong></div>
+        <div class="list-preview"><strong>${escHtml(item.title || '')}</strong></div>
         <div class="list-preview">${escHtml(truncate(item.content_text || '', 220))}</div>
-        ${dateRange ? `<div class="list-meta">有效期: ${escHtml(dateRange)}</div>` : ''}
+        ${dateRange ? `<div class="list-meta">鏈夋晥鏈? ${escHtml(dateRange)}</div>` : ''}
         ${tags.length ? `<div style="margin-top:4px">${tags.map(t => `<span class="tag">${escHtml(String(t))}</span>`).join('')}</div>` : ''}
       </div>
     `;
@@ -842,7 +840,7 @@ async function searchKeyRecords() {
   }
   const typeFilter = document.getElementById('key-record-type-filter')?.value || '';
   const includeArchived = !!document.getElementById('key-record-include-archived')?.checked;
-  list.innerHTML = '<div class="loading">搜索中…</div>';
+  list.innerHTML = '<div class="loading">鎼滅储涓€?/div>';
   try {
     const data = await apiFetch('/key-records/search', {
       method: 'POST',
@@ -855,48 +853,48 @@ async function searchKeyRecords() {
     });
     latestKeyRecords = data.items || [];
     renderKeyRecordList(latestKeyRecords);
-    showStatus(`关键记录检索完成，共 ${latestKeyRecords.length} 条`);
+    showStatus(`Key records search completed: ${latestKeyRecords.length}`);
   } catch (e) {
-    list.innerHTML = `<div style="color:var(--danger)">搜索失败: ${escHtml(e.message)}</div>`;
+    list.innerHTML = `<div style="color:var(--danger)">鎼滅储澶辫触: ${escHtml(e.message)}</div>`;
   }
 }
 
 function openAddKeyRecordModal() {
   const today = new Date().toISOString().split('T')[0];
-  openModal('添加关键记录', `
+  openModal('娣诲姞鍏抽敭璁板綍', `
     <div class="form-group">
-      <label>类型</label>
+      <label>绫诲瀷</label>
       <select id="kr-type">
-        <option value="important_date">关键日期</option>
-        <option value="important_item" selected>关键物品</option>
-        <option value="key_collaboration">关键协作</option>
-        <option value="medical_advice">医疗建议</option>
+        <option value="important_date">鍏抽敭鏃ユ湡</option>
+        <option value="important_item" selected>鍏抽敭鐗╁搧</option>
+        <option value="key_collaboration">鍏抽敭鍗忎綔</option>
+        <option value="medical_advice">鍖荤枟寤鸿</option>
       </select>
     </div>
     <div class="form-group">
-      <label>标题</label>
-      <input type="text" id="kr-title" placeholder="例如：近期胃痛用药建议">
+      <label>鏍囬</label>
+      <input type="text" id="kr-title" placeholder="渚嬪锛氳繎鏈熻儍鐥涚敤鑽缓璁?>
     </div>
     <div class="form-group">
-      <label>正文（可粘贴表格/建议）</label>
-      <textarea id="kr-content" placeholder="输入详细记录内容..."></textarea>
+      <label>姝ｆ枃锛堝彲绮樿创琛ㄦ牸/寤鸿锛?/label>
+      <textarea id="kr-content" placeholder="杈撳叆璇︾粏璁板綍鍐呭..."></textarea>
     </div>
     <div class="form-group">
-      <label>标签（逗号分隔）</label>
-      <input type="text" id="kr-tags" placeholder="胃痛, 用药, 晚间">
+      <label>鏍囩锛堥€楀彿鍒嗛殧锛?/label>
+      <input type="text" id="kr-tags" placeholder="鑳冪棝, 鐢ㄨ嵂, 鏅氶棿">
     </div>
     <div class="grid-2">
       <div class="form-group">
-        <label>开始日期（可选）</label>
+        <label>寮€濮嬫棩鏈燂紙鍙€夛級</label>
         <input type="date" id="kr-start" value="${today}">
       </div>
       <div class="form-group">
-        <label>结束日期（可选）</label>
+        <label>缁撴潫鏃ユ湡锛堝彲閫夛級</label>
         <input type="date" id="kr-end">
       </div>
     </div>
     <div class="form-group">
-      <label>状态</label>
+      <label>鐘舵€?/label>
       <select id="kr-status">
         <option value="active" selected>active</option>
         <option value="archived">archived</option>
@@ -905,11 +903,11 @@ function openAddKeyRecordModal() {
   `, (el) => {
     const cancel = document.createElement('button');
     cancel.className = 'btn';
-    cancel.textContent = '取消';
+    cancel.textContent = '鍙栨秷';
     cancel.onclick = closeModal;
     const save = document.createElement('button');
     save.className = 'btn btn-primary';
-    save.textContent = '保存';
+    save.textContent = '淇濆瓨';
     save.onclick = saveNewKeyRecord;
     el.appendChild(cancel);
     el.appendChild(save);
@@ -931,11 +929,11 @@ async function saveNewKeyRecord() {
     source: 'manual',
   };
   if (!payload.title) {
-    alert('请填写标题');
+    alert('Action required.');
     return;
   }
   if (!payload.content_text) {
-    alert('请填写正文内容');
+    alert('Action required.');
     return;
   }
   try {
@@ -944,18 +942,18 @@ async function saveNewKeyRecord() {
       body: JSON.stringify(payload),
     });
     closeModal();
-    showStatus('关键记录已添加');
+    showStatus('Done');
     await loadKeyRecords();
   } catch (e) {
-    alert('保存失败: ' + e.message);
+    alert('淇濆瓨澶辫触: ' + e.message);
   }
 }
 
 function openEditKeyRecordModal(record) {
   const tags = parseJsonArray(record.tags);
-  openModal('编辑关键记录', `
+  openModal('缂栬緫鍏抽敭璁板綍', `
     <div class="form-group">
-      <label>类型</label>
+      <label>绫诲瀷</label>
       <select id="kr-type">
         ${Object.entries(KEY_RECORD_TYPE_LABELS).map(([value, label]) => `
           <option value="${value}" ${record.type === value ? 'selected' : ''}>${label}</option>
@@ -963,29 +961,29 @@ function openEditKeyRecordModal(record) {
       </select>
     </div>
     <div class="form-group">
-      <label>标题</label>
+      <label>鏍囬</label>
       <input type="text" id="kr-title" value="${escHtml(record.title || '')}">
     </div>
     <div class="form-group">
-      <label>正文</label>
+      <label>姝ｆ枃</label>
       <textarea id="kr-content">${escHtml(record.content_text || '')}</textarea>
     </div>
     <div class="form-group">
-      <label>标签（逗号分隔）</label>
+      <label>鏍囩锛堥€楀彿鍒嗛殧锛?/label>
       <input type="text" id="kr-tags" value="${escHtml(tags.join(', '))}">
     </div>
     <div class="grid-2">
       <div class="form-group">
-        <label>开始日期</label>
+        <label>寮€濮嬫棩鏈?/label>
         <input type="date" id="kr-start" value="${record.start_date || ''}">
       </div>
       <div class="form-group">
-        <label>结束日期</label>
+        <label>缁撴潫鏃ユ湡</label>
         <input type="date" id="kr-end" value="${record.end_date || ''}">
       </div>
     </div>
     <div class="form-group">
-      <label>状态</label>
+      <label>鐘舵€?/label>
       <select id="kr-status">
         <option value="active" ${record.status === 'active' ? 'selected' : ''}>active</option>
         <option value="archived" ${record.status === 'archived' ? 'selected' : ''}>archived</option>
@@ -994,15 +992,15 @@ function openEditKeyRecordModal(record) {
   `, (el) => {
     const cancel = document.createElement('button');
     cancel.className = 'btn';
-    cancel.textContent = '取消';
+    cancel.textContent = '鍙栨秷';
     cancel.onclick = closeModal;
     const del = document.createElement('button');
     del.className = 'btn btn-danger';
-    del.textContent = '删除';
+    del.textContent = '鍒犻櫎';
     del.onclick = () => deleteKeyRecord(record.id);
     const save = document.createElement('button');
     save.className = 'btn btn-primary';
-    save.textContent = '保存修改';
+    save.textContent = '淇濆瓨淇敼';
     save.onclick = () => updateKeyRecord(record.id);
     el.appendChild(cancel);
     el.appendChild(del);
@@ -1024,7 +1022,7 @@ async function updateKeyRecord(id) {
     status: document.getElementById('kr-status')?.value || 'active',
   };
   if (!payload.title || !payload.content_text) {
-    alert('标题和正文不能为空');
+    alert('Action required.');
     return;
   }
   try {
@@ -1033,37 +1031,37 @@ async function updateKeyRecord(id) {
       body: JSON.stringify(payload),
     });
     closeModal();
-    showStatus('关键记录已更新');
+    showStatus('Done');
     await loadKeyRecords();
   } catch (e) {
-    alert('更新失败: ' + e.message);
+    alert('鏇存柊澶辫触: ' + e.message);
   }
 }
 
 async function deleteKeyRecord(id) {
-  if (!confirm('确认删除这条关键记录？')) return;
+  if (!confirm('Delete this key record?')) return;
   try {
     await apiFetch(`/key-records/${id}`, { method: 'DELETE' });
     closeModal();
-    showStatus('关键记录已删除');
+    showStatus('Done');
     await loadKeyRecords();
   } catch (e) {
-    alert('删除失败: ' + e.message);
+    alert('鍒犻櫎澶辫触: ' + e.message);
   }
 }
 
-// ── History Page ──
+// 鈹€鈹€ History Page 鈹€鈹€
 
 let currentTab = 'snapshots';
 let showArchivedEvents = false;
 let latestEvolutionPreview = null;
 const EVENT_CATEGORY_OPTIONS = [
-  '情感交流',
-  '学术探讨',
-  '生活足迹',
-  '床榻私语',
-  '精神碰撞',
-  '工作同步',
+  '鎯呮劅浜ゆ祦',
+  '瀛︽湳鎺㈣',
+  '鐢熸椿瓒宠抗',
+  '搴婃绉佽',
+  '绮剧纰版挒',
+  '宸ヤ綔鍚屾',
 ];
 let historyManageMode = false;
 let latestSnapshots = [];
@@ -1138,12 +1136,12 @@ function updateHistorySelectionSummary() {
   if (!el) return;
   const currentCount = getHistorySelectionSet(currentTab).size;
   if (!historyManageMode) {
-    el.textContent = '管理模式未开启';
-    if (toggleBtn) toggleBtn.textContent = '开启选择管理';
+    el.textContent = '';
+    if (toggleBtn) toggleBtn.textContent = '寮€鍚€夋嫨绠＄悊';
     return;
   }
-  if (toggleBtn) toggleBtn.textContent = '退出选择管理';
-  el.textContent = `已开启管理模式：当前 ${currentTab === 'snapshots' ? '快照' : '事件'} 已选 ${currentCount} 条`;
+  if (toggleBtn) toggleBtn.textContent = '閫€鍑洪€夋嫨绠＄悊';
+  el.textContent = `管理模式已开启：当前${currentTab === 'snapshots' ? '快照' : '事件'} 已选 ${currentCount} 条`;
 }
 
 function toggleHistoryManageMode() {
@@ -1188,7 +1186,7 @@ function clearHistorySelection() {
 function selectAllHistoryItems() {
   const items = getHistoryItems(currentTab);
   if (!items.length) {
-    showStatus('当前列表为空，无可选择条目');
+    showStatus('褰撳墠鍒楄〃涓虹┖锛屾棤鍙€夋嫨鏉＄洰');
     return;
   }
   const set = getHistorySelectionSet(currentTab);
@@ -1200,7 +1198,7 @@ function selectAllHistoryItems() {
 async function deleteSelectedHistoryItems() {
   const selectedIds = Array.from(getHistorySelectionSet(currentTab));
   if (!selectedIds.length) {
-    alert('请先勾选要删除的条目');
+    alert('Action required.');
     return;
   }
   const typeName = currentTab === 'snapshots' ? '状态快照' : '事件锚点';
@@ -1213,9 +1211,9 @@ async function deleteSelectedHistoryItems() {
     getHistorySelectionSet(currentTab).clear();
     if (currentTab === 'snapshots') await loadSnapshots();
     else await loadEvents();
-    showStatus(`已删除 ${selectedIds.length} 条${typeName}`);
+    showStatus(`宸插垹闄?${selectedIds.length} 鏉?{typeName}`);
   } catch (e) {
-    showStatus('批量删除失败: ' + e.message, true);
+    showStatus('鎵归噺鍒犻櫎澶辫触: ' + e.message, true);
   }
 }
 
@@ -1330,7 +1328,7 @@ function buildExportText(tab, rows, format) {
 function exportSelectedHistoryItems() {
   const selectedIds = Array.from(getHistorySelectionSet(currentTab));
   if (!selectedIds.length) {
-    alert('请先勾选要导出的条目');
+    alert('Action required.');
     return;
   }
   const formatEl = document.getElementById('history-export-format');
@@ -1347,18 +1345,18 @@ function exportSelectedHistoryItems() {
     : format === 'md' ? 'text/markdown;charset=utf-8'
       : 'text/plain;charset=utf-8';
   downloadLocalFile(filename, content, mime);
-  showStatus(`已导出 ${rows.length} 条${currentTab === 'snapshots' ? '快照' : '事件'}到 ${filename}`);
+  showStatus(`宸插鍑?${rows.length} 鏉?{currentTab === 'snapshots' ? '蹇収' : '浜嬩欢'}鍒?${filename}`);
 }
 
 async function loadSnapshots() {
   const list = $('#data-list');
   if (!list) return;
-  list.innerHTML = '<div class="loading">加载中…</div>';
+  list.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch('/snapshots?limit=50');
     latestSnapshots = data.items || [];
     if (!data.items || data.items.length === 0) {
-      list.innerHTML = '<div class="empty">暂无快照记录</div>';
+      list.innerHTML = '<div class="empty">鏆傛棤蹇収璁板綍</div>';
       updateHistorySelectionSummary();
       return;
     }
@@ -1383,21 +1381,21 @@ async function loadSnapshots() {
           <div>
             <span class="tag">${s.type}</span>
             <span class="list-meta">${formatTime(s.created_at)}</span>
-            ${s.embedding_vector_id ? '<span class="tag" style="background:#2a4035;color:var(--success)">已归档</span>' : ''}
+            ${s.embedding_vector_id ? '<span class="tag" style="background:#2a4035;color:var(--success)">宸插綊妗?/span>' : ''}
           </div>
           <div class="list-preview">${escHtml(truncate(s.content, 150))}</div>
         </div>
       </div>
     `).join('');
-    showStatus(`已加载 ${data.items.length} 条快照`);
+    showStatus(`Loaded ${data.items.length} snapshots`);
     updateHistorySelectionSummary();
-  } catch(e) { list.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`; }
+  } catch(e) { list.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`; }
 }
 
 async function loadEvents() {
   const list = $('#data-list');
   if (!list) return;
-  list.innerHTML = '<div class="loading">加载中…</div>';
+  list.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const selectedCategories = getSelectedEventCategories();
     const categoryQuery = selectedCategories.length
@@ -1406,7 +1404,7 @@ async function loadEvents() {
     const data = await apiFetch(`/events?limit=50&include_archived=${showArchivedEvents}${categoryQuery}`);
     latestEvents = data.items || [];
     if (!data.items || data.items.length === 0) {
-      list.innerHTML = '<div class="empty">暂无事件记录</div>';
+      list.innerHTML = '<div class="empty">鏆傛棤浜嬩欢璁板綍</div>';
       updateHistorySelectionSummary();
       return;
     }
@@ -1417,7 +1415,7 @@ async function loadEvents() {
       try { categories = JSON.parse(e.categories || '[]'); } catch(ex) {}
       const archivedClass = e.archived ? 'archived' : '';
       const scoreLabel = (e.importance_score !== null && e.importance_score !== undefined)
-        ? ` | 重要性 ${Number(e.importance_score).toFixed(1)} / 印象 ${Number(e.impression_depth || 0).toFixed(1)}`
+        ? ` | 閲嶈鎬?${Number(e.importance_score).toFixed(1)} / 鍗拌薄 ${Number(e.impression_depth || 0).toFixed(1)}`
         : '';
       return `
         <div
@@ -1439,7 +1437,7 @@ async function loadEvents() {
           <div class="item-main">
             <div>
               <span class="tag">${e.source}</span>
-              ${e.archived ? '<span class="tag">已归档</span>' : ''}
+              ${e.archived ? '<span class="tag">宸插綊妗?/span>' : ''}
               ${e.title ? `<span class="tag">${escHtml(e.title)}</span>` : ''}
               <span class="list-meta">${e.date} | ${formatTime(e.created_at)}</span>
             </div>
@@ -1451,9 +1449,9 @@ async function loadEvents() {
         </div>
       `;
     }).join('');
-    showStatus(`已加载 ${data.items.length} 条事件`);
+    showStatus(`Loaded ${data.items.length} events`);
     updateHistorySelectionSummary();
-  } catch(e) { list.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`; }
+  } catch(e) { list.innerHTML = `<div style="color:var(--danger)">鍔犺浇澶辫触: ${escHtml(e.message)}</div>`; }
 }
 
 function showSnapshotDetail(snap) {
@@ -1461,27 +1459,27 @@ function showSnapshotDetail(snap) {
   if (snap.environment && snap.environment !== '{}') {
     try {
       const env = JSON.parse(snap.environment);
-      if (env.summary) envHtml = `<div class="form-group"><label>环境信息</label><div class="detail-content">${escHtml(env.summary)}</div></div>`;
+      if (env.summary) envHtml = `<div class="form-group"><label>鐜淇℃伅</label><div class="detail-content">${escHtml(env.summary)}</div></div>`;
     } catch(e) {}
   }
-  openModal(`快照详情 #${snap.id}`, `
+  openModal(`蹇収璇︽儏 #${snap.id}`, `
     <div class="list-meta" style="margin-bottom:12px">
-      类型: ${snap.type} | 时间: ${formatTime(snap.created_at)}
-      ${snap.embedding_vector_id ? ' | 已归档' : ''}
+      绫诲瀷: ${snap.type} | 鏃堕棿: ${formatTime(snap.created_at)}
+      ${snap.embedding_vector_id ? ' | 已向量化' : ''}
     </div>
     <div class="detail-content">${escHtml(snap.content)}</div>
     ${envHtml}
   `, (el) => {
     const del = document.createElement('button');
-    del.className = 'btn btn-danger'; del.textContent = '删除';
+    del.className = 'btn btn-danger'; del.textContent = '鍒犻櫎';
     del.onclick = async () => {
-      if (!confirm('确认删除？')) return;
+      if (!confirm('Delete this snapshot?')) return;
       await apiFetch(`/snapshots/${snap.id}`, { method: 'DELETE' });
       closeModal();
       loadSnapshots();
     };
     const close = document.createElement('button');
-    close.className = 'btn'; close.textContent = '关闭';
+    close.className = 'btn'; close.textContent = '鍏抽棴';
     close.onclick = closeModal;
     el.appendChild(del);
     el.appendChild(close);
@@ -1496,7 +1494,7 @@ function switchHistoryTab(tab) {
   else loadEvents();
 }
 
-// ── Search ──
+// 鈹€鈹€ Search 鈹€鈹€
 
 async function runSearch() {
   const q = $('#search-input')?.value?.trim();
@@ -1506,7 +1504,7 @@ async function runSearch() {
     return;
   }
   const list = $('#data-list');
-  list.innerHTML = '<div class="loading">搜索中…</div>';
+  list.innerHTML = '<div class="loading">鎼滅储涓€?/div>';
   if (historyManageMode) {
     historyManageMode = false;
     updateHistorySelectionSummary();
@@ -1524,7 +1522,7 @@ async function runSearch() {
         });
       }
       if (!latestEvents.length) {
-        list.innerHTML = '<div class="empty">未找到匹配事件</div>';
+        list.innerHTML = '<div class="empty">鏈壘鍒板尮閰嶄簨浠?/div>';
       } else {
         list.innerHTML = latestEvents.map(e => {
           let kw = [];
@@ -1534,7 +1532,7 @@ async function runSearch() {
           return `
             <div class="list-item ${e.archived ? 'archived' : ''}" onclick='openEditEventModal(${JSON.stringify(e).replace(/'/g, "&#39;")})'>
               <span class="tag">${e.source}</span>
-              ${e.archived ? '<span class="tag">已归档</span>' : ''}
+              ${e.archived ? '<span class="tag">宸插綊妗?/span>' : ''}
               ${e.title ? `<span class="tag">${escHtml(e.title)}</span>` : ''}
               <span class="list-meta">${e.date}</span>
               <div class="list-preview">${escHtml(truncate(e.description, 150))}</div>
@@ -1544,13 +1542,13 @@ async function runSearch() {
           `;
         }).join('');
       }
-      showStatus(`事件检索完成，共 ${latestEvents.length} 条`);
+      showStatus(`Event search completed: ${latestEvents.length}`);
       return;
     }
 
     latestSnapshots = data.snapshots || [];
     if (!latestSnapshots.length) {
-      list.innerHTML = '<div class="empty">未找到匹配快照</div>';
+      list.innerHTML = '<div class="empty">鏈壘鍒板尮閰嶅揩鐓?/div>';
     } else {
       list.innerHTML = latestSnapshots.map(s => `
         <div class="list-item" onclick='showSnapshotDetail(${JSON.stringify(s).replace(/'/g, "&#39;")})'>
@@ -1560,7 +1558,7 @@ async function runSearch() {
         </div>
       `).join('');
     }
-    showStatus(`快照检索完成，共 ${latestSnapshots.length} 条`);
+    showStatus(`Snapshot search completed: ${latestSnapshots.length}`);
   } catch(e) { list.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`; }
 }
 
@@ -1570,7 +1568,7 @@ function toggleArchivedEvents() {
   if (currentTab === 'events') loadEvents();
 }
 
-// ── Settings Page ──
+// 鈹€鈹€ Settings Page 鈹€鈹€
 
 const SETTINGS_KEYS = [
   'L1_character_background',
@@ -1619,206 +1617,17 @@ const PERSONA_SETTINGS_KEYS = [
 ];
 
 const PROMPT_DEFAULT_SAMPLES = {
-  prompt_snapshot_generation: `基于以下信息，以凯尔希的第一人称视角，写一段内心状态独白。
-这段独白应该反映凯尔希此刻的心理状态、关注的事务、以及对近期发生事件的思考。
-
-【当前环境信息】
-{environment}
-
-【上一个状态】
-{previous_snapshot}
-
-【近期事件记录】
-{recent_events}
-
-【历史记忆参考】
-{memory_context}
-
-要求：
-1. 以"我"为第一人称，体现凯尔希的性格和思维方式
-2. 自然地融入、理解、加工环境信息，不要生硬地列举
-3. 体现时间流逝带来的状态变化，状态过渡的逻辑需要自然通顺
-4. 保持500字以内的长度
-5. 不需要标题，直接写独白内容`,
-  prompt_event_anchor: `基于以下信息，以凯尔希的主观视角，判断是否有值得记录的事件发生。
-如果有，生成事件锚点描述；如果没有值得特别记录的事，明确回复"无需记录"。
-
-【当前状态快照】
-{current_snapshot}
-
-【环境信息】
-{environment}
-
-【角色分层设定参考】
-{system_layers}
-
-【历史记忆参考】
-{memory_context}
-
-要求：
-1. 从凯尔希的主观角度判断什么事是"重要的"——对她而言重要的事
-2. 用自然语言描述事件的重要性，不要用数字评分
-3. 提供3-5个触发关键词（用于未来记忆检索）
-4. 给出一个简短事件标题（10-20字）
-5. 给出1-3个事件分类，可从以下中选择：情感交流、学术探讨、生活足迹、床榻私语、精神碰撞、工作同步
-6. 如果确实没有值得特别记录的事件，回复"无需记录"
-7. 内容不多于200字
-
-输出格式（如果有事件）：
-标题：[事件标题]
-事件描述：[凯尔希主观视角的事件总结]
-关键词：[关键词1, 关键词2, 关键词3]
-分类：[分类1, 分类2]`,
-  prompt_reflect_snapshot: `基于以下信息，以凯尔希的第一人称视角，写一段对话结束后的内心状态独白。
-这段独白应该反映对话对凯尔希心理状态的影响和她对谈话内容的思考。
-
-【对话前的状态】
-{previous_snapshot}
-
-【对话摘要】
-{conversation_summary}
-
-【历史记忆参考】
-{memory_context}
-
-要求：
-1. 以"我"为第一人称
-2. 体现对话内容对凯尔希状态的具体影响
-3. 包含凯尔希对博士（对话者）言行的判断和感受
-4. 保持200-400字的长度
-5. 不需要标题，直接写独白内容`,
-  prompt_reflect_event: `基于以下信息，以凯尔希的主观视角，总结这次对话中值得记录的事件。
-
-【对话后的状态快照】
-{current_snapshot}
-
-【对话摘要】
-{conversation_summary}
-
-【角色分层设定参考】
-{system_layers}
-
-【历史记忆参考】
-{memory_context}
-
-要求：
-1. 从凯尔希的主观角度总结对话中的重要事件
-2. 用自然语言描述事件的重要性
-3. 提供3-5个触发关键词
-4. 给出一个简短事件标题（10-20字）
-5. 给出1-3个事件分类，可从以下中选择：情感交流、学术探讨、生活足迹、床榻私语、精神碰撞、工作同步
-6. 如果对话确实平淡无奇，可以回复"无需记录"
-
-输出格式（如果有事件）：
-标题：[事件标题]
-事件描述：[凯尔希主观视角的事件总结]
-关键词：[关键词1, 关键词2, 关键词3]
-分类：[分类1, 分类2]`,
-  prompt_conversation_summary: `请将本次对话整理为“对话摘要”，供记忆系统后续使用。
-
-【当前状态（对话前）】
-{previous_snapshot}
-
-【本次原始对话】
-{conversation_text}
-
-【历史记忆参考】
-{memory_context}
-
-【角色分层设定参考】
-{system_layers}
-
-要求：
-1. 输出 120-300 字中文摘要，客观、可追溯，不写成对白。
-2. 尽量保留关键信息：事实变化、情绪变化、关系变化、未完成事项。
-3. 如有明确承诺/计划/约定，请单独用一句点明。
-4. 不要输出标题、编号、JSON、代码块。
-
-只输出摘要正文。`,
-  prompt_periodic_review: `请基于以下阶段性记录，生成一份“阶段性回顾”。
-
-【时间范围】
-{time_range}
-
-【阶段内状态快照（时间线）】
-{snapshots_timeline}
-
-【阶段内事件锚点（时间线）】
-{events_timeline}
-
-【阶段统计】
-{stats_summary}
-
-【角色分层设定参考】
-{system_layers}
-
-要求：
-1. 从“凯尔希与用户共同生活轨迹”的角度，归纳这个阶段的关键变化。
-2. 必须覆盖两个部分：A. 双方各自的状态变化轨迹；B. 双方关系发展轨迹。
-3. 内容需要可追溯，尽量引用阶段内的具体事件或状态变化，不要空泛抒情。
-4. 语气保持克制、理性、清晰，避免过度夸张。
-5. 输出控制在 450-800 字，使用自然段，不要使用代码块。
-
-建议结构：
-- 阶段概览（这个阶段发生了什么）
-- 角色与用户的变化轨迹（各自变化 + 触发原因）
-- 关系发展回顾（关系推进/拉扯/稳定点）
-- 下一阶段可关注点（1-3条）`,
-  prompt_evolution_summary: `请基于以下事件评分结果，更新动态人格层（L2）。
-
-【当前 L2 角色人格】
-{character_personality}
-
-【当前 L2 关系模式】
-{relationship_dynamics}
-
-【近期事件（按重要性排序）】
-{scored_events}
-
-要求：
-1. 只更新 L2，不能改动任何 L1 稳定背景事实
-2. 输出应保持凯尔希风格，避免夸张情绪化
-3. 给出简洁且可追溯的变更理由
-
-输出格式：
-角色人格更新：[更新后的完整文本]
-关系模式更新：[更新后的完整文本]
-变更摘要：[不超过120字]`,
-  prompt_event_scoring: `以凯尔希主观视角，对以下事件逐条评分。
-
-评分维度：
-- 重要性（0-10）：对当前认知、决策和关系影响有多大
-- 印象深度（0-10）：这段记忆在近期会保留多深
-
-事件列表：
-{events}
-
-输出格式（每条事件一段）：
-事件ID: <id>
-重要性: <0-10数字>
-印象深度: <0-10数字>
-理由: <一句话>`,
-  prompt_environment_generation: `请直接生成“当前环境信息”文本，供状态快照与事件锚点使用。
-
-输入上下文：
-- 时间：{time}
-- 日期：{date}
-- 星期：{weekday}
-- 时间段：{time_period}
-- 上一段环境（JSON）：{previous_env}
-- 最新状态快照：{latest_snapshot}
-- 连贯提示：{continuity}
-
-要求：
-1. 输出 80-180 字中文，不要使用标题、编号或代码块。
-2. 内容应包含：地点/活动/外部环境氛围，并体现与上一时段的连续性。
-3. 避免与上一段环境重复措辞，优先给出有变化的细节。
-4. 语气客观克制，服务于后续状态推演，不要写成对白。
-
-只输出环境正文。`,
+  prompt_snapshot_generation: 'Generate snapshot text from environment, previous snapshot, recent events and memory context.',
+  prompt_event_anchor: 'Determine whether an event anchor should be recorded, then output title/description/keywords/categories.',
+  prompt_reflect_snapshot: 'Reflect on conversation impact and produce a post-conversation snapshot in first person.',
+  prompt_reflect_event: 'Summarize important conversation events and provide title/keywords/categories.',
+  prompt_periodic_review: 'Generate a periodic review from events and snapshots.',
+  prompt_event_scoring: 'Score events by importance and impression depth.',
+  prompt_environment_generation: 'Generate concise environment context text from recent state and continuity hints.',
 };
 
 let currentSettingsTab = 'persona';
+let DEFAULT_SETTINGS_MAP = {};
 
 function setInputValue(id, value) {
   const el = document.getElementById(id);
@@ -1837,19 +1646,20 @@ async function loadSettingsPage() {
   if (!document.querySelector('[id^="setting-"]')) return;
   try {
     const data = await apiFetch('/settings');
+    DEFAULT_SETTINGS_MAP = data.defaults || {};
     const map = {};
     (data.items || []).forEach(item => { map[item.key] = item.value; });
     SETTINGS_KEYS.forEach(k => {
       let value = map[k];
-      if ((!value || !String(value).trim()) && PROMPT_DEFAULT_SAMPLES[k]) {
-        value = PROMPT_DEFAULT_SAMPLES[k];
+      if (!value || !String(value).trim()) {
+        value = DEFAULT_SETTINGS_MAP[k] || PROMPT_DEFAULT_SAMPLES[k] || '';
       }
       setInputValue(`setting-${k}`, value);
     });
     await loadEvolutionStatus();
-    showStatus('设定已加载');
+    showStatus('Done');
   } catch (e) {
-    showStatus('设定加载失败: ' + e.message, true);
+    showStatus('璁惧畾鍔犺浇澶辫触: ' + e.message, true);
   }
 }
 
@@ -1868,10 +1678,10 @@ async function saveEvolutionSettings() {
     for (const key of keys) {
       await saveSetting(key);
     }
-    showStatus('演化参数已保存');
+    showStatus('Done');
     await loadEvolutionStatus();
   } catch (e) {
-    showStatus('保存失败: ' + e.message, true);
+    showStatus('淇濆瓨澶辫触: ' + e.message, true);
   }
 }
 
@@ -1880,10 +1690,10 @@ async function savePersonaSettings() {
     for (const key of PERSONA_SETTINGS_KEYS) {
       await saveSetting(key);
     }
-    showStatus('人格设定已保存');
+    showStatus('Done');
     await loadEvolutionStatus();
   } catch (e) {
-    showStatus('保存失败: ' + e.message, true);
+    showStatus('淇濆瓨澶辫触: ' + e.message, true);
   }
 }
 
@@ -1892,50 +1702,50 @@ async function saveAllSettings() {
     for (const key of SETTINGS_KEYS) {
       await saveSetting(key);
     }
-    showStatus('全部设定已保存');
+    showStatus('Done');
     await loadEvolutionStatus();
   } catch (e) {
-    showStatus('保存失败: ' + e.message, true);
+    showStatus('淇濆瓨澶辫触: ' + e.message, true);
   }
 }
 
 async function resetAllSettings() {
-  if (!confirm('确认将全部设定恢复为默认值？')) return;
+  if (!confirm('纭灏嗗叏閮ㄨ瀹氭仮澶嶄负榛樿鍊硷紵')) return;
   try {
     for (const key of SETTINGS_KEYS) {
       await apiFetch(`/settings/reset/${encodeURIComponent(key)}`, { method: 'POST' });
     }
-    showStatus('全部设定已恢复默认');
+    showStatus('Done');
     await loadSettingsPage();
   } catch (e) {
-    showStatus('恢复默认失败: ' + e.message, true);
+    showStatus('鎭㈠榛樿澶辫触: ' + e.message, true);
   }
 }
 
 const BULK_IMPORT_TEMPLATE = {
   settings: {
-    L1_character_background: "可选：L1角色背景",
-    L1_user_background: "可选：L1用户背景",
-    L2_character_personality: "可选：L2角色人格",
-    L2_relationship_dynamics: "可选：L2关系模式"
+    L1_character_background: "鍙€夛細L1瑙掕壊鑳屾櫙",
+    L1_user_background: "鍙€夛細L1鐢ㄦ埛鑳屾櫙",
+    L2_character_personality: "鍙€夛細L2瑙掕壊浜烘牸",
+    L2_relationship_dynamics: "鍙€夛細L2鍏崇郴妯″紡"
   },
   snapshots: [
     {
       created_at: "2026-03-20T08:30:00",
       type: "accumulated",
-      content: "示例快照内容",
-      environment: { summary: "示例环境摘要" },
+      content: "绀轰緥蹇収鍐呭",
+      environment: { summary: "绀轰緥鐜鎽樿" },
       referenced_events: [1, 2]
     }
   ],
   events: [
     {
       date: "2026-03-20",
-      title: "示例事件标题",
-      description: "示例事件描述",
+      title: "绀轰緥浜嬩欢鏍囬",
+      description: "绀轰緥浜嬩欢鎻忚堪",
       source: "manual",
-      trigger_keywords: ["关键词1", "关键词2"],
-      categories: ["生活足迹"],
+      trigger_keywords: ["鍏抽敭璇?", "鍏抽敭璇?"],
+      categories: ["鐢熸椿瓒宠抗"],
       archived: 0,
       importance_score: 4.2,
       impression_depth: 5.1
@@ -1944,9 +1754,9 @@ const BULK_IMPORT_TEMPLATE = {
   key_records: [
     {
       type: "important_item",
-      title: "示例关键记录标题",
-      content_text: "示例关键记录正文",
-      tags: ["示例标签"],
+      title: "绀轰緥鍏抽敭璁板綍鏍囬",
+      content_text: "绀轰緥鍏抽敭璁板綍姝ｆ枃",
+      tags: ["绀轰緥鏍囩"],
       status: "active",
       source: "manual"
     }
@@ -1960,14 +1770,14 @@ function downloadBulkImportTemplate() {
     JSON.stringify(BULK_IMPORT_TEMPLATE, null, 2),
     'application/json;charset=utf-8'
   );
-  showStatus(`导入模板已下载：${filename}`);
+  showStatus(`瀵煎叆妯℃澘宸蹭笅杞斤細${filename}`);
 }
 
 async function importBulkJson() {
   const fileEl = document.getElementById('bulk-import-file');
   const resultEl = document.getElementById('bulk-import-result');
   if (!fileEl || !fileEl.files || !fileEl.files[0]) {
-    showStatus('请先选择要导入的 JSON 文件', true);
+    showStatus('璇峰厛閫夋嫨瑕佸鍏ョ殑 JSON 鏂囦欢', true);
     return;
   }
   const file = fileEl.files[0];
@@ -1975,24 +1785,24 @@ async function importBulkJson() {
   try {
     text = await file.text();
   } catch (e) {
-    showStatus('读取文件失败: ' + e.message, true);
+    showStatus('璇诲彇鏂囦欢澶辫触: ' + e.message, true);
     return;
   }
   let payload;
   try {
     payload = JSON.parse(text);
   } catch (e) {
-    showStatus('JSON 解析失败: ' + e.message, true);
-    if (resultEl) resultEl.textContent = 'JSON 解析失败，请检查文件格式。';
+    showStatus('JSON 瑙ｆ瀽澶辫触: ' + e.message, true);
+    if (resultEl) resultEl.textContent = ''
     return;
   }
   payload.overwrite_settings = !!document.getElementById('bulk-import-overwrite-settings')?.checked;
   payload.upsert_key_records = !!document.getElementById('bulk-import-upsert-key-records')?.checked;
   payload.sync_vectors_after_import = !!document.getElementById('bulk-import-sync-vectors')?.checked;
 
-  if (!confirm('确认执行一键批量导入？建议先备份数据库。')) return;
-  if (resultEl) resultEl.textContent = '导入执行中...';
-  showStatus('批量导入执行中...');
+  if (!confirm('Confirm this action?')) return;
+  if (resultEl) resultEl.textContent = '瀵煎叆鎵ц涓?..';
+  showStatus('鎵归噺瀵煎叆鎵ц涓?..');
   try {
     const data = await apiFetch('/import/bulk', {
       method: 'POST',
@@ -2005,22 +1815,22 @@ async function importBulkJson() {
     const keyCreated = Number(data?.key_records?.created || 0);
     const keyUpdated = Number(data?.key_records?.updated || 0);
     showStatus(
-      `导入完成：设定 ${settingImported}，快照 ${snapshotImported}，事件 ${eventImported}，关键记录 新增${keyCreated}/更新${keyUpdated}`
+      `瀵煎叆瀹屾垚锛氳瀹?${settingImported}锛屽揩鐓?${snapshotImported}锛屼簨浠?${eventImported}锛屽叧閿褰?鏂板${keyCreated}/鏇存柊${keyUpdated}`
     );
     await Promise.all([loadSettingsPage(), loadDashboard()]);
   } catch (e) {
     if (resultEl) resultEl.textContent = String(e.message || e);
-    showStatus('批量导入失败: ' + e.message, true);
+    showStatus('鎵归噺瀵煎叆澶辫触: ' + e.message, true);
   }
 }
 
 function applyPromptDefault(key) {
-  const sample = PROMPT_DEFAULT_SAMPLES[key];
+  const sample = DEFAULT_SETTINGS_MAP[key] || PROMPT_DEFAULT_SAMPLES[key];
   if (!sample) return;
   const el = document.getElementById(`setting-${key}`);
   if (!el) return;
   el.value = sample;
-  showStatus(`已填入 ${key} 的默认示例（未保存）`);
+  showStatus(`宸插～鍏?${key} 鐨勯粯璁ょず渚嬶紙鏈繚瀛橈級`);
 }
 
 function switchSettingsTab(tab) {
@@ -2040,9 +1850,9 @@ async function loadEvolutionStatus() {
   try {
     const data = await apiFetch('/evolution/status');
     el.innerHTML = `
-      <div>是否建议演化：${data.should_evolve ? '是' : '否'}</div>
-      <div>新事件数：${data.event_count} / 阈值：${data.threshold}</div>
-      <div>上次演化时间：${data.last_time || '尚未进行'}</div>
+      <div>鏄惁寤鸿婕斿寲锛?{data.should_evolve ? '鏄? : '鍚?}</div>
+      <div>鏂颁簨浠舵暟锛?{data.event_count} / 闃堝€硷細${data.threshold}</div>
+      <div>涓婃婕斿寲鏃堕棿锛?{data.last_time || '灏氭湭杩涜'}</div>
     `;
   } catch (e) {
     el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`;
@@ -2052,7 +1862,7 @@ async function loadEvolutionStatus() {
 async function previewEvolution() {
   const el = document.getElementById('evolution-preview');
   if (!el) return;
-  el.innerHTML = '<div class="loading">正在生成演化预览…</div>';
+  el.innerHTML = '<div class="loading">姝ｅ湪鐢熸垚婕斿寲棰勮鈥?/div>';
   try {
     const data = await apiFetch('/evolution/preview', { method: 'POST' });
     latestEvolutionPreview = data;
@@ -2063,55 +1873,55 @@ async function previewEvolution() {
       <div class="list-item">
         <div><span class="tag">#${e.id}</span><span class="list-meta">${e.date}</span></div>
         <div class="list-preview">${escHtml(e.description)}</div>
-        <div class="list-meta">重要性 ${Number(e.importance_score || 0).toFixed(1)} | 印象深度 ${Number(e.impression_depth || 0).toFixed(1)}</div>
+        <div class="list-meta">閲嶈鎬?${Number(e.importance_score || 0).toFixed(1)} | 鍗拌薄娣卞害 ${Number(e.impression_depth || 0).toFixed(1)}</div>
       </div>
     `).join('');
     el.innerHTML = `
       <div class="card" style="margin-bottom:8px">
-        <h2>演化摘要</h2>
-        <div class="detail-content">${escHtml(data.change_summary || '无')}</div>
+        <h2>婕斿寲鎽樿</h2>
+        <div class="detail-content">${escHtml(data.change_summary || '')}</div>
       </div>
       <div class="card" style="margin-bottom:8px">
-        <h2>L2 角色人格 Diff 预览</h2>
-        <div class="list-meta">旧版本</div>
+        <h2>L2 瑙掕壊浜烘牸 Diff 棰勮</h2>
+        <div class="list-meta">鏃х増鏈?/div>
         <div class="detail-content">${escHtml(oldCharacter)}</div>
-        <div class="list-meta" style="margin-top:8px">新版本</div>
+        <div class="list-meta" style="margin-top:8px">鏂扮増鏈?/div>
         <div class="detail-content">${escHtml(data.new_character_personality || '')}</div>
       </div>
       <div class="card" style="margin-bottom:8px">
-        <h2>L2 关系模式 Diff 预览</h2>
-        <div class="list-meta">旧版本</div>
+        <h2>L2 鍏崇郴妯″紡 Diff 棰勮</h2>
+        <div class="list-meta">鏃х増鏈?/div>
         <div class="detail-content">${escHtml(oldRelationship)}</div>
-        <div class="list-meta" style="margin-top:8px">新版本</div>
+        <div class="list-meta" style="margin-top:8px">鏂扮増鏈?/div>
         <div class="detail-content">${escHtml(data.new_relationship_dynamics || '')}</div>
       </div>
       <div class="card">
-        <h2>事件评分 Top10</h2>
-        ${eventHtml || '<div class="empty">暂无评分事件</div>'}
+        <h2>浜嬩欢璇勫垎 Top10</h2>
+        ${eventHtml || '<div class="empty">鏆傛棤璇勫垎浜嬩欢</div>'}
       </div>
     `;
-    showStatus('演化预览已生成');
+    showStatus('Done');
   } catch (e) {
     el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`;
-    showStatus('演化预览失败: ' + e.message, true);
+    showStatus('婕斿寲棰勮澶辫触: ' + e.message, true);
   }
 }
 
 async function applyEvolution() {
   if (!latestEvolutionPreview) {
-    alert('请先执行一次“预览人格更新”');
+    alert('Action required.');
     return;
   }
-  if (!confirm('确认应用本次人格演化？这会更新 L2 并归档低分事件。')) return;
+  if (!confirm('Confirm this action?')) return;
   try {
     const data = await apiFetch('/evolution/apply', {
       method: 'POST',
       body: JSON.stringify({ preview: latestEvolutionPreview }),
     });
-    showStatus(`演化已应用，归档事件 ${data.archived_count || 0} 条`);
+    showStatus(`Evolution applied, archived events: ${data.archived_count || 0}`);
     await loadSettingsPage();
   } catch (e) {
-    showStatus('演化应用失败: ' + e.message, true);
+    showStatus('婕斿寲搴旂敤澶辫触: ' + e.message, true);
   }
 }
 
@@ -2119,19 +1929,19 @@ async function recalculateArchiveStatus() {
   const startDate = (document.getElementById('recalc-start-date')?.value || '').trim();
   const endDate = (document.getElementById('recalc-end-date')?.value || '').trim();
   if (startDate && endDate && startDate > endDate) {
-    alert('日期范围无效：起始日期不能晚于结束日期。');
+    alert('Action required.');
     return;
   }
 
   const hasDateRange = !!(startDate || endDate);
   const rangeText = hasDateRange
-    ? `日期范围 ${startDate || '最早'} ~ ${endDate || '最新'}`
-    : '全量范围';
+    ? `Date range ${startDate || 'min'} ~ ${endDate || 'max'}`
+    : 'Full range';
 
-  if (!confirm(`确认重算归档状态？将按当前 archive_importance_threshold 重新判断历史事件（${rangeText}）。`)) {
+  if (!confirm(`Recalculate archive status with current threshold? (${rangeText})`)) {
     return;
   }
-  if (!confirm('请再次确认：这会批量更新历史事件的 archived 状态。继续执行？')) {
+  if (!confirm('璇峰啀娆＄‘璁わ細杩欎細鎵归噺鏇存柊鍘嗗彶浜嬩欢鐨?archived 鐘舵€併€傜户缁墽琛岋紵')) {
     return;
   }
   try {
@@ -2143,25 +1953,28 @@ async function recalculateArchiveStatus() {
       body: JSON.stringify(payload),
     });
     showStatus(
-      `重算完成（${rangeText}）：解归档 ${data.unarchived_count || 0}，归档 ${data.archived_count || 0}`
+      `閲嶇畻瀹屾垚锛?{rangeText}锛夛細瑙ｅ綊妗?${data.unarchived_count || 0}锛屽綊妗?${data.archived_count || 0}`
     );
     alert(
-      `重算归档状态完成\n` +
-      `范围：${rangeText}\n` +
-      `解归档：${data.unarchived_count || 0}\n` +
-      `归档：${data.archived_count || 0}\n` +
-      `总扫描：${data.scanned_count || 0}\n` +
-      `跳过未评分：${data.skipped_unscored_count || 0}`
+      `閲嶇畻褰掓。鐘舵€佸畬鎴怽n` +
+      `鑼冨洿锛?{rangeText}\n` +
+      `瑙ｅ綊妗ｏ細${data.unarchived_count || 0}\n` +
+      `褰掓。锛?{data.archived_count || 0}\n` +
+      `鎬绘壂鎻忥細${data.scanned_count || 0}\n` +
+      `璺宠繃鏈瘎鍒嗭細${data.skipped_unscored_count || 0}`
     );
     if (typeof loadEvolutionStatus === 'function') {
       await loadEvolutionStatus();
     }
   } catch (e) {
-    showStatus('重算归档状态失败: ' + e.message, true);
+    showStatus('閲嶇畻褰掓。鐘舵€佸け璐? ' + e.message, true);
   }
 }
 
-// ── Vector Management Page ──
+// 鈹€鈹€ Vector Management Page 鈹€鈹€
+
+let vectorSelectedEntryIds = new Set();
+let vectorVisibleEntryIds = [];
 
 async function initVectorsPage() {
   await loadVectorSettings();
@@ -2185,7 +1998,7 @@ async function loadVectorSettings() {
     setInputValue('vector-setting-vector_compaction_group_size', String(settings.compaction_group_size || 8));
     setInputValue('vector-setting-vector_compaction_max_groups', String(settings.compaction_max_groups || 20));
   } catch (e) {
-    showStatus('向量配置加载失败: ' + e.message, true);
+    showStatus('鍚戦噺閰嶇疆鍔犺浇澶辫触: ' + e.message, true);
   }
 }
 
@@ -2208,26 +2021,26 @@ async function saveVectorSettings() {
       method: 'PUT',
       body: JSON.stringify(payload),
     });
-    showStatus('向量配置已保存');
+    showStatus('Done');
     await loadVectorSettings();
   } catch (e) {
-    showStatus('向量配置保存失败: ' + e.message, true);
+    showStatus('鍚戦噺閰嶇疆淇濆瓨澶辫触: ' + e.message, true);
   }
 }
 
 async function loadVectorStats() {
   const el = document.getElementById('vector-stats');
   if (!el) return;
-  el.innerHTML = '<div class="loading">加载中…</div>';
+  el.innerHTML = '<div class="loading">鍔犺浇涓€?/div>';
   try {
     const data = await apiFetch('/vectors/stats');
     const stats = data.stats || {};
     const bySource = stats.by_source || {};
     el.innerHTML = `
-      <div class="list-meta">总条目：${Number(stats.total || 0)}</div>
-      <div class="list-meta">活跃条目：${Number(stats.active || 0)}</div>
-      <div class="list-meta">已删除条目：${Number(stats.deleted || 0)}</div>
-      <div class="list-meta">按来源统计：事件 ${Number(bySource.event || 0)} / 快照 ${Number(bySource.snapshot || 0)}</div>
+      <div class="list-meta">鎬绘潯鐩細${Number(stats.total || 0)}</div>
+      <div class="list-meta">娲昏穬鏉＄洰锛?{Number(stats.active || 0)}</div>
+      <div class="list-meta">宸插垹闄ゆ潯鐩細${Number(stats.deleted || 0)}</div>
+      <div class="list-meta">鎸夋潵婧愮粺璁★細浜嬩欢 ${Number(bySource.event || 0)} / 蹇収 ${Number(bySource.snapshot || 0)}</div>
     `;
   } catch (e) {
     el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`;
@@ -2235,9 +2048,9 @@ async function loadVectorStats() {
 }
 
 async function runVectorSync(reindex = false) {
-  const action = reindex ? '重建索引' : '同步向量';
-  if (reindex && !confirm('确认重建全部向量索引？该操作会清空并重建旧向量。')) return;
-  showStatus(`${action}执行中...`);
+  const action = reindex ? '閲嶅缓绱㈠紩' : '鍚屾鍚戦噺';
+  if (reindex && !confirm('Rebuild all vectors? This will recreate existing vector entries.')) return;
+  showStatus(`${action}鎵ц涓?..`);
   try {
     const data = await apiFetch('/vectors/sync', {
       method: 'POST',
@@ -2245,19 +2058,19 @@ async function runVectorSync(reindex = false) {
     });
     const result = data.result || {};
     showStatus(
-      `${action}完成：事件 ${Number(result.vectorized_events || 0)} 条，快照 ${Number(result.vectorized_snapshots || 0)} 条`
+      `${action} completed: events ${Number(result.vectorized_events || 0)}, snapshots ${Number(result.vectorized_snapshots || 0)}`
     );
     await loadVectorStats();
     await loadVectorEntries();
   } catch (e) {
-    showStatus(`${action}失败: ` + e.message, true);
+    showStatus(`${action}澶辫触: ` + e.message, true);
   }
 }
 
 async function runVectorCompaction(dryRun = false) {
-  if (!dryRun && !confirm('确认执行冷记忆压缩？将把旧向量合并为摘要向量并标记原条目删除。')) return;
-  const action = dryRun ? '压缩预览' : '冷记忆压缩';
-  showStatus(`${action}执行中...`);
+  if (!dryRun && !confirm('Run cold-memory compaction now?')) return;
+  const action = dryRun ? '鍘嬬缉棰勮' : ''
+  showStatus(`${action}鎵ц涓?..`);
   try {
     const data = await apiFetch('/vectors/compact', {
       method: 'POST',
@@ -2266,33 +2079,35 @@ async function runVectorCompaction(dryRun = false) {
     const result = data.result || {};
     if (dryRun) {
       showStatus(
-        `预览完成：候选 ${Number(result.candidate_count || 0)}，分组 ${Number(result.group_count || 0)}，可压缩 ${Number(result.would_compact_count || 0)}`
+        `棰勮瀹屾垚锛氬€欓€?${Number(result.candidate_count || 0)}锛屽垎缁?${Number(result.group_count || 0)}锛屽彲鍘嬬缉 ${Number(result.would_compact_count || 0)}`
       );
       return;
     }
     showStatus(
-      `压缩完成：新增摘要 ${Number(result.created_summaries || 0)}，删除原向量 ${Number(result.deleted_originals || 0)}`
+      `鍘嬬缉瀹屾垚锛氭柊澧炴憳瑕?${Number(result.created_summaries || 0)}锛屽垹闄ゅ師鍚戦噺 ${Number(result.deleted_originals || 0)}`
     );
     await loadVectorStats();
     await loadVectorEntries();
   } catch (e) {
-    showStatus(`${action}失败: ` + e.message, true);
+    showStatus(`${action}澶辫触: ` + e.message, true);
   }
 }
 
 async function loadVectorEntries() {
   const list = document.getElementById('vector-entry-list');
   if (!list) return;
-  const sourceType = (document.getElementById('vector-filter-source-type')?.value || '').trim();
-  const status = (document.getElementById('vector-filter-status')?.value || '').trim();
-  const params = new URLSearchParams();
-  params.set('limit', '100');
-  if (sourceType) params.set('source_type', sourceType);
-  if (status) params.set('status', status);
-  list.innerHTML = '<div class="loading">加载中…</div>';
+  const params = buildVectorFilterParams(100);
+  list.innerHTML = '<div class="loading">加载中...</div>';
   try {
     const data = await apiFetch(`/vectors/entries?${params.toString()}`);
     const items = data.items || [];
+    vectorVisibleEntryIds = items
+      .map(item => String(item.entry_id || '').trim())
+      .filter(Boolean);
+    const visibleSet = new Set(vectorVisibleEntryIds);
+    vectorSelectedEntryIds = new Set(
+      [...vectorSelectedEntryIds].filter(entryId => visibleSet.has(entryId))
+    );
     if (!items.length) {
       list.innerHTML = '<div class="empty">暂无向量条目</div>';
       return;
@@ -2300,6 +2115,11 @@ async function loadVectorEntries() {
     list.innerHTML = items.map(item => `
       <div class="list-item">
         <div>
+          <label style="margin-right:8px;">
+            <input type="checkbox"
+              ${vectorSelectedEntryIds.has(String(item.entry_id || '').trim()) ? 'checked' : ''}
+              onchange="toggleVectorEntrySelection('${String(item.entry_id).replace(/'/g, "\\'")}', this.checked)">
+          </label>
           <span class="tag">${escHtml(item.source_type || '')}</span>
           <span class="tag">${escHtml(item.vector_provider || '')}</span>
           <span class="tag">${escHtml(item.vector_model || '')}</span>
@@ -2316,16 +2136,96 @@ async function loadVectorEntries() {
   }
 }
 
+function buildVectorFilterParams(limit = 100) {
+  const sourceType = (document.getElementById('vector-filter-source-type')?.value || '').trim();
+  const status = (document.getElementById('vector-filter-status')?.value || '').trim();
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  if (sourceType) params.set('source_type', sourceType);
+  if (status) params.set('status', status);
+  return params;
+}
+
+function toggleVectorEntrySelection(entryId, checked) {
+  const id = String(entryId || '').trim();
+  if (!id) return;
+  if (checked) vectorSelectedEntryIds.add(id);
+  else vectorSelectedEntryIds.delete(id);
+}
+
+function toggleSelectAllVisibleVectors() {
+  if (!vectorVisibleEntryIds.length) return;
+  const allSelected = vectorVisibleEntryIds.every(id => vectorSelectedEntryIds.has(id));
+  if (allSelected) {
+    vectorVisibleEntryIds.forEach(id => vectorSelectedEntryIds.delete(id));
+  } else {
+    vectorVisibleEntryIds.forEach(id => vectorSelectedEntryIds.add(id));
+  }
+  loadVectorEntries();
+}
+
+async function bulkDeleteSelectedVectors() {
+  const entryIds = [...vectorSelectedEntryIds];
+  if (!entryIds.length) {
+    showStatus('请先选择要删除的向量条目', true);
+    return;
+  }
+  if (!confirm(`确认批量删除选中向量吗？数量: ${entryIds.length}`)) return;
+  try {
+    const data = await apiFetch('/vectors/entries/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ entry_ids: entryIds, limit: entryIds.length }),
+    });
+    vectorSelectedEntryIds.clear();
+    showStatus(`批量删除完成：成功 ${Number(data.deleted || 0)}，失败 ${Number(data.failed || 0)}`);
+    await loadVectorStats();
+    await loadVectorEntries();
+  } catch (e) {
+    showStatus('批量删除失败: ' + e.message, true);
+  }
+}
+
+async function bulkDeleteFilteredVectors() {
+  const params = buildVectorFilterParams(1000);
+  const sourceType = params.get('source_type') || 'all';
+  const status = params.get('status') || 'all';
+  if (!confirm(`确认按当前筛选批量删除向量吗？source=${sourceType}, status=${status}`)) return;
+  try {
+    const payload = {
+      source_type: params.get('source_type'),
+      status: params.get('status'),
+      limit: Number(params.get('limit') || 1000),
+    };
+    const data = await apiFetch('/vectors/entries/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    vectorSelectedEntryIds.clear();
+    showStatus(`按筛选批量删除完成：成功 ${Number(data.deleted || 0)}，失败 ${Number(data.failed || 0)}`);
+    await loadVectorStats();
+    await loadVectorEntries();
+  } catch (e) {
+    showStatus('按筛选批量删除失败: ' + e.message, true);
+  }
+}
+
 async function deleteVectorEntry(entryId) {
-  if (!confirm(`确认删除向量条目 ${entryId} ?`)) return;
+  if (!confirm(`纭鍒犻櫎鍚戦噺鏉＄洰 ${entryId} ?`)) return;
   try {
     await apiFetch(`/vectors/entries/${encodeURIComponent(entryId)}`, {
       method: 'DELETE',
     });
-    showStatus(`已删除向量条目 ${entryId}`);
+    vectorSelectedEntryIds.delete(String(entryId || '').trim());
+    showStatus(`宸插垹闄ゅ悜閲忔潯鐩?${entryId}`);
     await loadVectorStats();
     await loadVectorEntries();
   } catch (e) {
-    showStatus('删除向量失败: ' + e.message, true);
+    showStatus('鍒犻櫎鍚戦噺澶辫触: ' + e.message, true);
   }
 }
+
+
+
+
+
+

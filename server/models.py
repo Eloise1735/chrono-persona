@@ -179,6 +179,14 @@ class VectorCompactRequest(BaseModel):
     dry_run: bool = False
 
 
+class VectorBatchDeleteRequest(BaseModel):
+    entry_ids: list[str] = Field(default_factory=list)
+    source_type: str | None = None
+    status: str | None = "active"
+    tier: str | None = None
+    limit: int = Field(default=500, ge=1, le=5000)
+
+
 class UpdateRuntimeLLMRequest(BaseModel):
     llm_api_base: str | None = None
     llm_api_key: str | None = None

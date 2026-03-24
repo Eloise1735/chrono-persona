@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 from mcp.server.fastmcp import FastMCP
 
+# FastMCP defaults streamable HTTP to path "/mcp". With mount "/mcp-http", the full URL is
+# /mcp-http/mcp (many clients append "/mcp" to the configured base URL).
 mcp = FastMCP("Kelsey-State-Machine")
 # Allow reverse-proxy/tunnel Host headers (e.g. trycloudflare.com) to access SSE.
 # Local-only deployments can keep strict defaults, but mobile + tunnel requires this.
@@ -178,7 +180,7 @@ async def recall_key_records(
     """对话过程中调用。检索结构化关键记录（例如医疗建议、关键计划、纪念日等）。
 
     Args:
-        query: 搜索词或描述
+        query: 搜索词或描述。建议至少提供2-4个关键词并用空格分隔（例如：用药方案 源石 镇痛 华法林）
         top_k: 返回条数
         record_type: 可选的类型过滤
         include_archived: 是否包含归档记录
@@ -188,6 +190,7 @@ async def recall_key_records(
 
     调用建议：
         - 当用户提到病症、药名、纪念日、信物、共同计划等“具体可执行信息”时优先调用本工具。
+        - query 优先使用“多关键词组合”而非单词查询，建议覆盖标题词、实体名词、动作词与正文关键短语。
         - 若命中后仍需补充背景叙事，再调用 recall_memories 获取事件锚点上下文。
         - 默认先查 active 记录；需要历史方案时再 include_archived=True。
     """
