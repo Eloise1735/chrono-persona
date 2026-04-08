@@ -1,8 +1,10 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 设定管理</title>
   <link rel="stylesheet" href="/static/style.css?v=20260326">
 </head>
@@ -15,6 +17,7 @@
     <a href="/events-history">事件历史</a>
     <a href="/key-records">关键记录</a>
     <a href="/settings" class="active">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
     <a href="/evolution">人格演化</a>
     <a href="/vectors">向量管理</a>
   </nav>
@@ -23,6 +26,7 @@
     <div class="tabs">
       <div class="tab active" data-tab="persona" onclick="switchSettingsTab('persona')">人格设定</div>
       <div class="tab" data-tab="prompts" onclick="switchSettingsTab('prompts')">Prompt 与参数</div>
+      <div class="tab" data-tab="models" onclick="switchSettingsTab('models')">模型调用</div>
       <div class="tab" data-tab="import" onclick="switchSettingsTab('import')">数据导入</div>
     </div>
 
@@ -40,6 +44,7 @@
         <div class="grid-2">
           <div class="form-group"><label>L2_character_personality</label><textarea id="setting-L2_character_personality" style="min-height:160px;"></textarea></div>
           <div class="form-group"><label>L2_relationship_dynamics</label><textarea id="setting-L2_relationship_dynamics" style="min-height:160px;"></textarea></div>
+          <div class="form-group"><label>L2_life_status</label><textarea id="setting-L2_life_status" style="min-height:160px;"></textarea></div>
         </div>
       </div>
 
@@ -63,11 +68,8 @@
       </div>
 
       <div class="card">
-        <h2>API 配置</h2>
+        <h2>向量与 API 配置</h2>
         <div class="grid-3">
-          <div class="form-group"><label>llm_api_base</label><input type="text" id="setting-llm_api_base"></div>
-          <div class="form-group"><label>llm_api_key</label><input type="text" id="setting-llm_api_key"></div>
-          <div class="form-group"><label>llm_model</label><input type="text" id="setting-llm_model"></div>
           <div class="form-group"><label>vector_embedding_api_base</label><input type="text" id="setting-vector_embedding_api_base"></div>
           <div class="form-group"><label>vector_embedding_api_key</label><input type="text" id="setting-vector_embedding_api_key"></div>
           <div class="form-group"><label>vector_embedding_model</label><input type="text" id="setting-vector_embedding_model"></div>
@@ -77,7 +79,7 @@
       <div class="card">
         <h2>运行参数</h2>
         <div class="grid-3">
-          <div class="form-group"><label>min_time_unit_hours</label><input type="text" id="setting-min_time_unit_hours"></div>
+          <div class="form-group"><label>min_time_unit_hours（小时）</label><input type="text" id="setting-min_time_unit_hours" placeholder="例如 8、0.5、8h、8小时"></div>
           <div class="form-group"><label>inject_hot_events_limit</label><input type="text" id="setting-inject_hot_events_limit"></div>
           <div class="form-group"><label>vector_embedding_dim</label><input type="text" id="setting-vector_embedding_dim"></div>
           <div class="form-group"><label>vector_sync_batch_size</label><input type="text" id="setting-vector_sync_batch_size"></div>
@@ -91,10 +93,107 @@
           <div class="form-group"><label>automation_auto_evolution</label><select id="setting-automation_auto_evolution"><option value="true">开启</option><option value="false">关闭</option></select></div>
           <div class="form-group"><label>automation_cold_compaction</label><select id="setting-automation_cold_compaction"><option value="true">开启</option><option value="false">关闭</option></select></div>
           <div class="form-group"><label>automation_compaction_min_interval_hours</label><input type="text" id="setting-automation_compaction_min_interval_hours"></div>
+          <div class="form-group"><label>snapshot_scheduler_enabled（后台按时间自动推进快照）</label><select id="setting-snapshot_scheduler_enabled"><option value="true">开启</option><option value="false">关闭</option></select></div>
+          <div class="form-group"><label>snapshot_scheduler_interval_sec（后台轮询间隔，秒）</label><input type="text" id="setting-snapshot_scheduler_interval_sec" placeholder="60"></div>
         </div>
       </div>
 
       <div class="card"><div class="btn-group"><button class="btn btn-primary" onclick="saveAllSettings()">保存全部设定</button><button class="btn btn-danger" onclick="resetAllSettings()">恢复默认</button><button class="btn" onclick="loadSettingsPage()">刷新</button></div></div>
+    </div>
+
+    <div id="settings-tab-models" style="display:none;">
+      <div class="card">
+        <h2>主 LLM</h2>
+        <div class="list-meta">用于人格演化总结等主生成任务。未填时回退 `config.yaml`。</div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>模型名</label>
+            <input id="runtime-llm-model" type="text" placeholder="例如 gpt-4o-mini">
+          </div>
+          <div class="form-group">
+            <label>请求超时（秒）</label>
+            <input id="runtime-llm-timeout-sec" type="number" min="1" step="1" placeholder="180">
+          </div>
+          <div class="form-group">
+            <label>API Base</label>
+            <input id="runtime-llm-api-base" type="text" placeholder="https://api.example.com/v1">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input id="runtime-llm-api-key" type="password" placeholder="sk-...">
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="saveRuntimeLLMConfig()">保存主 LLM 配置</button>
+          <button class="btn" onclick="loadRuntimeLLMConfig()">刷新</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>环境生成专用 LLM</h2>
+        <div class="list-meta">用于环境信息生成。未启用时自动回退主 LLM。</div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>启用开关</label>
+            <select id="env-llm-enabled">
+              <option value="false">关闭</option>
+              <option value="true">启用</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>模型名</label>
+            <input id="env-llm-model" type="text" placeholder="例如 gpt-4o-mini">
+          </div>
+          <div class="form-group">
+            <label>API Base</label>
+            <input id="env-llm-api-base" type="text" placeholder="https://api.example.com/v1">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input id="env-llm-api-key" type="password" placeholder="sk-...">
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="saveEnvironmentLLMConfig()">保存环境 LLM 配置</button>
+          <button class="btn" onclick="loadEnvironmentLLMConfig()">刷新</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>快照与评分专用 LLM</h2>
+        <div class="list-meta">用于快照生成、事件评分等流程。未启用时自动回退主 LLM。</div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>启用开关</label>
+            <select id="snapshot-llm-enabled">
+              <option value="false">关闭</option>
+              <option value="true">启用</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>模型名</label>
+            <input id="snapshot-llm-model" type="text" placeholder="例如 gpt-4o-mini">
+          </div>
+          <div class="form-group">
+            <label>API Base</label>
+            <input id="snapshot-llm-api-base" type="text" placeholder="https://api.example.com/v1">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input id="snapshot-llm-api-key" type="password" placeholder="sk-...">
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="saveSnapshotLLMConfig()">保存快照/评分 LLM 配置</button>
+          <button class="btn" onclick="loadSnapshotLLMConfig()">刷新</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="btn-group">
+          <button class="btn" onclick="loadModelSettingsPage()">刷新模型配置</button>
+        </div>
+      </div>
     </div>
 
     <div id="settings-tab-import" style="display:none;">
@@ -116,7 +215,9 @@
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-  <script src="/static/app.js?v=20260326"></script>
+  <script src="/static/app.js?v=20260326b"></script>
   <script>loadSettingsPage();</script>
 </body>
 </html>
+
+

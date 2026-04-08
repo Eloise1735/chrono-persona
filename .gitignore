@@ -14,6 +14,12 @@ __pycache__/
 dist/
 build/
 
+# Android
+android/.gradle/
+android/**/build/
+android/local.properties
+*.apk
+
 # 编辑器与系统
 .idea/
 .vscode/
@@ -28,3 +34,12 @@ Thumbs.db
 # 离线 wheel 包与归档（体积大，服务器用 pip 安装即可）
 deploy/packages/*.whl
 *.zip
+
+# Local build tools
+tools/
+*.hprof
+
+# Cursor / 本地临时
+.cursor/
+tmp/
+

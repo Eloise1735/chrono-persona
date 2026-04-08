@@ -1,28 +1,52 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
+
+from server.time_display import iso_string_for_cst_display, shanghai_now
+
+
+def format_utc_instant_z(dt: datetime) -> str:
+    """将 UTC 时刻写入 DB 时使用，带 Z 后缀，避免 naive iso 与 utcnow() 比较时出现时区歧义。"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat() + "Z"
 
 
 class StateSnapshot(BaseModel):
     id: int | None = None
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    # 叙事/检查点时间（推进逻辑与「最新快照」排序均按此字段）
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    # 行写入数据库时的 UTC 时刻（Z）；旧数据迁移前可能为空
+    inserted_at: str | None = None
     type: Literal["daily", "conversation_end", "accumulated"] = "daily"
     content: str = ""
     environment: str = "{}"
     referenced_events: str = "[]"
     embedding_vector_id: str | None = None
 
+    @computed_field
+    @property
+    def created_at_cst(self) -> str:
+        return iso_string_for_cst_display(self.created_at)
+
+    @computed_field
+    @property
+    def inserted_at_cst(self) -> str | None:
+        if not self.inserted_at:
+            return None
+        return iso_string_for_cst_display(self.inserted_at)
+
 
 class EventAnchor(BaseModel):
     id: int | None = None
-    date: str = Field(default_factory=lambda: datetime.utcnow().strftime("%Y-%m-%d"))
+    date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
     title: str = ""
     description: str = ""
     source: Literal["generated", "manual", "conversation"] = "generated"
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
     embedding_vector_id: str | None = None
     trigger_keywords: str = "[]"
     categories: str = "[]"
@@ -43,6 +67,18 @@ class KeyRecord(BaseModel):
     status: Literal["active", "archived"] = "active"
     source: Literal["manual", "conversation", "generated"] = "manual"
     linked_event_id: int | None = None
+    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class WorldBook(BaseModel):
+    id: int | None = None
+    name: str = ""
+    content: str = ""
+    tags: str = "[]"
+    match_keywords: str = "[]"
+    is_active: int = 1
+    embedding_vector_id: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
@@ -100,6 +136,35 @@ class UpdateKeyRecordRequest(BaseModel):
     linked_event_id: int | None = None
 
 
+class WorldBookCreateRequest(BaseModel):
+    name: str = ""
+    content: str
+    tags: list[str] = Field(default_factory=list)
+    match_keywords: list[str] = Field(default_factory=list)
+    is_active: bool = True
+
+
+class WorldBookUpdateRequest(BaseModel):
+    name: str | None = None
+    content: str | None = None
+    tags: list[str] | None = None
+    match_keywords: list[str] | None = None
+    is_active: bool | None = None
+
+
+class WorldBookAutoMetaRequest(BaseModel):
+    item_ids: list[int] = Field(default_factory=list)
+    overwrite_title: bool = False
+    overwrite_keywords: bool = False
+
+
+class WorldBookJsonImportRequest(BaseModel):
+    """Body: `{ "data": <酒馆/世界书导出 JSON 根对象>, "skip_disabled": false }`。"""
+
+    data: Any
+    skip_disabled: bool = False
+
+
 class MemorySearchRequest(BaseModel):
     query: str
     top_k: int = 5
@@ -107,7 +172,10 @@ class MemorySearchRequest(BaseModel):
 
 class GetCurrentStateRequest(BaseModel):
     current_time: str
-    last_interaction_time: str
+    # 兼容旧调用保留，可不传；实际 last_interaction 检查点来自 DB 的 conversation_end
+    last_interaction_time: str | None = None
+    # 为 True 时在响应中附带 checkpoint_schedule，便于核对整格/尾部逻辑
+    include_checkpoint_schedule: bool = False
 
 
 class ReflectRequest(BaseModel):
@@ -129,6 +197,10 @@ class KeyRecordSearchRequest(BaseModel):
     type: Literal["important_date", "important_item", "key_collaboration", "medical_advice"] | None = None
     top_k: int = 5
     include_archived: bool = False
+    include_world_books: bool = Field(
+        default=True,
+        description="为 True 时合并检索启用中的世界书（关键词 + 已向量化时的语义向量）",
+    )
 
 
 class UpsertKeyRecordToolRequest(BaseModel):
@@ -158,6 +230,14 @@ class RecalculateArchiveRequest(BaseModel):
     end_id: int | None = None
     start_date: str | None = None
     end_date: str | None = None
+
+
+class EvolutionRescoreRequest(BaseModel):
+    start_id: int | None = None
+    end_id: int | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    scored_only: bool = True
 
 
 class UpdateVectorSettingsRequest(BaseModel):
@@ -191,6 +271,7 @@ class UpdateRuntimeLLMRequest(BaseModel):
     llm_api_base: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    llm_timeout_sec: float | None = None
 
 
 class UpsertModelPricingRequest(BaseModel):
@@ -207,3 +288,7 @@ class BulkImportRequest(BaseModel):
     overwrite_settings: bool = True
     upsert_key_records: bool = True
     sync_vectors_after_import: bool = True
+
+
+class SnapshotTimezoneRepairRequest(BaseModel):
+    dry_run: bool = False

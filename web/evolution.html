@@ -1,8 +1,10 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 人格演化</title>
   <link rel="stylesheet" href="/static/style.css?v=20260326">
 </head>
@@ -15,6 +17,7 @@
     <a href="/events-history">事件历史</a>
     <a href="/key-records">关键记录</a>
     <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
     <a href="/evolution" class="active">人格演化</a>
     <a href="/vectors">向量管理</a>
   </nav>
@@ -25,11 +28,36 @@
       <div class="grid-2">
         <div class="form-group">
           <label>触发阈值（evolution_event_threshold）</label>
-          <input type="text" id="setting-evolution_event_threshold" placeholder="10">
+          <input type="number" id="setting-evolution_event_threshold" placeholder="10" min="1" step="1" inputmode="numeric">
         </div>
         <div class="form-group">
-          <label>归档阈值（archive_importance_threshold）</label>
-          <input type="text" id="setting-archive_importance_threshold" placeholder="4.0">
+          <label>归档重要性阈值（archive_importance_threshold）</label>
+          <input type="number" id="setting-archive_importance_threshold" placeholder="3.0" min="0" max="10" step="0.1" inputmode="decimal">
+        </div>
+        <div class="form-group">
+          <label>归档深度保护（archive_depth_threshold）</label>
+          <input type="number" id="setting-archive_depth_threshold" placeholder="5.0" min="0" max="10" step="0.1" inputmode="decimal">
+          <small style="color:var(--text-muted);font-size:11px;">印象深度高于此值的事件即使重要性低也不归档</small>
+        </div>
+        <div class="form-group">
+          <label>演化候选重要性阈值（evolution_prompt_importance_min）</label>
+          <input type="number" id="setting-evolution_prompt_importance_min" placeholder="5.0" min="0" max="10" step="0.1" inputmode="decimal">
+        </div>
+        <div class="form-group">
+          <label>演化候选印象深度阈值（evolution_prompt_depth_min）</label>
+          <input type="number" id="setting-evolution_prompt_depth_min" placeholder="6.0" min="0" max="10" step="0.1" inputmode="decimal">
+        </div>
+        <div class="form-group">
+          <label>低价值剔除重要性阈值（evolution_prompt_drop_importance_below）</label>
+          <input type="number" id="setting-evolution_prompt_drop_importance_below" placeholder="2.0" min="0" max="10" step="0.1" inputmode="decimal">
+        </div>
+        <div class="form-group">
+          <label>低价值剔除印象深度阈值（evolution_prompt_drop_depth_below）</label>
+          <input type="number" id="setting-evolution_prompt_drop_depth_below" placeholder="3.0" min="0" max="10" step="0.1" inputmode="decimal">
+        </div>
+        <div class="form-group">
+          <label>注入演化的事件上限（evolution_prompt_max_events）</label>
+          <input type="number" id="setting-evolution_prompt_max_events" placeholder="12" min="1" step="1" inputmode="numeric">
         </div>
       </div>
       <div class="btn-group" style="margin-top:4px;"><button class="btn btn-primary" onclick="saveEvolutionSettings()">保存演化参数</button></div>
@@ -40,6 +68,7 @@
       <div id="evolution-status" class="detail-content" style="margin-bottom:14px;">加载中...</div>
       <div class="btn-group">
         <button class="btn" onclick="previewEvolution()">预览人格更新</button>
+        <button class="btn" onclick="regenerateEvolutionPreview()">按全库已评分结果重生预览</button>
         <button class="btn btn-primary" onclick="applyEvolution()">确认应用演化</button>
       </div>
       <div class="card-section">
@@ -47,15 +76,20 @@
         <div class="btn-group" style="margin-bottom:8px;">
           <input type="date" id="recalc-start-date" style="max-width:160px;" aria-label="重算起始日期">
           <input type="date" id="recalc-end-date" style="max-width:160px;" aria-label="重算结束日期">
+          <button class="btn" onclick="rescoreEvolutionEvents()">重算事件评分</button>
           <button class="btn" onclick="recalculateArchiveStatus()">重算归档状态</button>
         </div>
+        <div class="list-meta">“重算事件评分”默认只处理已有评分的事件，并按当前评分 prompt 与归档阈值同步刷新结果。</div>
+        <div class="list-meta">“按全库已评分结果重生预览”不会重算分数，也不受 last_evolution_time 限制，只会基于当前已落库评分重新生成 L2 演化预览。</div>
       </div>
       <div id="evolution-preview" style="margin-top:14px;"></div>
     </div>
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-  <script src="/static/app.js?v=20260326"></script>
+  <script src="/static/app.js?v=20260331d"></script>
   <script>loadSettingsPage();</script>
 </body>
 </html>
+
+

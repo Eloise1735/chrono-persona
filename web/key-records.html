@@ -1,8 +1,10 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 关键记录</title>
   <link rel="stylesheet" href="/static/style.css?v=20260326">
 </head>
@@ -15,6 +17,7 @@
     <a href="/events-history">事件历史</a>
     <a href="/key-records" class="active">关键记录</a>
     <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
     <a href="/evolution">人格演化</a>
     <a href="/vectors">向量管理</a>
   </nav>
@@ -32,6 +35,10 @@
       <button class="btn btn-primary" onclick="searchKeyRecords()">搜索</button>
       <button class="btn" onclick="openAddKeyRecordModal()">添加记录</button>
       <label class="checkbox-label">
+        <input type="checkbox" id="key-record-include-world-books" checked onchange="loadKeyRecords()">
+        检索含世界书
+      </label>
+      <label class="checkbox-label">
         <input type="checkbox" id="key-record-include-archived" onchange="loadKeyRecords()">
         显示归档
       </label>
@@ -47,3 +54,5 @@
   <script>initKeyRecordsPage();</script>
 </body>
 </html>
+
+
