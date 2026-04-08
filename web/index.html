@@ -1,10 +1,12 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 仪表盘</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260326">
+  <link rel="stylesheet" href="/static/style.css?v=20260326b">
 </head>
 <body>
   <nav>
@@ -15,6 +17,7 @@
     <a href="/events-history">事件历史</a>
     <a href="/key-records">关键记录</a>
     <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
     <a href="/evolution">人格演化</a>
     <a href="/vectors">向量管理</a>
   </nav>
@@ -29,6 +32,7 @@
 
     <div class="card">
       <h2>当前状态快照</h2>
+      <div id="idle-snapshot-summary" class="idle-snapshot-summary" aria-live="polite"><div class="loading">加载中…</div></div>
       <div id="latest-snapshot"><div class="loading">加载中...</div></div>
     </div>
 
@@ -88,7 +92,9 @@
 
   <div class="status-bar" id="status-bar">就绪</div>
 
-  <script src="/static/app.js?v=20260326"></script>
+  <script src="/static/app.js?v=20260326b"></script>
   <script>initDashboardPage();</script>
 </body>
 </html>
+
+

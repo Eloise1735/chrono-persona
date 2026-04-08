@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException
 
+logger = logging.getLogger(__name__)
+
+from server.diagnostics import TRACE_STORE
+from server.llm_client import LLMTimeoutError, LLMTransportError, LLMUpstreamHTTPError
 from server.models import (
     CreateSnapshotRequest,
     CreateEventRequest,
@@ -20,19 +25,34 @@ from server.models import (
     UpdateSettingRequest,
     EvolutionApplyRequest,
     RecalculateArchiveRequest,
+    EvolutionRescoreRequest,
     UpdateVectorSettingsRequest,
     VectorSyncRequest,
     VectorCompactRequest,
     VectorBatchDeleteRequest,
     UpdateRuntimeLLMRequest,
+    WorldBookCreateRequest,
+    WorldBookUpdateRequest,
+    WorldBookAutoMetaRequest,
+    WorldBookJsonImportRequest,
     UpsertModelPricingRequest,
     BulkImportRequest,
+    SnapshotTimezoneRepairRequest,
     StateSnapshot,
     EventAnchor,
     KeyRecord,
+    WorldBook,
+    format_utc_instant_z,
 )
 from server.prompts import DEFAULT_SETTINGS, KEY_MODEL_PRICING_JSON
+from server.time_display import (
+    normalize_user_instant_to_utc_z,
+    shanghai_now,
+    shanghai_time_to_utc_naive,
+    utc_naive_to_shanghai_iso,
+)
 from server.event_taxonomy import classify_event, make_event_title
+from server.world_book_import import parse_world_book_import
 
 router = APIRouter(prefix="/api")
 
@@ -42,6 +62,14 @@ _memory_store = None
 _prompt_manager = None
 _evolution_engine = None
 _llm_client = None
+_env_llm_client = None
+_snapshot_llm_client = None
+
+
+def _require_state_machine():
+    if _state_machine is None:
+        raise HTTPException(503, "State machine is not initialized. Restart the server and wait for startup to complete.")
+    return _state_machine
 
 
 def _to_json_array_text(value) -> str:
@@ -78,6 +106,13 @@ def _to_int_flag(value, default: int = 0) -> int:
     if text in {"0", "false", "no", "n", "off"}:
         return 0
     return default
+
+
+def _normalize_optional_instant_to_utc_z(value, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    return normalize_user_instant_to_utc_z(text)
 
 def _parse_pricing_table(json_str: str) -> dict[str, dict[str, float]]:
     """Parse a JSON pricing string into a normalized {model: {prompt, completion}} table."""
@@ -143,6 +178,41 @@ async def _get_model_pricing_table() -> dict[str, dict[str, float]]:
     return _parse_pricing_table(pricing_json)
 
 
+async def _generate_event_meta_by_summary_llm(
+    description: str,
+    categories: list[str] | None = None,
+) -> dict:
+    if _llm_client is None:
+        return {}
+    desc = (description or "").strip()
+    if not desc:
+        return {}
+    cat_text = ", ".join([c for c in (categories or []) if str(c).strip()]) or "无"
+    prompt = (
+        "你是事件元信息提取助手。请只输出 JSON，不要输出其他文本。"
+        "JSON格式：{\"title\": string, \"keywords\": string[]}。"
+        "要求：title 8-24 字且具体；keywords 4-8 个，可检索、尽量实体化。"
+        "不要空数组。\n\n"
+        f"事件描述：{desc}\n"
+        f"事件分类：{cat_text}"
+    )
+    try:
+        response = await _llm_client.chat(
+            [
+                {"role": "system", "content": "你是严谨的结构化信息提取助手。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=220,
+        )
+        parsed = _extract_json_object(response)
+        title = str(parsed.get("title") or "").strip()
+        keywords = _parse_json_list(parsed.get("keywords"))
+        return {"title": title, "keywords": keywords}
+    except Exception:
+        return {}
+
+
 def set_dependencies(
     db,
     state_machine,
@@ -150,14 +220,19 @@ def set_dependencies(
     prompt_manager=None,
     evolution_engine=None,
     llm_client=None,
+    env_llm_client=None,
+    snapshot_llm_client=None,
 ):
-    global _db, _state_machine, _memory_store, _prompt_manager, _evolution_engine, _llm_client
+    global _db, _state_machine, _memory_store, _prompt_manager, _evolution_engine
+    global _llm_client, _env_llm_client, _snapshot_llm_client
     _db = db
     _state_machine = state_machine
     _memory_store = memory_store
     _prompt_manager = prompt_manager
     _evolution_engine = evolution_engine
     _llm_client = llm_client
+    _env_llm_client = env_llm_client
+    _snapshot_llm_client = snapshot_llm_client
 
 
 async def _ensure_event_meta(event: EventAnchor) -> EventAnchor:
@@ -208,25 +283,160 @@ def _ensure_vector_store():
     return _memory_store
 
 
+def _parse_json_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    raw = str(value).strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except Exception:
+        pass
+    return [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
+
+
+def _extract_json_object(text: str) -> dict:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        snippet = raw[start : end + 1]
+        try:
+            data = json.loads(snippet)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _serialize_world_book(item: WorldBook) -> dict:
+    data = item.model_dump()
+    data["tags"] = _parse_json_list(item.tags)
+    data["match_keywords"] = _parse_json_list(item.match_keywords)
+    data["is_active"] = bool(int(item.is_active or 0))
+    data["vectorized"] = bool(str(item.embedding_vector_id or "").strip())
+    return data
+
+
+async def _get_llm_config(prefix: str) -> dict:
+    enabled = await _db.get_setting(f"{prefix}_enabled")
+    api_base = await _db.get_setting(f"{prefix}_api_base")
+    api_key = await _db.get_setting(f"{prefix}_api_key")
+    model = await _db.get_setting(f"{prefix}_model")
+    return {
+        "enabled": str((enabled or {}).get("value", "0")) == "1",
+        "api_base": str((api_base or {}).get("value", "")),
+        "api_key": str((api_key or {}).get("value", "")),
+        "model": str((model or {}).get("value", "")),
+    }
+
+
+async def _save_llm_config(prefix: str, payload: dict):
+    meta_map = {
+        "enabled": f"{prefix}_enabled",
+        "api_base": f"{prefix}_api_base",
+        "api_key": f"{prefix}_api_key",
+        "model": f"{prefix}_model",
+    }
+    defaults = {
+        "enabled": "0",
+        "api_base": "",
+        "api_key": "",
+        "model": "",
+    }
+    for key, setting_key in meta_map.items():
+        if key not in payload:
+            continue
+        value = payload.get(key, defaults[key])
+        if key == "enabled":
+            value = "1" if _to_int_flag(value, 0) == 1 else "0"
+        await _db.set_setting(
+            key=setting_key,
+            value=str(value or ""),
+            category="runtime",
+            description=DEFAULT_SETTINGS.get(setting_key, {}).get("description", ""),
+        )
+
+
 # ── State Machine endpoints (mirror MCP tools for web testing) ──
 
 @router.post("/state/current")
 async def api_get_current_state(req: GetCurrentStateRequest):
-    result = await _state_machine.get_current_state(
-        req.current_time, req.last_interaction_time
-    )
-    return {"content": result}
+    sm = _require_state_machine()
+    try:
+        out = await sm.get_current_state(
+            req.current_time,
+            req.last_interaction_time,
+            return_schedule=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # LLMClient.chat 在网关错误/限流/非 JSON 响应时抛出，原先会变成笼统的 500
+        logger.warning("get_current_state LLM/runtime error: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if isinstance(out, tuple):
+        content, schedule = out
+        pending = await _evolution_engine.get_pending_preview() if _evolution_engine is not None else None
+        if pending:
+            content = (
+                f"{content}\n\n"
+                f"[系统提示：后台已生成一份待确认的人格演化预览（新事件 {pending.get('event_count')} 条，"
+                f"候选 {pending.get('evolution_prompt_event_count', 0)} 条）。"
+                "请提醒用户前往 Web 前端的“人格演化”页面查看预览并手动确认应用。]"
+            )
+        generated_count = len(schedule.get("generated_snapshots") or [])
+        payload = {
+            "content": content,
+            "generated_snapshot_count": generated_count,
+            "input_current_time_cst": schedule.get("input_current_time_cst"),
+            "input_last_interaction_cst": schedule.get("input_last_interaction_cst"),
+        }
+        if req.include_checkpoint_schedule:
+            payload["checkpoint_schedule"] = schedule
+        return payload
+    return {"content": out, "generated_snapshot_count": 0}
 
 
 @router.post("/state/reflect")
 async def api_reflect(req: ReflectRequest):
-    result = await _state_machine.reflect_on_conversation(req.conversation_summary)
+    sm = _require_state_machine()
+    try:
+        result = await sm.reflect_on_conversation(req.conversation_summary)
+    except RuntimeError as exc:
+        logger.warning("reflect_on_conversation LLM/runtime error: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"content": result}
+
+
+@router.get("/debug/operation-traces")
+async def api_operation_traces(limit: int = 20, operation: str | None = None, status: str | None = None):
+    capped_limit = max(1, min(int(limit or 20), 100))
+    return {
+        "items": TRACE_STORE.list_recent(
+            limit=capped_limit,
+            operation=operation,
+            status=status,
+        )
+    }
 
 
 @router.post("/state/summarize")
 async def api_summarize_conversation(req: SummarizeConversationRequest):
-    result = await _state_machine.summarize_conversation(req.conversation_text)
+    sm = _require_state_machine()
+    result = await sm.summarize_conversation(req.conversation_text)
     return {"summary": result}
 
 
@@ -280,6 +490,7 @@ async def search_key_records(req: KeyRecordSearchRequest):
         top_k=req.top_k,
         record_type=req.type,
         include_archived=req.include_archived,
+        include_world_books=req.include_world_books,
     )
     return {"items": items}
 
@@ -353,6 +564,305 @@ async def delete_key_record(record_id: int):
     return {"message": "Key record deleted"}
 
 
+@router.get("/world-books")
+async def list_world_books(offset: int = 0, limit: int = 100):
+    items = await _db.list_world_books(offset=offset, limit=limit)
+    return {"items": [_serialize_world_book(i) for i in items]}
+
+
+@router.get("/world-books/{item_id}")
+async def get_world_book(item_id: int):
+    item = await _db.get_world_book_by_id(item_id)
+    if not item:
+        raise HTTPException(404, "World book item not found")
+    return _serialize_world_book(item)
+
+
+@router.post("/world-books")
+async def create_world_book(req: WorldBookCreateRequest):
+    now = datetime.utcnow().isoformat()
+    item = WorldBook(
+        name=req.name.strip(),
+        content=req.content.strip(),
+        tags=json.dumps(req.tags, ensure_ascii=False),
+        match_keywords=json.dumps(req.match_keywords, ensure_ascii=False),
+        is_active=1 if req.is_active else 0,
+        created_at=now,
+        updated_at=now,
+    )
+    item_id = await _db.insert_world_book(item)
+    return {"id": item_id, "message": "World book created"}
+
+
+@router.post("/world-books/import-json")
+async def import_world_books_json(req: WorldBookJsonImportRequest):
+    items, warnings = parse_world_book_import(
+        req.data, skip_disabled=req.skip_disabled
+    )
+    if not items:
+        detail = "; ".join(warnings) if warnings else "未能解析出任何有效条目（内容为空或格式不匹配）"
+        raise HTTPException(400, detail)
+    now = datetime.utcnow().isoformat()
+    ids: list[int] = []
+    for it in items:
+        wb = WorldBook(
+            name=str(it["name"] or "未命名")[:500],
+            content=str(it["content"] or "").strip(),
+            tags=json.dumps(it.get("tags") or [], ensure_ascii=False),
+            match_keywords=json.dumps(it.get("match_keywords") or [], ensure_ascii=False),
+            is_active=1 if it.get("is_active", True) else 0,
+            created_at=now,
+            updated_at=now,
+        )
+        ids.append(await _db.insert_world_book(wb))
+    return {
+        "created": len(ids),
+        "ids": ids,
+        "warnings": warnings,
+    }
+
+
+@router.put("/world-books/{item_id}")
+async def update_world_book(item_id: int, req: WorldBookUpdateRequest):
+    item = await _db.get_world_book_by_id(item_id)
+    if not item:
+        raise HTTPException(404, "World book item not found")
+    fields = {}
+    if req.name is not None:
+        fields["name"] = req.name.strip()
+    if req.content is not None:
+        fields["content"] = req.content.strip()
+    if req.tags is not None:
+        fields["tags"] = json.dumps(req.tags, ensure_ascii=False)
+    if req.match_keywords is not None:
+        fields["match_keywords"] = json.dumps(req.match_keywords, ensure_ascii=False)
+    if req.is_active is not None:
+        fields["is_active"] = 1 if req.is_active else 0
+    should_revectorize = False
+    if fields:
+        if any(k in fields for k in ("name", "content", "tags", "match_keywords")):
+            should_revectorize = True
+        await _db.update_world_book(item_id, **fields)
+    if should_revectorize:
+        upsert_method = getattr(_memory_store, "upsert_world_book_vector", None)
+        if callable(upsert_method) and str(item.embedding_vector_id or "").strip():
+            await upsert_method(item_id)
+    return {"message": "World book updated"}
+
+
+@router.delete("/world-books/{item_id}")
+async def delete_world_book(item_id: int):
+    item = await _db.get_world_book_by_id(item_id)
+    if not item:
+        raise HTTPException(404, "World book item not found")
+    delete_method = getattr(_memory_store, "delete_world_book_vector", None)
+    if callable(delete_method):
+        await delete_method(item_id)
+    await _db.delete_world_book(item_id)
+    return {"message": "World book deleted"}
+
+
+@router.post("/world-books/{item_id}/vectorize")
+async def vectorize_world_book(item_id: int):
+    item = await _db.get_world_book_by_id(item_id)
+    if not item:
+        raise HTTPException(404, "World book item not found")
+    upsert_method = getattr(_memory_store, "upsert_world_book_vector", None)
+    if not callable(upsert_method):
+        raise HTTPException(400, "Current memory store does not support world book vectorization")
+    ok = await upsert_method(item_id)
+    if not ok:
+        raise HTTPException(500, "World book vectorization failed")
+    return {"message": "World book vectorized"}
+
+
+@router.delete("/world-books/{item_id}/vector")
+async def delete_world_book_vector(item_id: int):
+    item = await _db.get_world_book_by_id(item_id)
+    if not item:
+        raise HTTPException(404, "World book item not found")
+    delete_method = getattr(_memory_store, "delete_world_book_vector", None)
+    if callable(delete_method):
+        await delete_method(item_id)
+    else:
+        await _db.clear_world_book_vectorized(item_id)
+    return {"message": "World book vector removed"}
+
+
+@router.post("/world-books/vector-sync")
+async def sync_world_book_vectors(limit: int = 200):
+    sync_method = getattr(_memory_store, "sync_world_book_vectors", None)
+    if not callable(sync_method):
+        raise HTTPException(400, "Current memory store does not support world book vectorization")
+    result = await sync_method(limit=max(1, limit))
+    return {"message": "World book vector sync completed", "result": result}
+
+
+@router.post("/world-books/auto-meta")
+async def auto_fill_world_book_meta(req: WorldBookAutoMetaRequest):
+    if _llm_client is None:
+        raise HTTPException(500, "LLM client is not initialized")
+    if _db is None:
+        raise HTTPException(500, "Database is not initialized")
+
+    target_ids = [int(x) for x in req.item_ids if int(x) > 0]
+    if target_ids:
+        items = await _db.get_world_books_by_ids(target_ids)
+    else:
+        items = await _db.list_world_books(offset=0, limit=500)
+
+    processed = 0
+    updated = 0
+    failed = 0
+    details: list[dict] = []
+
+    for item in items:
+        processed += 1
+        name = str(item.name or "").strip()
+        content = str(item.content or "").strip()
+        if not content:
+            failed += 1
+            details.append({"id": item.id, "status": "failed", "reason": "empty content"})
+            continue
+        need_title = req.overwrite_title or (not name)
+        existing_keywords = _parse_json_list(item.match_keywords)
+        need_keywords = req.overwrite_keywords or (not existing_keywords)
+        if not need_title and not need_keywords:
+            details.append({"id": item.id, "status": "skipped", "reason": "already has meta"})
+            continue
+
+        prompt = (
+            "你是世界书整理助手。请只输出 JSON，不要输出额外文本。"
+            "JSON 结构为：{\"title\": string, \"keywords\": string[]}。"
+            "要求：title 8-30 字，简洁具体；keywords 6-12 个，偏可检索实体词/术语词。"
+            "禁止空数组。\n\n"
+            f"世界书内容：\n{content}"
+        )
+        try:
+            response = await _llm_client.chat(
+                [
+                    {"role": "system", "content": "你是严谨的信息抽取助手。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=300,
+            )
+            parsed = _extract_json_object(response)
+            suggested_title = str(parsed.get("title") or "").strip()
+            suggested_keywords = _parse_json_list(parsed.get("keywords"))
+
+            if not suggested_title:
+                suggested_title = (content.split("。")[0].strip() or content[:24].strip())[:30]
+            if not suggested_keywords:
+                tokens = _parse_json_list(item.tags)
+                suggested_keywords = tokens[:8]
+                if not suggested_keywords:
+                    suggested_keywords = [w for w in content.replace("，", ",").replace("。", ",").split(",") if w.strip()][:8]
+
+            fields = {}
+            if need_title and suggested_title:
+                fields["name"] = suggested_title
+            if need_keywords and suggested_keywords:
+                fields["match_keywords"] = json.dumps(suggested_keywords, ensure_ascii=False)
+
+            if fields:
+                await _db.update_world_book(int(item.id or 0), **fields)
+                upsert_method = getattr(_memory_store, "upsert_world_book_vector", None)
+                if callable(upsert_method) and str(item.embedding_vector_id or "").strip():
+                    await upsert_method(int(item.id or 0))
+                updated += 1
+                details.append(
+                    {
+                        "id": item.id,
+                        "status": "updated",
+                        "name": fields.get("name", item.name),
+                        "match_keywords": suggested_keywords if "match_keywords" in fields else existing_keywords,
+                    }
+                )
+            else:
+                details.append({"id": item.id, "status": "skipped", "reason": "no generated fields"})
+        except Exception as exc:
+            failed += 1
+            details.append({"id": item.id, "status": "failed", "reason": str(exc)})
+
+    return {
+        "message": "World book auto meta completed",
+        "processed": processed,
+        "updated": updated,
+        "failed": failed,
+        "details": details,
+        "model_source": "runtime_llm",
+    }
+
+
+@router.get("/environment/history")
+async def list_environment_history(offset: int = 0, limit: int = 50, include_empty: bool = False):
+    snapshots = await _db.get_all_snapshots(offset=offset, limit=limit)
+    items: list[dict] = []
+    for snap in snapshots:
+        env_raw = str(snap.environment or "{}").strip() or "{}"
+        try:
+            env_obj = json.loads(env_raw)
+            if not isinstance(env_obj, dict):
+                env_obj = {}
+        except Exception:
+            env_obj = {}
+        summary = str(env_obj.get("summary") or "")
+        activity = str(env_obj.get("activity") or "")
+        if not include_empty and not (summary or activity):
+            continue
+        items.append(
+            {
+                "snapshot_id": snap.id,
+                "created_at": snap.created_at,
+                "type": snap.type,
+                "summary": summary,
+                "activity": activity,
+                "continuity": str(env_obj.get("continuity") or ""),
+                "environment": env_obj,
+            }
+        )
+    return {"items": items}
+
+
+@router.get("/dashboard/idle-snapshot-summary")
+async def get_idle_snapshot_summary():
+    """仪表盘：距最新快照时间、自上次「对话结束」快照以来的增量统计、后台调度器开关状态。"""
+    if _db is None:
+        raise HTTPException(500, "Database is not initialized")
+    sm = _require_state_machine()
+    latest = await _db.get_latest_snapshot()
+    conv = await _db.get_latest_snapshot_by_type("conversation_end")
+    since = str(conv.created_at).strip() if conv and conv.created_at else ""
+    snap_n: int | None = None
+    evt_n: int | None = None
+    if since:
+        snap_n = await _db.count_snapshots_since(since)
+        evt_n = await _db.count_events_since(since)
+    sched = await sm.get_snapshot_scheduler_public_info()
+    now_u = datetime.utcnow()
+    latest_d = latest.model_dump() if latest else None
+    last_conv = None
+    if conv:
+        lc = conv.model_dump()
+        last_conv = {
+            "id": lc["id"],
+            "type": lc["type"],
+            "created_at": lc["created_at"],
+            "inserted_at": lc.get("inserted_at"),
+            "created_at_cst": lc["created_at_cst"],
+            "inserted_at_cst": lc.get("inserted_at_cst"),
+        }
+    return {
+        "server_now_cst": utc_naive_to_shanghai_iso(now_u),
+        "latest_snapshot": latest_d,
+        "last_conversation_end": last_conv,
+        "snapshots_since_conversation_end": snap_n,
+        "events_since_conversation_end": evt_n,
+        "snapshot_scheduler": sched,
+    }
+
+
 # ── Snapshots CRUD ──
 
 @router.get("/snapshots")
@@ -381,13 +891,20 @@ async def get_snapshot(snap_id: int):
 @router.post("/snapshots")
 async def create_snapshot(req: CreateSnapshotRequest):
     snap = StateSnapshot(
-        created_at=datetime.utcnow().isoformat(),
+        created_at=format_utc_instant_z(datetime.utcnow()),
         type=req.type,
         content=req.content,
         environment=req.environment,
     )
     snap_id = await _db.insert_snapshot(snap)
     return {"id": snap_id, "message": "Snapshot created"}
+
+
+@router.post("/snapshots/repair-timezone")
+async def repair_snapshot_timezone(req: SnapshotTimezoneRepairRequest):
+    if _db is None:
+        raise HTTPException(500, "Database is not initialized")
+    return await _db.repair_snapshot_timezones(dry_run=req.dry_run)
 
 
 @router.delete("/snapshots/{snap_id}")
@@ -430,14 +947,30 @@ async def get_event(event_id: int):
 @router.post("/events")
 async def create_event(req: CreateEventRequest):
     categories = req.categories if req.categories is not None else classify_event(req.description, req.trigger_keywords)
-    title = (req.title or "").strip() or make_event_title(req.description, req.trigger_keywords, categories)
+    title = (req.title or "").strip()
+    keywords = list(req.trigger_keywords or [])
+
+    if not title or not keywords:
+        meta = await _generate_event_meta_by_summary_llm(
+            description=req.description,
+            categories=categories,
+        )
+        if not title:
+            title = str(meta.get("title") or "").strip()
+        if not keywords:
+            generated_keywords = _parse_json_list(meta.get("keywords"))
+            if generated_keywords:
+                keywords = generated_keywords
+
+    title = title or make_event_title(req.description, keywords, categories)
+    now_shanghai = shanghai_now()
     event = EventAnchor(
-        date=req.date or datetime.utcnow().strftime("%Y-%m-%d"),
+        date=req.date or now_shanghai.date().isoformat(),
         title=title,
         description=req.description,
         source=req.source,
-        created_at=datetime.utcnow().isoformat(),
-        trigger_keywords=json.dumps(req.trigger_keywords, ensure_ascii=False),
+        created_at=format_utc_instant_z(shanghai_time_to_utc_naive(now_shanghai)),
+        trigger_keywords=json.dumps(keywords, ensure_ascii=False),
         categories=json.dumps(categories, ensure_ascii=False),
     )
     event_id = await _db.insert_event(event)
@@ -479,13 +1012,36 @@ async def update_event(event_id: int, req: UpdateEventRequest):
     except Exception:
         existing_keywords = []
     keywords = req.trigger_keywords if req.trigger_keywords is not None else existing_keywords
+    current_title = (req.title if req.title is not None else event.title) or ""
 
     if req.categories is None and (req.description is not None or req.trigger_keywords is not None):
         fields["categories"] = json.dumps(classify_event(description, keywords), ensure_ascii=False)
 
-    if req.title is None and (
+    # Auto-generate event title/keywords via runtime summary-LLM when missing.
+    if (
         req.description is not None or req.trigger_keywords is not None or req.categories is not None
-    ):
+    ) and (not str(current_title).strip() or not keywords):
+        try:
+            category_for_meta = (
+                req.categories
+                if req.categories is not None
+                else json.loads(fields.get("categories", event.categories or "[]"))
+            )
+        except Exception:
+            category_for_meta = []
+        meta = await _generate_event_meta_by_summary_llm(description, category_for_meta)
+        if not str(current_title).strip():
+            generated_title = str(meta.get("title") or "").strip()
+            if generated_title:
+                fields["title"] = generated_title
+                current_title = generated_title
+        if not keywords:
+            generated_keywords = _parse_json_list(meta.get("keywords"))
+            if generated_keywords:
+                keywords = generated_keywords
+                fields["trigger_keywords"] = json.dumps(generated_keywords, ensure_ascii=False)
+
+    if not str(current_title).strip():
         try:
             category_for_title = (
                 req.categories
@@ -656,6 +1212,50 @@ async def update_vector_settings(req: UpdateVectorSettingsRequest):
 
 
 # ── Runtime LLM API config ──
+
+@router.get("/environment/llm-config")
+async def get_environment_llm_config():
+    settings = await _get_llm_config("env_llm")
+    return {"settings": settings}
+
+
+@router.post("/environment/llm-config")
+async def update_environment_llm_config(payload: dict):
+    if _env_llm_client is not None:
+        await _env_llm_client.update_runtime_config(
+            {
+                "env_llm_enabled": "1" if _to_int_flag(payload.get("enabled"), 0) == 1 else "0",
+                "env_llm_api_base": payload.get("api_base", ""),
+                "env_llm_api_key": payload.get("api_key", ""),
+                "env_llm_model": payload.get("model", ""),
+            }
+        )
+    else:
+        await _save_llm_config("env_llm", payload)
+    return {"message": "Environment LLM settings updated"}
+
+
+@router.get("/snapshot/llm-config")
+async def get_snapshot_llm_config():
+    settings = await _get_llm_config("snapshot_llm")
+    return {"settings": settings}
+
+
+@router.post("/snapshot/llm-config")
+async def update_snapshot_llm_config(payload: dict):
+    if _snapshot_llm_client is not None:
+        await _snapshot_llm_client.update_runtime_config(
+            {
+                "snapshot_llm_enabled": "1" if _to_int_flag(payload.get("enabled"), 0) == 1 else "0",
+                "snapshot_llm_api_base": payload.get("api_base", ""),
+                "snapshot_llm_api_key": payload.get("api_key", ""),
+                "snapshot_llm_model": payload.get("model", ""),
+            }
+        )
+    else:
+        await _save_llm_config("snapshot_llm", payload)
+    return {"message": "Snapshot LLM settings updated"}
+
 
 @router.get("/runtime/llm")
 async def get_runtime_llm():
@@ -875,7 +1475,7 @@ async def automation_token_summary():
         "week": await _sum_usage(week_rows),
         "all": await _sum_usage(all_rows),
         "pricing_unit": "USD / 1M tokens",
-        "generated_at": now.isoformat(),
+        "generated_at": utc_naive_to_shanghai_iso(now),
     }
 
 
@@ -936,7 +1536,7 @@ async def bulk_import(req: BulkImportRequest):
     if _db is None:
         raise HTTPException(500, "Database is not initialized")
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = format_utc_instant_z(datetime.utcnow())
     result: dict = {
         "settings": {"imported": 0, "skipped": 0, "errors": []},
         "snapshots": {"imported": 0, "skipped": 0, "errors": []},
@@ -984,7 +1584,10 @@ async def bulk_import(req: BulkImportRequest):
                 environment_text = str(environment or "{}")
             referenced_events_text = _to_json_array_text(item.get("referenced_events"))
             snapshot = StateSnapshot(
-                created_at=str(item.get("created_at") or now_iso),
+                created_at=_normalize_optional_instant_to_utc_z(
+                    item.get("created_at"),
+                    now_iso,
+                ),
                 type=snap_type,  # type: ignore[arg-type]
                 content=content,
                 environment=environment_text,
@@ -1122,14 +1725,69 @@ async def bulk_import(req: BulkImportRequest):
 async def evolution_status():
     if _evolution_engine is None:
         raise HTTPException(500, "Evolution engine is not initialized")
-    return await _evolution_engine.check_status()
+    status = await _evolution_engine.check_status()
+    pending = await _evolution_engine.get_pending_preview()
+    status["has_pending_preview"] = bool(pending)
+    status["pending_preview_generated_at"] = (
+        pending.get("pending_preview_generated_at") if pending else None
+    )
+    status["pending_preview_event_count"] = int(pending.get("event_count") or 0) if pending else 0
+    status["pending_preview_candidate_count"] = (
+        int(pending.get("evolution_prompt_event_count") or 0) if pending else 0
+    )
+    return status
 
 
 @router.post("/evolution/preview")
 async def evolution_preview():
     if _evolution_engine is None:
         raise HTTPException(500, "Evolution engine is not initialized")
-    return await _evolution_engine.preview()
+    try:
+        return await _evolution_engine.preview(store_pending=True, source="manual")
+    except LLMTimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except LLMTransportError as exc:
+        status_code = exc.status_code if 400 <= int(exc.status_code) <= 599 else 502
+        raise HTTPException(status_code, str(exc)) from exc
+    except LLMUpstreamHTTPError as exc:
+        status_code = exc.status_code if 400 <= int(exc.status_code) <= 599 else 502
+        raise HTTPException(status_code, str(exc)) from exc
+
+
+@router.post("/evolution/regenerate-preview")
+async def evolution_regenerate_preview():
+    if _evolution_engine is None:
+        raise HTTPException(500, "Evolution engine is not initialized")
+    try:
+        return await _evolution_engine.regenerate_preview_from_scored(
+            store_pending=True,
+            source="manual_regenerate",
+        )
+    except LLMTimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except LLMTransportError as exc:
+        status_code = exc.status_code if 400 <= int(exc.status_code) <= 599 else 502
+        raise HTTPException(status_code, str(exc)) from exc
+    except LLMUpstreamHTTPError as exc:
+        status_code = exc.status_code if 400 <= int(exc.status_code) <= 599 else 502
+        raise HTTPException(status_code, str(exc)) from exc
+
+
+@router.get("/evolution/pending-preview")
+async def evolution_pending_preview():
+    if _evolution_engine is None:
+        raise HTTPException(500, "Evolution engine is not initialized")
+    data = await _evolution_engine.get_pending_preview()
+    if not data:
+        raise HTTPException(404, "No pending evolution preview")
+    return data
+
+
+@router.put("/evolution/pending-preview")
+async def evolution_update_pending_preview(req: EvolutionApplyRequest):
+    if _evolution_engine is None:
+        raise HTTPException(500, "Evolution engine is not initialized")
+    return await _evolution_engine.save_pending_preview(req.preview, source="manual_edit")
 
 
 @router.post("/evolution/apply")
@@ -1153,6 +1811,31 @@ async def evolution_recalculate_archive(req: RecalculateArchiveRequest):
         start_date=req.start_date,
         end_date=req.end_date,
     )
+    sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
+    if callable(sync_method):
+        await sync_method()
+    return result
+
+
+@router.post("/evolution/rescore")
+async def evolution_rescore(req: EvolutionRescoreRequest):
+    if _evolution_engine is None:
+        raise HTTPException(500, "Evolution engine is not initialized")
+    try:
+        result = await _evolution_engine.rescore_events(
+            start_id=req.start_id,
+            end_id=req.end_id,
+            start_date=req.start_date,
+            end_date=req.end_date,
+            scored_only=req.scored_only,
+        )
+    except LLMTimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except LLMTransportError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except LLMUpstreamHTTPError as exc:
+        status_code = 502 if exc.status_code < 400 else exc.status_code
+        raise HTTPException(status_code, str(exc)) from exc
     sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
     if callable(sync_method):
         await sync_method()

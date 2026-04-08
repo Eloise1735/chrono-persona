@@ -7,7 +7,8 @@ from datetime import datetime
 
 import aiosqlite
 
-from server.models import StateSnapshot, EventAnchor, KeyRecord
+from server.models import StateSnapshot, EventAnchor, KeyRecord, WorldBook, format_utc_instant_z
+from server.time_display import normalize_user_instant_to_utc_z
 
 _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS state_snapshots (
@@ -66,6 +67,18 @@ CREATE TABLE IF NOT EXISTS key_records (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS world_books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    match_keywords TEXT NOT NULL DEFAULT '[]',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    embedding_vector_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_vectors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entry_id TEXT NOT NULL UNIQUE,
@@ -120,6 +133,8 @@ class Database:
         await self._ensure_column("event_anchors", "impression_depth", "REAL")
         await self._ensure_column("event_anchors", "title", "TEXT NOT NULL DEFAULT ''")
         await self._ensure_column("event_anchors", "categories", "TEXT NOT NULL DEFAULT '[]'")
+        await self._ensure_column("world_books", "embedding_vector_id", "TEXT")
+        await self._ensure_column("state_snapshots", "inserted_at", "TEXT")
         await self.conn.execute(
             """CREATE TABLE IF NOT EXISTS memory_recall_stats (
                 entry_id TEXT PRIMARY KEY,
@@ -141,6 +156,19 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'active',
                 source TEXT NOT NULL DEFAULT 'manual',
                 linked_event_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS world_books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                match_keywords TEXT NOT NULL DEFAULT '[]',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                embedding_vector_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"""
@@ -184,26 +212,52 @@ class Database:
     # ── Snapshots ──
 
     async def insert_snapshot(self, snap: StateSnapshot) -> int:
+        wall = format_utc_instant_z(datetime.utcnow())
         cursor = await self.conn.execute(
             """INSERT INTO state_snapshots
-               (created_at, type, content, environment, referenced_events, embedding_vector_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (snap.created_at, snap.type, snap.content,
-             snap.environment, snap.referenced_events, snap.embedding_vector_id),
+               (created_at, inserted_at, type, content, environment, referenced_events, embedding_vector_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                snap.created_at,
+                wall,
+                snap.type,
+                snap.content,
+                snap.environment,
+                snap.referenced_events,
+                snap.embedding_vector_id,
+            ),
         )
         await self.conn.commit()
         return cursor.lastrowid  # type: ignore
 
     async def get_latest_snapshot(self) -> StateSnapshot | None:
         async with self.conn.execute(
-            "SELECT * FROM state_snapshots ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
             return StateSnapshot(**dict(row)) if row else None
 
+    async def get_latest_snapshot_by_type(self, snap_type: str) -> StateSnapshot | None:
+        async with self.conn.execute(
+            # 对话检查点语义优先「最新写入的一条记录」而非 created_at 最大值：
+            # created_at 可能来自导入/回填的历史时间，不能稳定代表最近一次互动写入。
+            "SELECT * FROM state_snapshots WHERE type = ? ORDER BY id DESC LIMIT 1",
+            (snap_type,),
+        ) as cur:
+            row = await cur.fetchone()
+            return StateSnapshot(**dict(row)) if row else None
+
+    async def count_snapshots_since(self, since_timestamp: str) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM state_snapshots WHERE created_at > ?",
+            (since_timestamp,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0] or 0)  # type: ignore
+
     async def get_recent_snapshots(self, limit: int = 7) -> list[StateSnapshot]:
         async with self.conn.execute(
-            "SELECT * FROM state_snapshots ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
         ) as cur:
             rows = await cur.fetchall()
             return [StateSnapshot(**dict(r)) for r in rows]
@@ -222,7 +276,7 @@ class Database:
 
     async def get_all_snapshots(self, offset: int = 0, limit: int = 50) -> list[StateSnapshot]:
         async with self.conn.execute(
-            "SELECT * FROM state_snapshots ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ) as cur:
             rows = await cur.fetchall()
@@ -240,12 +294,23 @@ class Database:
             row = await cur.fetchone()
             return StateSnapshot(**dict(row)) if row else None
 
+    async def update_snapshot(self, snap_id: int, **fields):
+        if not fields:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [snap_id]
+        await self.conn.execute(
+            f"UPDATE state_snapshots SET {set_clause} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
+
     async def get_oldest_snapshots_beyond_limit(self, max_keep: int) -> list[StateSnapshot]:
         """Return snapshots that exceed the retention limit (oldest first)."""
         async with self.conn.execute(
             """SELECT * FROM state_snapshots
                WHERE id NOT IN (
-                   SELECT id FROM state_snapshots ORDER BY id DESC LIMIT ?
+                   SELECT id FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT ?
                )
                AND embedding_vector_id IS NULL
                ORDER BY id ASC""",
@@ -267,6 +332,61 @@ class Database:
             (snap_id,),
         )
         await self.conn.commit()
+
+    async def repair_snapshot_timezones(self, *, dry_run: bool = False) -> dict:
+        async with self.conn.execute(
+            "SELECT id, created_at FROM state_snapshots ORDER BY id ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+
+        updates: list[tuple[str, int]] = []
+        examples: list[dict[str, str | int]] = []
+        errors: list[str] = []
+        scanned = 0
+        skipped = 0
+
+        for row in rows:
+            scanned += 1
+            snap_id = int(row["id"])
+            raw_created_at = str(row["created_at"] or "").strip()
+            if not raw_created_at:
+                skipped += 1
+                continue
+            try:
+                normalized = normalize_user_instant_to_utc_z(raw_created_at)
+            except ValueError as exc:
+                errors.append(f"id={snap_id}: {exc}")
+                continue
+            if normalized == raw_created_at:
+                skipped += 1
+                continue
+            updates.append((normalized, snap_id))
+            if len(examples) < 20:
+                examples.append(
+                    {
+                        "id": snap_id,
+                        "from": raw_created_at,
+                        "to": normalized,
+                    }
+                )
+
+        if updates and not dry_run:
+            await self.conn.executemany(
+                "UPDATE state_snapshots SET created_at = ? WHERE id = ?",
+                updates,
+            )
+            await self.conn.commit()
+
+        return {
+            "dry_run": dry_run,
+            "scanned": scanned,
+            "candidate_count": len(updates),
+            "updated_count": 0 if dry_run else len(updates),
+            "skipped_count": skipped,
+            "error_count": len(errors),
+            "examples": examples,
+            "errors": errors,
+        }
 
     async def get_snapshots_older_than_days_without_vector(
         self,
@@ -360,6 +480,20 @@ class Database:
     async def get_event_by_id(self, event_id: int) -> EventAnchor | None:
         async with self.conn.execute(
             "SELECT * FROM event_anchors WHERE id = ?", (event_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return EventAnchor(**dict(row)) if row else None
+
+    async def get_event_by_date_title(
+        self,
+        date: str,
+        title: str,
+    ) -> EventAnchor | None:
+        async with self.conn.execute(
+            """SELECT * FROM event_anchors
+               WHERE date = ? AND title = ?
+               ORDER BY id DESC LIMIT 1""",
+            (date, title),
         ) as cur:
             row = await cur.fetchone()
             return EventAnchor(**dict(row)) if row else None
@@ -466,7 +600,7 @@ class Database:
         async with self.conn.execute(
             """SELECT * FROM state_snapshots
                WHERE content LIKE ? AND embedding_vector_id IS NOT NULL
-               ORDER BY id DESC LIMIT ?""",
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
             (pattern, limit),
         ) as cur:
             rows = await cur.fetchall()
@@ -489,7 +623,7 @@ class Database:
         async with self.conn.execute(
             f"""SELECT * FROM state_snapshots
                 WHERE ({where}) AND embedding_vector_id IS NOT NULL
-                ORDER BY id DESC LIMIT ?""",
+                ORDER BY created_at DESC, id DESC LIMIT ?""",
             params,
         ) as cur:
             rows = await cur.fetchall()
@@ -734,6 +868,94 @@ class Database:
         await self.conn.execute(
             "DELETE FROM key_records WHERE id = ?",
             (record_id,),
+        )
+        await self.conn.commit()
+
+    # ── World Books ──
+
+    async def insert_world_book(self, item: WorldBook) -> int:
+        cursor = await self.conn.execute(
+            """INSERT INTO world_books
+               (name, content, tags, match_keywords, is_active, embedding_vector_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                item.name,
+                item.content,
+                item.tags,
+                item.match_keywords,
+                item.is_active,
+                item.embedding_vector_id,
+                item.created_at,
+                item.updated_at,
+            ),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    async def get_world_book_by_id(self, item_id: int) -> WorldBook | None:
+        async with self.conn.execute(
+            "SELECT * FROM world_books WHERE id = ?",
+            (item_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return WorldBook(**dict(row)) if row else None
+
+    async def list_world_books(self, offset: int = 0, limit: int = 100) -> list[WorldBook]:
+        async with self.conn.execute(
+            "SELECT * FROM world_books ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [WorldBook(**dict(r)) for r in rows]
+
+    async def update_world_book(self, item_id: int, **fields):
+        if not fields:
+            return
+        fields["updated_at"] = datetime.utcnow().isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [item_id]
+        await self.conn.execute(
+            f"UPDATE world_books SET {set_clause} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
+
+    async def delete_world_book(self, item_id: int):
+        await self.conn.execute(
+            "DELETE FROM world_books WHERE id = ?",
+            (item_id,),
+        )
+        await self.conn.commit()
+
+    async def get_active_world_books(self) -> list[WorldBook]:
+        async with self.conn.execute(
+            "SELECT * FROM world_books WHERE is_active = 1 ORDER BY updated_at DESC, id DESC",
+        ) as cur:
+            rows = await cur.fetchall()
+            return [WorldBook(**dict(r)) for r in rows]
+
+    async def get_world_books_by_ids(self, item_ids: list[int]) -> list[WorldBook]:
+        if not item_ids:
+            return []
+        placeholders = ",".join(["?"] * len(item_ids))
+        async with self.conn.execute(
+            f"SELECT * FROM world_books WHERE id IN ({placeholders}) ORDER BY id DESC",
+            item_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+            return [WorldBook(**dict(r)) for r in rows]
+
+    async def mark_world_book_vectorized(self, item_id: int, vector_id: str):
+        await self.conn.execute(
+            "UPDATE world_books SET embedding_vector_id = ?, updated_at = ? WHERE id = ?",
+            (vector_id, datetime.utcnow().isoformat(), item_id),
+        )
+        await self.conn.commit()
+
+    async def clear_world_book_vectorized(self, item_id: int):
+        await self.conn.execute(
+            "UPDATE world_books SET embedding_vector_id = NULL, updated_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), item_id),
         )
         await self.conn.commit()
 

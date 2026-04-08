@@ -55,15 +55,38 @@ class AutomationEngine:
                 try:
                     status = await self._evolution_engine.check_status()
                     if status.get("should_evolve"):
-                        preview = await self._evolution_engine.preview()
-                        applied = await self._evolution_engine.apply(preview)
+                        pending = await self._evolution_engine.get_pending_preview()
+                        same_pending = (
+                            isinstance(pending, dict)
+                            and str(pending.get("last_time") or "") == str(status.get("last_time") or "")
+                            and int(pending.get("event_count") or 0) == int(status.get("event_count") or 0)
+                        )
+                        if same_pending:
+                            report["evolution"] = {
+                                "status": status,
+                                "generated_preview": False,
+                                "pending_confirmation": True,
+                                "pending_preview_generated_at": pending.get("pending_preview_generated_at"),
+                                "candidate_count": int(pending.get("evolution_prompt_event_count") or 0),
+                            }
+                        else:
+                            preview = await self._evolution_engine.preview(
+                                store_pending=True,
+                                source="automation",
+                            )
+                            report["evolution"] = {
+                                "status": status,
+                                "generated_preview": True,
+                                "pending_confirmation": True,
+                                "pending_preview_generated_at": preview.get("pending_preview_generated_at"),
+                                "candidate_count": int(preview.get("evolution_prompt_event_count") or 0),
+                            }
+                    else:
                         report["evolution"] = {
                             "status": status,
-                            "applied": True,
-                            "archived_count": applied.get("archived_count", 0),
+                            "generated_preview": False,
+                            "pending_confirmation": False,
                         }
-                    else:
-                        report["evolution"] = {"status": status, "applied": False}
                 except Exception as exc:
                     report["errors"].append(f"evolution: {exc}")
 

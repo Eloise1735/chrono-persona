@@ -185,9 +185,11 @@ class VectorMemoryStore(MemoryStore):
             )
             await self._db.mark_snapshot_vectorized(int(snap.id), entry_id)
             snapshot_count += 1
+        world_book_result = await self.sync_world_book_vectors(limit=batch_size)
         return {
             "vectorized_events": event_count,
             "vectorized_snapshots": snapshot_count,
+            "vectorized_world_books": int(world_book_result.get("vectorized_world_books", 0)),
             "batch_size": batch_size,
             "snapshot_days_threshold": snapshot_days,
         }
@@ -211,6 +213,95 @@ class VectorMemoryStore(MemoryStore):
         )
         await self._db.mark_event_vectorized(event_id, entry_id)
         return True
+
+    async def upsert_world_book_vector(self, world_book_id: int) -> bool:
+        if world_book_id <= 0:
+            return False
+        world_book = await self._db.get_world_book_by_id(world_book_id)
+        if not world_book:
+            return False
+        entry_id = f"world_book_{world_book_id}"
+        vector_text = self._build_world_book_vector_text(world_book)
+        await self.store(
+            entry_id,
+            vector_text,
+            {
+                "source_type": "world_book",
+                "source_id": world_book_id,
+                "name": world_book.name,
+            },
+        )
+        await self._db.mark_world_book_vectorized(world_book_id, entry_id)
+        return True
+
+    async def delete_world_book_vector(self, world_book_id: int) -> bool:
+        if world_book_id <= 0:
+            return False
+        entry_id = f"world_book_{world_book_id}"
+        row = await self._db.get_memory_vector(entry_id)
+        if not row:
+            await self._db.clear_world_book_vectorized(world_book_id)
+            return False
+        await self._db.mark_memory_vector_deleted(entry_id)
+        await self._db.clear_world_book_vectorized(world_book_id)
+        return True
+
+    async def sync_world_book_vectors(self, limit: int = 200) -> dict:
+        books = await self._db.get_active_world_books()
+        done = 0
+        failed = 0
+        for book in books[: max(1, limit)]:
+            try:
+                if await self.upsert_world_book_vector(int(book.id or 0)):
+                    done += 1
+            except Exception:
+                failed += 1
+        return {"vectorized_world_books": done, "failed": failed}
+
+    async def search_world_books(
+        self,
+        query: str,
+        top_k: int = 4,
+        candidate_ids: list[int] | None = None,
+    ) -> list[dict]:
+        query_text = (query or "").strip()
+        if not query_text:
+            return []
+        cfg = await self.get_runtime_config()
+        qvec, _provider = await self._embed_text(query_text, cfg)
+        qvec = self._normalize_vector(qvec)
+        if not qvec:
+            return []
+        rows = await self._db.list_memory_vectors(
+            offset=0,
+            limit=5000,
+            source_type="world_book",
+            status="active",
+        )
+        if candidate_ids:
+            allowed = {int(x) for x in candidate_ids if int(x) > 0}
+            rows = [r for r in rows if int(r.get("source_id") or 0) in allowed]
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            vec = self._normalize_vector(self._loads_vector(row.get("vector_json")))
+            if len(vec) != len(qvec):
+                continue
+            cosine = self._cosine_similarity(qvec, vec)
+            if cosine <= 0:
+                continue
+            scored.append((cosine, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        result: list[dict] = []
+        for score, row in scored[: max(1, top_k)]:
+            result.append(
+                {
+                    "id": int(row.get("source_id") or 0),
+                    "entry_id": str(row.get("entry_id") or ""),
+                    "score": float(score),
+                    "text": str(row.get("text_content") or ""),
+                }
+            )
+        return result
 
     async def get_vector_stats(self) -> dict:
         total = await self._db.count_memory_vectors()
@@ -248,6 +339,8 @@ class VectorMemoryStore(MemoryStore):
             await self._db.clear_event_vectorized(int(entry_id.split("_", 1)[1]))
         elif entry_id.startswith("snapshot_"):
             await self._db.clear_snapshot_vectorized(int(entry_id.split("_", 1)[1]))
+        elif entry_id.startswith("world_book_"):
+            await self._db.clear_world_book_vectorized(int(entry_id.split("_", 1)[1]))
         return True
 
     async def reindex_all_vectors(self) -> dict:
@@ -459,6 +552,23 @@ class VectorMemoryStore(MemoryStore):
                 score=score,
             )
 
+        if source_type == "world_book":
+            world_book = await self._db.get_world_book_by_id(source_id)
+            if not world_book:
+                return None
+            return MemoryEntry(
+                id=entry_id,
+                text=world_book.content,
+                source_type="world_book",
+                source_id=source_id,
+                metadata={
+                    "name": world_book.name,
+                    "tags": self._parse_json_list(world_book.tags),
+                    "score": round(score, 4),
+                },
+                score=score,
+            )
+
         snap = await self._db.get_snapshot_by_id(source_id)
         if not snap:
             return None
@@ -522,6 +632,21 @@ class VectorMemoryStore(MemoryStore):
             parts.append("keywords: " + ", ".join(keywords))
         if categories:
             parts.append("categories: " + ", ".join(categories))
+        return "\n".join([p for p in parts if p])
+
+    @staticmethod
+    def _build_world_book_vector_text(world_book: object) -> str:
+        name = str(getattr(world_book, "name", "") or "").strip()
+        content = str(getattr(world_book, "content", "") or "").strip()
+        tags = VectorMemoryStore._parse_json_list(getattr(world_book, "tags", "[]"))
+        match_keywords = VectorMemoryStore._parse_json_list(getattr(world_book, "match_keywords", "[]"))
+        parts = [content]
+        if name:
+            parts.append(f"name: {name}")
+        if tags:
+            parts.append("tags: " + ", ".join(tags))
+        if match_keywords:
+            parts.append("match_keywords: " + ", ".join(match_keywords))
         return "\n".join([p for p in parts if p])
 
     async def _keyword_fallback_entries(
