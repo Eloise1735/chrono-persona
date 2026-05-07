@@ -60,6 +60,24 @@ function escHtml(str) {
   return d.innerHTML;
 }
 
+function formatPlanSource(item) {
+  const kind = String(item?.source_kind || 'generated').trim() || 'generated';
+  const ref = item?.source_ref_id == null || item?.source_ref_id === ''
+    ? '—'
+    : String(item.source_ref_id);
+  return `来源：${kind} | source_ref_id：${ref}`;
+}
+
+function formatPlanRawPlan(plan) {
+  const raw = String(plan?.raw_plan || '').trim();
+  if (!raw) return '';
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch (e) {
+    return raw;
+  }
+}
+
 /** 环境 JSON 中 activity=正文、summary=小结；旧数据可能两段相同或仅有一段 */
 function formatEnvironmentBlocks(env, contentClass = 'detail-content') {
   if (!env || typeof env !== 'object') return '';
@@ -170,6 +188,13 @@ function showStatus(msg, isError = false) {
 // ── Dashboard Page ──
 
 let currentAutomationTab = 'latest';
+let currentSchedulePlanId = null;
+let currentScheduleItems = [];
+let selectedPlanItemId = null;
+let selectedNpcId = null;
+let scheduleHistoryManageMode = false;
+const selectedSchedulePlanIds = new Set();
+let latestPlanHistoryItems = [];
 
 async function initDashboardPage() {
   await loadDashboard();
@@ -179,6 +204,594 @@ async function initDashboardPage() {
   await loadModelPricingForDashboard();
   if (idleSnapshotSummaryTimer) clearInterval(idleSnapshotSummaryTimer);
   idleSnapshotSummaryTimer = setInterval(updateIdleSnapshotAgoLabel, 10000);
+}
+
+async function initSchedulePage() {
+  scheduleHistoryManageMode = false;
+  selectedSchedulePlanIds.clear();
+  updateScheduleHistorySelectionSummary();
+  await loadSchedulePage();
+  await loadPlanHistory();
+}
+
+async function loadSchedulePage() {
+  try {
+    const data = await apiFetch('/plans/today');
+    const wrap = $('#schedule-summary');
+    const timeline = $('#schedule-timeline');
+    const plan = data.plan;
+    const baselinePlanId = Number(data.baseline_plan_id || 0);
+    const items = Array.isArray(data.items) ? data.items : [];
+    currentSchedulePlanId = plan ? Number(plan.id || 0) : null;
+    currentScheduleItems = items;
+    if (!wrap || !timeline) return;
+    if (!plan) {
+      wrap.innerHTML = '<div class="empty">今日尚无计划</div>';
+      timeline.innerHTML = '<div class="empty">暂无时间轴</div>';
+      const editor = $('#schedule-item-editor');
+      if (editor) editor.innerHTML = '<div class="empty">暂无可编辑计划项</div>';
+    } else {
+      const planRawText = formatPlanRawPlan(plan);
+      wrap.innerHTML = `
+        <div class="list-meta">日期：${escHtml(plan.plan_date || '')}</div>
+        <div class="list-meta">状态：${escHtml(plan.status || '')}</div>
+        <div class="list-meta">生成时间：${escHtml(formatTime(plan.generated_at || plan.created_at || ''))}</div>
+        <div class="list-meta">计划 ID：${Number(plan.id || 0)}</div>
+        <div class="list-meta">重规划触发：${escHtml(plan.replan_trigger || '—')} | 父计划：${plan.replan_parent_id == null ? '—' : Number(plan.replan_parent_id)}</div>
+        <div class="list-meta">API：<code>GET /api/plans/today</code></div>
+        <div class="list-meta">当前 baseline 计划：${baselinePlanId > 0 ? baselinePlanId : '未设置'}</div>
+        <div class="detail-content" style="margin-top:12px; white-space:pre-wrap;">${escHtml(planRawText)}</div>
+        <div class="btn-group" style="margin-top:12px;">
+          <button class="btn btn-primary" onclick="usePlanAsBaseline(${Number(plan.id || 0)})">设为新的 baseline</button>
+          <button class="btn btn-danger" onclick="deletePlan(${Number(plan.id || 0)})">删除当前计划</button>
+        </div>
+      `;
+      timeline.innerHTML = items.length
+        ? items.map((item) => `
+            <div class="history-item">
+              <div class="history-title">${escHtml(String(item.hour_start).padStart(2, '0'))}:00 - ${escHtml(String(item.hour_end).padStart(2, '0'))}:00</div>
+              <div class="list-meta">类型：${escHtml(item.action_type || 'internal')} | 状态：${escHtml(item.status || '')}</div>
+              <div class="list-meta">${escHtml(formatPlanSource(item))}</div>
+              <div class="detail-content">${escHtml(item.activity || '')}</div>
+              <div class="list-meta" style="margin-top:8px;">结果：${escHtml(item.outcome || '（暂无）')}</div>
+              <div class="btn-group" style="margin-top:8px;">
+                <button class="btn" onclick="openPlanItemEditor(${Number(item.id)})">查看 / 编辑</button>
+              </div>
+            </div>
+          `).join('')
+        : '<div class="empty">计划存在，但暂无条目</div>';
+      if (items.length) {
+        openPlanItemEditor(Number(items[0].id));
+      }
+    }
+    await loadNotificationsForSchedule();
+  } catch (e) {
+    showStatus(`加载日程失败：${e.message}`, true);
+  }
+}
+
+async function loadPlanHistory() {
+  const wrap = $('#schedule-history');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/plans/history?limit=20');
+    const items = Array.isArray(data.items) ? data.items : [];
+    latestPlanHistoryItems = items;
+    wrap.innerHTML = items.length
+      ? items.map((item) => `
+          <div class="history-item ${selectedSchedulePlanIds.has(Number(item.id || 0)) ? 'selected' : ''}" data-schedule-plan-id="${Number(item.id || 0)}">
+            <div class="history-title">${escHtml(item.plan_date || '')}</div>
+            <div class="list-meta">计划 ID：${Number(item.id || 0)} | 状态：${escHtml(item.status || '')}</div>
+            <div class="list-meta">生成：${escHtml(formatTime(item.generated_at || item.created_at || ''))} | 触发：${escHtml(item.replan_trigger || '—')}</div>
+            ${scheduleHistoryManageMode ? `
+              <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;margin-top:8px;cursor:pointer">
+                <input
+                  type="checkbox"
+                  class="schedule-history-checkbox"
+                  ${selectedSchedulePlanIds.has(Number(item.id || 0)) ? 'checked' : ''}
+                  onchange="toggleScheduleHistoryItemSelection(${Number(item.id || 0)}, this.checked)"
+                >
+                勾选此计划
+              </label>
+            ` : ''}
+            <div class="btn-group" style="margin-top:8px;">
+              <button class="btn" onclick="loadSpecificPlan(${Number(item.id)})">查看详情</button>
+              <button class="btn btn-danger" onclick="deletePlan(${Number(item.id || 0)})">删除</button>
+            </div>
+          </div>
+        `).join('')
+      : '<div class="empty">暂无计划历史</div>';
+    updateScheduleHistorySelectionSummary();
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--danger)">计划历史加载失败：${escHtml(e.message)}</div>`;
+  }
+}
+
+function updateScheduleHistorySelectionSummary() {
+  const el = document.getElementById('schedule-history-selection-summary');
+  const toggleBtn = document.getElementById('schedule-history-toggle-manage-btn');
+  if (!el) return;
+  const n = selectedSchedulePlanIds.size;
+  if (!scheduleHistoryManageMode) {
+    el.textContent = '管理模式未开启';
+    if (toggleBtn) toggleBtn.textContent = '开启选择管理';
+    return;
+  }
+  if (toggleBtn) toggleBtn.textContent = '退出选择管理';
+  el.textContent = `已开启管理模式：已选 ${n} 条计划历史`;
+}
+
+function toggleScheduleHistoryManageMode() {
+  scheduleHistoryManageMode = !scheduleHistoryManageMode;
+  if (!scheduleHistoryManageMode) selectedSchedulePlanIds.clear();
+  updateScheduleHistorySelectionSummary();
+  loadPlanHistory();
+}
+
+function toggleScheduleHistoryItemSelection(planId, forceChecked) {
+  const id = Number(planId || 0);
+  if (!id) return;
+  const checked = forceChecked === undefined ? !selectedSchedulePlanIds.has(id) : !!forceChecked;
+  if (checked) selectedSchedulePlanIds.add(id);
+  else selectedSchedulePlanIds.delete(id);
+  const row = document.querySelector(`[data-schedule-plan-id="${id}"]`);
+  if (row) {
+    row.classList.toggle('selected', selectedSchedulePlanIds.has(id));
+    const cb = row.querySelector('.schedule-history-checkbox');
+    if (cb) cb.checked = selectedSchedulePlanIds.has(id);
+  }
+  updateScheduleHistorySelectionSummary();
+}
+
+function clearScheduleHistorySelection() {
+  selectedSchedulePlanIds.clear();
+  loadPlanHistory();
+}
+
+function selectAllScheduleHistory() {
+  if (!latestPlanHistoryItems.length) {
+    showStatus('当前列表为空，无可选择计划');
+    return;
+  }
+  if (!scheduleHistoryManageMode) {
+    showStatus('请先开启选择管理');
+    return;
+  }
+  latestPlanHistoryItems.forEach((item) => {
+    const id = Number(item.id || 0);
+    if (id) selectedSchedulePlanIds.add(id);
+  });
+  loadPlanHistory();
+}
+
+async function loadSpecificPlan(planId) {
+  try {
+    const data = await apiFetch(`/plans/${planId}`);
+    const wrap = $('#schedule-summary');
+    const timeline = $('#schedule-timeline');
+    const plan = data.plan;
+    const items = Array.isArray(data.items) ? data.items : [];
+    const planRawText = formatPlanRawPlan(plan);
+    currentSchedulePlanId = plan ? Number(plan.id || 0) : null;
+    currentScheduleItems = items;
+    if (wrap) {
+      wrap.innerHTML = `
+        <div class="list-meta">日期：${escHtml(plan.plan_date || '')}</div>
+        <div class="list-meta">状态：${escHtml(plan.status || '')}</div>
+        <div class="list-meta">生成时间：${escHtml(formatTime(plan.generated_at || plan.created_at || ''))}</div>
+        <div class="list-meta">计划 ID：${Number(plan.id || 0)}</div>
+        <div class="list-meta">重规划触发：${escHtml(plan.replan_trigger || '—')} | 父计划：${plan.replan_parent_id == null ? '—' : Number(plan.replan_parent_id)}</div>
+        <div class="detail-content" style="margin-top:12px; white-space:pre-wrap;">${escHtml(planRawText)}</div>
+        <div class="btn-group" style="margin-top:12px;">
+          <button class="btn btn-primary" onclick="usePlanAsBaseline(${Number(plan.id || 0)})">设为新的 baseline</button>
+          <button class="btn btn-danger" onclick="deletePlan(${Number(plan.id || 0)})">删除此计划</button>
+        </div>
+      `;
+    }
+    if (timeline) {
+      timeline.innerHTML = items.length
+        ? items.map((item) => `
+            <div class="history-item">
+              <div class="history-title">${escHtml(String(item.hour_start).padStart(2, '0'))}:00 - ${escHtml(String(item.hour_end).padStart(2, '0'))}:00</div>
+              <div class="list-meta">类型：${escHtml(item.action_type || 'internal')} | 状态：${escHtml(item.status || '')}</div>
+              <div class="list-meta">${escHtml(formatPlanSource(item))}</div>
+              <div class="detail-content">${escHtml(item.activity || '')}</div>
+              <div class="list-meta" style="margin-top:8px;">结果：${escHtml(item.outcome || '（暂无）')}</div>
+              <div class="btn-group" style="margin-top:8px;">
+                <button class="btn" onclick="openPlanItemEditor(${Number(item.id)})">查看 / 编辑</button>
+              </div>
+            </div>
+          `).join('')
+        : '<div class="empty">此计划暂无条目</div>';
+    }
+    if (items.length) openPlanItemEditor(Number(items[0].id));
+  } catch (e) {
+    showStatus(`加载计划详情失败：${e.message}`, true);
+  }
+}
+
+function openPlanItemEditor(itemId) {
+  selectedPlanItemId = Number(itemId);
+  const item = currentScheduleItems.find((x) => Number(x.id) === selectedPlanItemId);
+  const wrap = $('#schedule-item-editor');
+  if (!wrap || !item) {
+    if (wrap) wrap.innerHTML = '<div class="empty">未找到计划项</div>';
+    return;
+  }
+  let payloadText = '{}';
+  try {
+    payloadText = JSON.stringify(JSON.parse(item.action_payload || '{}'), null, 2);
+  } catch (e) {
+    payloadText = String(item.action_payload || '{}');
+  }
+  wrap.innerHTML = `
+    <div class="grid-2">
+      <div class="form-group">
+        <label>开始小时</label>
+        <input id="plan-item-hour-start" type="number" min="0" max="23" value="${Number(item.hour_start || 0)}">
+      </div>
+      <div class="form-group">
+        <label>结束小时</label>
+        <input id="plan-item-hour-end" type="number" min="1" max="24" value="${Number(item.hour_end || 1)}">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>动作类型</label>
+      <select id="plan-item-action-type">
+        ${['internal', 'message_user', 'web_search', 'npc_interaction'].map((type) => `<option value="${type}" ${item.action_type === type ? 'selected' : ''}>${type}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-group">
+      <label>活动描述</label>
+      <textarea id="plan-item-activity">${escHtml(item.activity || '')}</textarea>
+    </div>
+    <div class="form-group">
+      <label>action_payload（JSON）</label>
+      <textarea id="plan-item-payload">${escHtml(payloadText)}</textarea>
+    </div>
+    <div class="form-group">
+      <label>状态</label>
+      <select id="plan-item-status">
+        ${['pending', 'executing', 'done', 'skipped'].map((status) => `<option value="${status}" ${item.status === status ? 'selected' : ''}>${status}</option>`).join('')}
+      </select>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label>source_kind</label>
+        <select id="plan-item-source-kind">
+          ${['generated', 'routine', 'carried_over', 'thread', 'spontaneous', 'replan'].map((kind) => `<option value="${kind}" ${String(item.source_kind || 'generated') === kind ? 'selected' : ''}>${kind}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group">
+        <label>source_ref_id</label>
+        <input id="plan-item-source-ref-id" type="number" min="1" step="1" value="${item.source_ref_id == null ? '' : Number(item.source_ref_id)}" placeholder="可留空">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>执行结果</label>
+      <textarea id="plan-item-outcome">${escHtml(item.outcome || '')}</textarea>
+    </div>
+    <div class="list-meta">计划项 ID：${Number(item.id || 0)} | ${escHtml(formatPlanSource(item))}</div>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="savePlanItem(${selectedPlanItemId})">保存计划项</button>
+      <button class="btn" onclick="loadSchedulePage()">刷新当前计划</button>
+    </div>
+  `;
+}
+
+async function savePlanItem(itemId) {
+  try {
+    const payload = JSON.parse(document.getElementById('plan-item-payload').value || '{}');
+    await apiFetch(`/plans/items/${itemId}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        hour_start: Number(document.getElementById('plan-item-hour-start').value),
+        hour_end: Number(document.getElementById('plan-item-hour-end').value),
+        action_type: document.getElementById('plan-item-action-type').value,
+        activity: document.getElementById('plan-item-activity').value,
+        action_payload: payload,
+        status: document.getElementById('plan-item-status').value,
+        source_kind: document.getElementById('plan-item-source-kind').value,
+        source_ref_id: document.getElementById('plan-item-source-ref-id').value
+          ? Number(document.getElementById('plan-item-source-ref-id').value)
+          : null,
+        outcome: document.getElementById('plan-item-outcome').value,
+      }),
+    });
+    showStatus('计划项已保存');
+    if (currentSchedulePlanId) {
+      await loadSpecificPlan(currentSchedulePlanId);
+    } else {
+      await loadSchedulePage();
+    }
+  } catch (e) {
+    showStatus(`保存计划项失败：${e.message}`, true);
+  }
+}
+
+async function generateTodayPlan() {
+  try {
+    await apiFetch('/plans/generate', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    showStatus('已生成今日计划');
+    await loadSchedulePage();
+  } catch (e) {
+    showStatus(`生成计划失败：${e.message}`, true);
+  }
+}
+
+async function manualReplan() {
+  try {
+    const contextInput = document.getElementById('manual-replan-context');
+    const context = contextInput && String(contextInput.value || '').trim()
+      ? String(contextInput.value || '').trim()
+      : '用户在 Web 页面手动触发重规划。';
+    await apiFetch('/plans/replan', {
+      method: 'POST',
+      body: JSON.stringify({ trigger: 'manual', context }),
+    });
+    showStatus('已执行重规划检查');
+    await loadSchedulePage();
+    await loadPlanHistory();
+  } catch (e) {
+    showStatus(`重规划失败：${e.message}`, true);
+  }
+}
+
+async function usePlanAsBaseline(planId) {
+  const targetId = Number(planId || 0);
+  if (!targetId) return;
+  if (!confirm(`确认将计划 #${targetId} 设为后续生成的 baseline 吗？`)) return;
+  try {
+    await apiFetch(`/plans/${targetId}/use-as-baseline`, { method: 'POST' });
+    showStatus(`已将计划 #${targetId} 设为新的 baseline`);
+    await loadSchedulePage();
+    await loadPlanHistory();
+  } catch (e) {
+    showStatus(`设置 baseline 失败：${e.message}`, true);
+  }
+}
+
+async function deletePlan(planId) {
+  const targetId = Number(planId || 0);
+  if (!targetId) {
+    showStatus('计划 ID 无效', true);
+    return;
+  }
+  if (!confirm(`确认删除计划 #${targetId}？其下所有计划项也会一并删除，此操作不可撤销。`)) return;
+  try {
+    await apiFetch(`/plans/${targetId}`, { method: 'DELETE' });
+    if (currentSchedulePlanId === targetId) {
+      currentSchedulePlanId = null;
+      currentScheduleItems = [];
+      selectedPlanItemId = null;
+    }
+    showStatus(`计划 #${targetId} 已删除`);
+    await loadPlanHistory();
+    await loadSchedulePage();
+  } catch (e) {
+    showStatus(`删除计划失败：${e.message}`, true);
+  }
+}
+
+async function deleteSelectedScheduleHistory() {
+  const planIds = Array.from(selectedSchedulePlanIds).filter((id) => id > 0);
+  if (!planIds.length) {
+    alert('请先勾选要删除的计划');
+    return;
+  }
+  if (!confirm(`确认删除选中的 ${planIds.length} 条计划历史？其下所有计划项也会一并删除，此操作不可撤销。`)) return;
+  try {
+    const data = await apiFetch('/plans/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ plan_ids: planIds }),
+    });
+    const deletedTargetWasCurrent = currentSchedulePlanId != null && planIds.includes(Number(currentSchedulePlanId));
+    selectedSchedulePlanIds.clear();
+    if (deletedTargetWasCurrent) {
+      currentSchedulePlanId = null;
+      currentScheduleItems = [];
+      selectedPlanItemId = null;
+    }
+    await loadPlanHistory();
+    await loadSchedulePage();
+    showStatus(`批量删除完成：成功 ${Number(data.deleted || 0)}，失败 ${Number(data.failed || 0)}`);
+  } catch (e) {
+    showStatus(`批量删除计划失败：${e.message}`, true);
+  }
+}
+
+async function loadNotificationsForSchedule() {
+  const wrap = $('#notification-list');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/notifications?status=pending&limit=100');
+    const items = Array.isArray(data.items) ? data.items : [];
+    wrap.innerHTML = items.length
+      ? items.map((item) => `
+          <div class="history-item">
+            <div class="history-title">${escHtml(item.tone || 'neutral')}</div>
+            <div class="detail-content">${escHtml(item.message_text || '')}</div>
+            <div class="btn-group" style="margin-top:8px;">
+              <button class="btn" onclick="markNotificationRead(${Number(item.id)})">标记已读</button>
+            </div>
+          </div>
+        `).join('')
+      : '<div class="empty">暂无未读主动消息</div>';
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--danger)">通知加载失败：${escHtml(e.message)}</div>`;
+  }
+}
+
+async function loadNotificationHistory() {
+  const wrap = $('#notification-list');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/notifications/history?limit=100');
+    const items = Array.isArray(data.items) ? data.items : [];
+    wrap.innerHTML = items.length
+      ? items.map((item) => `
+          <div class="history-item">
+            <div class="history-title">${escHtml(item.tone || 'neutral')}</div>
+            <div class="list-meta">状态：${escHtml(item.status || '')} | 创建时间：${escHtml(formatTime(item.created_at || ''))}</div>
+            <div class="detail-content">${escHtml(item.message_text || '')}</div>
+          </div>
+        `).join('')
+      : '<div class="empty">暂无通知历史</div>';
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--danger)">通知历史加载失败：${escHtml(e.message)}</div>`;
+  }
+}
+
+async function markNotificationRead(id) {
+  try {
+    await apiFetch(`/notifications/${id}/read`, { method: 'POST' });
+    showStatus('已标记通知为已读');
+    await loadNotificationsForSchedule();
+  } catch (e) {
+    showStatus(`标记已读失败：${e.message}`, true);
+  }
+}
+
+async function initNPCsPage() {
+  await loadNPCsPage();
+}
+
+async function loadNPCsPage() {
+  const wrap = $('#npc-list');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/npcs');
+    const items = Array.isArray(data.items) ? data.items : [];
+    wrap.innerHTML = items.length
+      ? items.map((item) => `
+          <div class="history-item">
+            <div class="history-title">${escHtml(item.name || '未命名 NPC')}</div>
+            <div class="list-meta">身份：${escHtml(item.role || '—')} | 状态：${escHtml(item.status || '')}</div>
+            <div class="detail-content">${escHtml(item.background || '')}</div>
+            <div class="list-meta" style="margin-top:8px;">关系：${escHtml(item.relationship_to_character || '—')}</div>
+            <div class="list-meta">备注：${escHtml(item.notes || '—')}</div>
+            <div class="btn-group" style="margin-top:8px;">
+              <button class="btn" onclick="openNpcEditor(${Number(item.id)})">查看 / 编辑</button>
+            </div>
+          </div>
+        `).join('')
+      : '<div class="empty">暂无 NPC</div>';
+    if (items.length) openNpcEditor(Number(items[0].id));
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--danger)">NPC 加载失败：${escHtml(e.message)}</div>`;
+  }
+}
+
+async function openNpcEditor(npcId) {
+  selectedNpcId = Number(npcId);
+  const wrap = $('#npc-editor');
+  if (!wrap) return;
+  try {
+    const item = await apiFetch(`/npcs/${npcId}`);
+    let traitsText = '[]';
+    try {
+      traitsText = JSON.stringify(JSON.parse(item.personality_traits || '[]'), null, 2);
+    } catch (e) {
+      traitsText = String(item.personality_traits || '[]');
+    }
+    wrap.innerHTML = `
+      <div class="form-group">
+        <label>名称</label>
+        <input id="npc-name" type="text" value="${escHtml(item.name || '')}">
+      </div>
+      <div class="form-group">
+        <label>身份 / 职能</label>
+        <input id="npc-role" type="text" value="${escHtml(item.role || '')}">
+      </div>
+      <div class="form-group">
+        <label>背景设定</label>
+        <textarea id="npc-background">${escHtml(item.background || '')}</textarea>
+      </div>
+      <div class="form-group">
+        <label>与凯尔希的关系</label>
+        <textarea id="npc-relationship">${escHtml(item.relationship_to_character || '')}</textarea>
+      </div>
+      <div class="form-group">
+        <label>个性特征（JSON 数组）</label>
+        <textarea id="npc-traits">${escHtml(traitsText)}</textarea>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>状态</label>
+          <select id="npc-status">
+            ${['active', 'inactive', 'departed'].map((status) => `<option value="${status}" ${item.status === status ? 'selected' : ''}>${status}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>来源</label>
+          <select id="npc-spawn-source">
+            ${['manual', 'auto_generated'].map((source) => `<option value="${source}" ${item.spawn_source === source ? 'selected' : ''}>${source}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>备注</label>
+        <textarea id="npc-notes">${escHtml(item.notes || '')}</textarea>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-primary" onclick="saveNpc(${selectedNpcId})">保存 NPC</button>
+        <button class="btn" onclick="loadNPCsPage()">刷新列表</button>
+      </div>
+      <div class="list-meta" style="margin-top:10px;">最近互动：${escHtml(formatTime(item.last_interaction_at || '')) || '—'} | 互动次数：${Number(item.interaction_count || 0)}</div>
+    `;
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--danger)">NPC 详情加载失败：${escHtml(e.message)}</div>`;
+  }
+}
+
+async function saveNpc(npcId) {
+  try {
+    const personalityTraits = JSON.parse(document.getElementById('npc-traits').value || '[]');
+    await apiFetch(`/npcs/${npcId}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: document.getElementById('npc-name').value,
+        role: document.getElementById('npc-role').value,
+        background: document.getElementById('npc-background').value,
+        relationship_to_character: document.getElementById('npc-relationship').value,
+        personality_traits: personalityTraits,
+        status: document.getElementById('npc-status').value,
+        spawn_source: document.getElementById('npc-spawn-source').value,
+        notes: document.getElementById('npc-notes').value,
+      }),
+    });
+    showStatus('NPC 已保存');
+    await loadNPCsPage();
+  } catch (e) {
+    showStatus(`保存 NPC 失败：${e.message}`, true);
+  }
+}
+
+async function openCreateNpcPrompt() {
+  const name = window.prompt('NPC 名称：');
+  if (!name) return;
+  const role = window.prompt('NPC 身份/职能：', '') || '';
+  const background = window.prompt('NPC 背景设定：', '') || '';
+  const relationship = window.prompt('与凯尔希的关系：', '') || '';
+  try {
+    await apiFetch('/npcs', {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        role,
+        background,
+        relationship_to_character: relationship,
+        personality_traits: [],
+      }),
+    });
+    showStatus('NPC 已创建');
+    await loadNPCsPage();
+  } catch (e) {
+    showStatus(`创建 NPC 失败：${e.message}`, true);
+  }
 }
 
 async function loadIdleSnapshotSummary() {
@@ -198,6 +811,7 @@ async function loadIdleSnapshotSummary() {
     const snapN = data.snapshots_since_conversation_end;
     const evtN = data.events_since_conversation_end;
     const schedOn = !!sched.enabled;
+    const schedPaused = !!sched.paused;
     const schedSec = Number(sched.interval_sec || 60);
 
     let statsHtml = '';
@@ -224,10 +838,14 @@ async function loadIdleSnapshotSummary() {
         </div>`
       : `<div class="idle-snapshot-row" style="margin-top:10px"><span>当前没有快照记录。</span></div>`;
 
+    const schedDetail = schedPaused
+      ? `当前处于夜间暂停，预计 ${escHtml(formatTime(String(sched.resume_at_cst || '')))} 恢复；暂停前最后一条自动快照时间为 ${escHtml(formatTime(String(sched.last_auto_snapshot_cst || '')))}。`
+      : `轮询间隔约 ${schedSec} 秒（可在「设定管理 → 运行参数」中修改 <code>snapshot_scheduler_*</code>）`;
+
     const schedLine = `
       <div class="idle-snapshot-row" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-subtle)">
-        <span>后台自动推进：<span class="idle-snapshot-strong">${schedOn ? '已开启' : '已关闭'}</span></span>
-        <span class="list-meta">轮询间隔约 ${schedSec} 秒（可在「设定管理 → 运行参数」中修改 <code>snapshot_scheduler_*</code>）</span>
+        <span>后台自动推进：<span class="idle-snapshot-strong">${schedOn ? (schedPaused ? '夜间暂停中' : '已开启') : '已关闭'}</span></span>
+        <span class="list-meta">${schedDetail}</span>
       </div>`;
 
     wrap.innerHTML = statsHtml + agoLine + schedLine;
@@ -953,10 +1571,19 @@ function exportPeriodicReview() {
 // ── Key Records Page ──
 
 const KEY_RECORD_TYPE_LABELS = {
-  important_date: '关键日期',
-  important_item: '关键物品',
+  medication_protocol: '用药方案',
+  health_monitoring: '健康监测',
+  dietary_intervention: '食疗干预',
+  anniversary_date: '纪念日',
+  medical_review_date: '复诊日期',
+  lifecycle_milestone: '人生节点',
   key_collaboration: '关键协作',
-  medical_advice: '医疗建议',
+  commitment_agreement: '承诺协议',
+  emotional_anchor: '情感锚点',
+  life_pattern: '生活模式',
+  important_date: '旧:关键日期',
+  important_item: '旧:关键事项',
+  medical_advice: '旧:医疗建议',
 };
 
 let latestKeyRecords = [];
@@ -1034,10 +1661,14 @@ function renderKeyRecordList(items) {
       </div>`;
     }
     const tags = parseJsonArray(item.tags);
+    const matchKeywords = Array.isArray(item.match_keywords) ? item.match_keywords : parseJsonArray(item.match_keywords);
     const typeLabel = getKeyRecordTypeLabel(item.type);
     const statusTag = item.status === 'archived'
       ? '<span class="tag">已归档</span>'
       : '<span class="tag" style="background:#2a4035;color:var(--success)">生效中</span>';
+    const vectorTag = item.vectorized
+      ? '<span class="tag" style="background:#22394f;color:#9ed0ff">已向量化</span>'
+      : '<span class="tag">未向量化</span>';
     const dateRange = item.start_date || item.end_date
       ? `${item.start_date || '未设开始'} ~ ${item.end_date || '未设结束'}`
       : '';
@@ -1056,6 +1687,7 @@ function renderKeyRecordList(items) {
           <span class="tag">${escHtml(typeLabel)}</span>
           ${item._memory_tier === 'primary' ? '<span class="tag">主序</span>' : ''}
           ${statusTag}
+          ${vectorTag}
           <span class="tag">${escHtml(item.source || 'manual')}</span>
           <span class="list-meta">${formatTime(item.updated_at)}</span>
           ${item._relevance_score != null ? `<span class="list-meta">相关度 ${escHtml(Number(item._relevance_score).toFixed(3))}</span>` : ''}
@@ -1064,6 +1696,7 @@ function renderKeyRecordList(items) {
         <div class="list-preview"><strong>${escHtml(item.title || '未命名记录')}</strong></div>
         <div class="list-preview">${escHtml(truncate(item.content_text || '', 220))}</div>
         ${dateRange ? `<div class="list-meta">有效期: ${escHtml(dateRange)}</div>` : ''}
+        <div class="list-meta">匹配关键词：${escHtml(matchKeywords.join('，') || '（无）')}</div>
         ${tags.length ? `<div style="margin-top:4px">${tags.map(t => `<span class="tag">${escHtml(String(t))}</span>`).join('')}</div>` : ''}
       </div>
     `;
@@ -1107,10 +1740,16 @@ function openAddKeyRecordModal() {
     <div class="form-group">
       <label>类型</label>
       <select id="kr-type">
-        <option value="important_date">关键日期</option>
-        <option value="important_item" selected>关键物品</option>
+        <option value="medication_protocol">用药方案</option>
+        <option value="health_monitoring">健康监测</option>
+        <option value="dietary_intervention">食疗干预</option>
+        <option value="anniversary_date">纪念日</option>
+        <option value="medical_review_date">复诊日期</option>
+        <option value="lifecycle_milestone">人生节点</option>
         <option value="key_collaboration">关键协作</option>
-        <option value="medical_advice">医疗建议</option>
+        <option value="commitment_agreement">承诺协议</option>
+        <option value="emotional_anchor">情感锚点</option>
+        <option value="life_pattern" selected>生活模式</option>
       </select>
     </div>
     <div class="form-group">
@@ -1124,6 +1763,10 @@ function openAddKeyRecordModal() {
     <div class="form-group">
       <label>标签（逗号分隔）</label>
       <input type="text" id="kr-tags" placeholder="胃痛, 用药, 晚间">
+    </div>
+    <div class="form-group">
+      <label>匹配关键词（逗号分隔）</label>
+      <input type="text" id="kr-match-keywords" placeholder="胃痛, 奥美拉唑, 晚饭后">
     </div>
     <div class="grid-2">
       <div class="form-group">
@@ -1157,11 +1800,16 @@ function openAddKeyRecordModal() {
 }
 
 async function saveNewKeyRecord() {
+  const rawMatchKeywords = (document.getElementById('kr-match-keywords')?.value || '').trim();
   const payload = {
-    type: document.getElementById('kr-type')?.value || 'important_item',
+    type: document.getElementById('kr-type')?.value || 'life_pattern',
     title: (document.getElementById('kr-title')?.value || '').trim(),
     content_text: (document.getElementById('kr-content')?.value || '').trim(),
     tags: (document.getElementById('kr-tags')?.value || '')
+      .split(/[,，、]/)
+      .map(s => s.trim())
+      .filter(Boolean),
+    match_keywords: rawMatchKeywords
       .split(/[,，、]/)
       .map(s => s.trim())
       .filter(Boolean),
@@ -1193,6 +1841,7 @@ async function saveNewKeyRecord() {
 
 function openEditKeyRecordModal(record) {
   const tags = parseJsonArray(record.tags);
+  const matchKeywords = Array.isArray(record.match_keywords) ? record.match_keywords : parseJsonArray(record.match_keywords);
   openModal('编辑关键记录', `
     <div class="form-group">
       <label>类型</label>
@@ -1213,6 +1862,10 @@ function openEditKeyRecordModal(record) {
     <div class="form-group">
       <label>标签（逗号分隔）</label>
       <input type="text" id="kr-tags" value="${escHtml(tags.join(', '))}">
+    </div>
+    <div class="form-group">
+      <label>匹配关键词（逗号分隔）</label>
+      <input type="text" id="kr-match-keywords" value="${escHtml(matchKeywords.join(', '))}">
     </div>
     <div class="grid-2">
       <div class="form-group">
@@ -1251,8 +1904,9 @@ function openEditKeyRecordModal(record) {
 }
 
 async function updateKeyRecord(id) {
+  const rawMatchKeywords = (document.getElementById('kr-match-keywords')?.value || '').trim();
   const payload = {
-    type: document.getElementById('kr-type')?.value || 'important_item',
+    type: document.getElementById('kr-type')?.value || 'life_pattern',
     title: (document.getElementById('kr-title')?.value || '').trim(),
     content_text: (document.getElementById('kr-content')?.value || '').trim(),
     tags: (document.getElementById('kr-tags')?.value || '')
@@ -1263,6 +1917,7 @@ async function updateKeyRecord(id) {
     end_date: (document.getElementById('kr-end')?.value || '').trim() || null,
     status: document.getElementById('kr-status')?.value || 'active',
   };
+  payload.match_keywords = rawMatchKeywords.split(/[,，、]/).map(s => s.trim()).filter(Boolean);
   if (!payload.title || !payload.content_text) {
     alert('标题和正文不能为空');
     return;
@@ -1292,6 +1947,82 @@ async function deleteKeyRecord(id) {
   }
 }
 
+function getCurrentVisibleKeyRecordIds() {
+  return latestKeyRecords
+    .filter(item => item && item._result_kind !== 'world_book' && Number(item.id || 0) > 0)
+    .map(item => Number(item.id));
+}
+
+async function batchVectorizeKeyRecords() {
+  const itemIds = getCurrentVisibleKeyRecordIds();
+  showStatus('正在批量向量化关键记录...');
+  try {
+    const data = await apiFetch('/key-records/vectorize-batch', {
+      method: 'POST',
+      body: JSON.stringify({
+        item_ids: itemIds,
+        include_archived: !!document.getElementById('key-record-include-archived')?.checked,
+      }),
+    });
+    showStatus(
+      `关键记录向量化完成：处理 ${Number(data.processed || 0)}，成功 ${Number(data.vectorized || 0)}，失败 ${Number(data.failed || 0)}`
+    );
+    const refreshJobs = [loadKeyRecords()];
+    if (typeof loadVectorStats === 'function') refreshJobs.push(loadVectorStats());
+    if (typeof loadVectorEntries === 'function') refreshJobs.push(loadVectorEntries());
+    await Promise.all(refreshJobs);
+  } catch (e) {
+    showStatus('关键记录向量化失败: ' + e.message, true);
+  }
+}
+
+async function openKeyRecordRelabelModal() {
+  try {
+    const data = await apiFetch('/key-records/relabel-preview?limit=200');
+    const items = Array.isArray(data.items) ? data.items : [];
+    const legacy = items.filter(item => item.legacy_type);
+    const preview = legacy.slice(0, 12).map(item => `
+      <div class="list-item" style="cursor:default">
+        <div><span class="tag">${escHtml(item.legacy_type || 'legacy')}</span><span class="tag">${escHtml(item.suggested_type || '')}</span></div>
+        <div class="list-preview"><strong>${escHtml(item.title || '未命名记录')}</strong></div>
+        <div class="list-meta">${escHtml((item.content_text || '').slice(0, 120))}</div>
+      </div>
+    `).join('');
+    openModal('迁移/重标旧记录', `
+      <div class="list-meta" style="margin-bottom:12px">检测到 ${legacy.length} 条旧类型记录。将按当前新分类规则重标，原记录内容会保留，仅更新 type。</div>
+      <div style="max-height:360px;overflow:auto">
+        ${preview || '<div class="empty">没有待迁移的旧记录</div>'}
+      </div>
+    `, (el) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn';
+      cancel.textContent = '关闭';
+      cancel.onclick = closeModal;
+      el.appendChild(cancel);
+      if (!legacy.length) return;
+      const applyBtn = document.createElement('button');
+      applyBtn.className = 'btn btn-primary';
+      applyBtn.textContent = '应用建议类型';
+      applyBtn.onclick = async () => {
+        try {
+          const result = await apiFetch('/key-records/relabel-apply', {
+            method: 'POST',
+            body: JSON.stringify({ apply_all_legacy: true }),
+          });
+          closeModal();
+          showStatus(`已更新 ${Number(result.updated || 0)} 条旧记录`);
+          await loadKeyRecords();
+        } catch (e) {
+          alert('迁移失败: ' + e.message);
+        }
+      };
+      el.appendChild(applyBtn);
+    });
+  } catch (e) {
+    alert('加载迁移预览失败: ' + e.message);
+  }
+}
+
 // ── History Page ──
 
 let currentTab = 'snapshots';
@@ -1311,6 +2042,9 @@ const EVENT_CATEGORY_OPTIONS = [
 let historyManageMode = false;
 let latestSnapshots = [];
 let latestEvents = [];
+let eventsPageOffset = 0;
+let eventsPageLimit = 50;
+let eventsPageTotal = 0;
 const selectedSnapshotIds = new Set();
 const selectedEventIds = new Set();
 
@@ -1341,7 +2075,37 @@ function clearEventCategoryFilter() {
       el.checked = false;
     });
   }
+  if (currentTab === 'events') {
+    eventsPageOffset = 0;
+    loadEvents();
+  }
+}
+
+function onEventSourceFilterChange() {
+  eventsPageOffset = 0;
   if (currentTab === 'events') loadEvents();
+}
+
+function goEventsPage(delta) {
+  const nextOffset = Math.max(0, eventsPageOffset + delta * eventsPageLimit);
+  if (delta > 0 && nextOffset >= eventsPageTotal) return;
+  if (nextOffset === eventsPageOffset) return;
+  eventsPageOffset = nextOffset;
+  loadEvents();
+}
+
+function updateEventsPaginationSummary() {
+  const el = document.getElementById('events-pagination-summary');
+  if (!el) return;
+  if (!eventsPageTotal) {
+    el.textContent = '当前没有可显示的事件。';
+    return;
+  }
+  const start = eventsPageOffset + 1;
+  const end = Math.min(eventsPageOffset + latestEvents.length, eventsPageTotal);
+  const page = Math.floor(eventsPageOffset / eventsPageLimit) + 1;
+  const totalPages = Math.max(1, Math.ceil(eventsPageTotal / eventsPageLimit));
+  el.textContent = `第 ${page}/${totalPages} 页，显示 ${start}-${end} / 共 ${eventsPageTotal} 条`;
 }
 
 function initSnapshotsHistoryPage() {
@@ -1354,6 +2118,7 @@ function initSnapshotsHistoryPage() {
 function initEventsHistoryPage() {
   currentTab = 'events';
   historyManageMode = false;
+  eventsPageOffset = 0;
   const container = document.getElementById('event-category-filter');
   if (container && !container.children.length) {
     EVENT_CATEGORY_OPTIONS.forEach((c, i) => {
@@ -1534,6 +2299,55 @@ function formatEventExportEntry(e, index) {
   };
 }
 
+function formatKeyRecordExportEntry(item, index) {
+  const tags = Array.isArray(item.tags) ? item.tags : parseJsonArray(item.tags);
+  const contentJson = item.content_json && typeof item.content_json === 'string'
+    ? (() => {
+        try {
+          return JSON.parse(item.content_json);
+        } catch (e) {
+          return item.content_json;
+        }
+      })()
+    : (item.content_json ?? null);
+  const entry = {
+    index,
+    id: item.id,
+    type: item.type || '',
+    type_label: getKeyRecordTypeLabel(item.type),
+    title: item.title || item.name || '',
+    status: item.status || '',
+    source: item.source || '',
+    start_date: item.start_date || null,
+    end_date: item.end_date || null,
+    updated_at: item.updated_at || '',
+    created_at: item.created_at || '',
+    tags,
+  };
+  if (item._result_kind === 'world_book') {
+    return {
+      ...entry,
+      result_kind: 'world_book',
+      content: item.content || '',
+      match_keywords: Array.isArray(item.match_keywords) ? item.match_keywords : parseJsonArray(item.match_keywords),
+      usage_hint: item._usage_hint || '',
+      relevance_score: item._relevance_score ?? null,
+      memory_tier: item._memory_tier || '',
+    };
+  }
+  return {
+    ...entry,
+    result_kind: 'key_record',
+    content_text: item.content_text || '',
+    content_json: contentJson,
+    match_keywords: Array.isArray(item.match_keywords) ? item.match_keywords : parseJsonArray(item.match_keywords),
+    linked_event_id: item.linked_event_id ?? null,
+    relevance_score: item._relevance_score ?? null,
+    memory_tier: item._memory_tier || '',
+    usage_hint: item._usage_hint || '',
+  };
+}
+
 function buildExportText(tab, rows, format) {
   if (format === 'json') {
     return JSON.stringify({
@@ -1594,6 +2408,122 @@ function exportSelectedHistoryItems() {
       : 'text/plain;charset=utf-8';
   downloadLocalFile(filename, content, mime);
   showStatus(`已导出 ${rows.length} 条${currentTab === 'snapshots' ? '快照' : '事件'}到 ${filename}`);
+}
+
+function buildKeyRecordExportText(rows, format) {
+  if (format === 'json') {
+    return JSON.stringify({
+      export_time: new Date().toISOString(),
+      tab: 'key-records',
+      count: rows.length,
+      items: rows,
+    }, null, 2);
+  }
+  let md = '# 关键记录导出\n\n';
+  md += `- 导出时间：${new Date().toLocaleString('zh-CN', { timeZone: DISPLAY_TZ })}\n`;
+  md += `- 条目数量：${rows.length}\n\n`;
+  rows.forEach((row, idx) => {
+    md += `## ${idx + 1}. ${row.title || `#${row.id}`}\n\n`;
+    md += `- ID：${row.id}\n`;
+    md += `- 类型：${row.type_label || row.type || '未分类'}\n`;
+    md += `- 来源：${row.source || 'unknown'}\n`;
+    md += `- 状态：${row.status || 'unknown'}\n`;
+    if (row.start_date || row.end_date) md += `- 生效区间：${row.start_date || '未设置'} ~ ${row.end_date || '未设置'}\n`;
+    if (row.tags?.length) md += `- 标签：${row.tags.join('、')}\n`;
+    if (row.match_keywords?.length) md += `- 匹配关键词：${row.match_keywords.join('、')}\n`;
+    if (row.relevance_score !== null && row.relevance_score !== undefined) md += `- 相关度：${row.relevance_score}\n`;
+    if (row.memory_tier) md += `- 记忆层级：${row.memory_tier}\n`;
+    if (row.usage_hint) md += `- 使用提示：${row.usage_hint}\n`;
+    if (row.content_text) md += `\n### 正文\n\n${row.content_text}\n`;
+    if (row.content) md += `\n### 内容\n\n${row.content}\n`;
+    if (row.content_json) md += `\n### 结构化内容\n\n\`\`\`json\n${JSON.stringify(row.content_json, null, 2)}\n\`\`\`\n`;
+    md += '\n';
+  });
+  return md;
+}
+
+function getHistoryExportFormat() {
+  const formatEl = document.getElementById('history-export-format');
+  return formatEl ? formatEl.value : 'md';
+}
+
+function buildExportText(tab, rows, format) {
+  if (format === 'json') {
+    return JSON.stringify({
+      export_time: new Date().toISOString(),
+      tab,
+      count: rows.length,
+      items: rows,
+    }, null, 2);
+  }
+  const title = tab === 'snapshots' ? '状态快照导出' : '事件历史导出';
+  let md = `# ${title}\n\n`;
+  md += `- 导出时间：${new Date().toLocaleString('zh-CN', { timeZone: DISPLAY_TZ })}\n`;
+  md += `- 条目数量：${rows.length}\n\n`;
+  rows.forEach((row, idx) => {
+    md += `## ${idx + 1}. ${row.title || `#${row.id}`}\n\n`;
+    Object.entries(row).forEach(([k, v]) => {
+      if (k === 'index' || k === 'id') return;
+      const val = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+      md += `- **${k}**：${val}\n`;
+    });
+    md += '\n';
+  });
+  return md;
+}
+
+function exportHistoryRows(rows, format, filenamePrefix, label) {
+  if (!rows.length) {
+    alert(`当前没有可导出的${label}`);
+    return;
+  }
+  const content = buildExportText(currentTab, rows, format);
+  const filename = `${filenamePrefix}_${formatExportTimestamp()}.${format}`;
+  const mime = format === 'json' ? 'application/json;charset=utf-8' : 'text/markdown;charset=utf-8';
+  downloadLocalFile(filename, content, mime);
+  showStatus(`已导出 ${rows.length} 条${label}到 ${filename}`);
+}
+
+function exportSelectedHistoryItems() {
+  const selectedIds = Array.from(getHistorySelectionSet(currentTab));
+  if (!selectedIds.length) {
+    alert('请先勾选要导出的条目');
+    return;
+  }
+  const format = getHistoryExportFormat();
+  const sourceItems = getHistoryItems(currentTab);
+  const rows = sourceItems
+    .filter(item => selectedIds.includes(item.id))
+    .map((item, idx) => (currentTab === 'snapshots'
+      ? formatSnapshotExportEntry(item, idx + 1)
+      : formatEventExportEntry(item, idx + 1)));
+  exportHistoryRows(rows, format, `${currentTab}_selected`, currentTab === 'snapshots' ? '快照' : '事件');
+}
+
+function exportVisibleHistoryItems() {
+  const sourceItems = getHistoryItems(currentTab);
+  const format = getHistoryExportFormat();
+  const rows = sourceItems.map((item, idx) => (
+    currentTab === 'snapshots'
+      ? formatSnapshotExportEntry(item, idx + 1)
+      : formatEventExportEntry(item, idx + 1)
+  ));
+  exportHistoryRows(rows, format, `${currentTab}_visible`, currentTab === 'snapshots' ? '快照' : '事件');
+}
+
+function exportKeyRecords() {
+  const formatEl = document.getElementById('key-record-export-format');
+  const format = formatEl ? formatEl.value : 'md';
+  const rows = latestKeyRecords.map((item, idx) => formatKeyRecordExportEntry(item, idx + 1));
+  if (!rows.length) {
+    alert('当前没有可导出的关键记录');
+    return;
+  }
+  const content = buildKeyRecordExportText(rows, format);
+  const filename = `key_records_${formatExportTimestamp()}.${format}`;
+  const mime = format === 'json' ? 'application/json;charset=utf-8' : 'text/markdown;charset=utf-8';
+  downloadLocalFile(filename, content, mime);
+  showStatus(`已导出 ${rows.length} 条关键记录到 ${filename}`);
 }
 
 async function loadSnapshots() {
@@ -1700,6 +2630,87 @@ async function loadEvents() {
     showStatus(`已加载 ${data.items.length} 条事件`);
     updateHistorySelectionSummary();
   } catch(e) { list.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`; }
+}
+
+function renderEventHistoryList(items) {
+  return items.map(e => {
+    let kw = [];
+    try { kw = JSON.parse(e.trigger_keywords || '[]'); } catch (ex) {}
+    let categories = [];
+    try { categories = JSON.parse(e.categories || '[]'); } catch (ex) {}
+    const archivedClass = e.archived ? 'archived' : '';
+    const scoreLabel = (e.importance_score !== null && e.importance_score !== undefined)
+      ? ` | 重要性 ${Number(e.importance_score).toFixed(1)} / 印象 ${Number(e.impression_depth || 0).toFixed(1)}`
+      : '';
+    return `
+      <div
+        class="list-item ${archivedClass} ${historyManageMode ? 'selectable' : ''} ${selectedEventIds.has(e.id) ? 'selected' : ''}"
+        data-history-item="events-${e.id}"
+        onclick="onHistoryItemRowClick('events', ${e.id})"
+      >
+        ${historyManageMode ? `
+          <div class="select-col">
+            <input
+              type="checkbox"
+              class="history-item-checkbox"
+              ${selectedEventIds.has(e.id) ? 'checked' : ''}
+              onclick="event.stopPropagation()"
+              onchange="toggleHistoryItemSelection('events', ${e.id}, this.checked)"
+            >
+          </div>
+        ` : ''}
+        <div class="item-main">
+          <div>
+            <span class="tag">${e.source}</span>
+            ${e.archived ? '<span class="tag">已归档</span>' : ''}
+            ${e.title ? `<span class="tag">${escHtml(e.title)}</span>` : ''}
+            <span class="list-meta">${e.date} | ${formatTime(e.created_at)}</span>
+          </div>
+          <div class="list-preview">${escHtml(truncate(e.description, 150))}</div>
+          <div class="list-meta">${scoreLabel ? scoreLabel.slice(3) : '未评分'}</div>
+          <div style="margin-top:4px">${categories.map(c => `<span class="tag" style="background:#3b3049;color:#d6c6ff">${escHtml(c)}</span>`).join('')}</div>
+          <div style="margin-top:4px">${kw.map(k => `<span class="tag">${escHtml(k)}</span>`).join('')}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function loadEvents() {
+  const list = $('#data-list');
+  if (!list) return;
+  list.innerHTML = '<div class="loading">加载中...</div>';
+  try {
+    const selectedCategories = getSelectedEventCategories();
+    const params = new URLSearchParams();
+    params.set('limit', String(eventsPageLimit));
+    params.set('offset', String(eventsPageOffset));
+    params.set('include_archived', String(showArchivedEvents));
+    if (selectedCategories.length) params.set('categories', selectedCategories.join(','));
+    const sourceFilter = (document.getElementById('event-source-filter')?.value || '').trim();
+    if (sourceFilter) params.set('sources', sourceFilter);
+    const data = await apiFetch(`/events?${params.toString()}`);
+    latestEvents = Array.isArray(data.items) ? data.items : [];
+    eventsPageTotal = Number(data.total || 0);
+    if (!latestEvents.length && eventsPageOffset > 0) {
+      eventsPageOffset = Math.max(0, eventsPageOffset - eventsPageLimit);
+      return await loadEvents();
+    }
+    if (!latestEvents.length) {
+      list.innerHTML = '<div class="empty">暂无事件记录</div>';
+      updateEventsPaginationSummary();
+      updateHistorySelectionSummary();
+      return;
+    }
+    list.innerHTML = renderEventHistoryList(latestEvents);
+    updateEventsPaginationSummary();
+    showStatus(`已加载 ${latestEvents.length} 条事件（共 ${eventsPageTotal} 条）`);
+    updateHistorySelectionSummary();
+  } catch (e) {
+    list.innerHTML = `<div style="color:var(--danger)">加载失败: ${escHtml(e.message)}</div>`;
+    const el = document.getElementById('events-pagination-summary');
+    if (el) el.textContent = '分页信息加载失败';
+  }
 }
 
 function showSnapshotDetail(snap) {
@@ -2414,7 +3425,7 @@ const BULK_IMPORT_TEMPLATE = {
   ],
   key_records: [
     {
-      type: "important_item",
+      type: "life_pattern",
       title: "示例关键记录标题",
       content_text: "示例关键记录正文",
       tags: ["示例标签"],
@@ -3644,5 +4655,407 @@ async function saveSnapshotLLMConfig() {
     await loadSnapshotLLMConfig();
   } catch (e) {
     showStatus('快照 LLM 配置保存失败: ' + e.message, true);
+  }
+}
+
+function getEventScoreFilterState() {
+  const maxImportanceRaw = (document.getElementById('event-max-importance-filter')?.value || '').trim();
+  const maxImpressionRaw = (document.getElementById('event-max-impression-filter')?.value || '').trim();
+  const scoredOnly = !!document.getElementById('event-scored-only-filter')?.checked;
+  const maxImportance = maxImportanceRaw === '' ? null : Number(maxImportanceRaw);
+  const maxImpression = maxImpressionRaw === '' ? null : Number(maxImpressionRaw);
+  return {
+    scoredOnly,
+    maxImportance: Number.isFinite(maxImportance) ? maxImportance : null,
+    maxImpression: Number.isFinite(maxImpression) ? maxImpression : null,
+  };
+}
+
+function applyEventScoreFilter() {
+  eventsPageOffset = 0;
+  loadEvents();
+}
+
+function clearEventScoreFilter() {
+  const maxImportanceInput = document.getElementById('event-max-importance-filter');
+  const maxImpressionInput = document.getElementById('event-max-impression-filter');
+  const scoredOnlyInput = document.getElementById('event-scored-only-filter');
+  if (maxImportanceInput) maxImportanceInput.value = '';
+  if (maxImpressionInput) maxImpressionInput.value = '';
+  if (scoredOnlyInput) scoredOnlyInput.checked = true;
+  eventsPageOffset = 0;
+  loadEvents();
+}
+
+async function deleteEventsByCurrentScoreFilter() {
+  const sourceFilter = (document.getElementById('event-source-filter')?.value || '').trim();
+  const selectedCategories = getSelectedEventCategories();
+  const scoreFilter = getEventScoreFilterState();
+  if (scoreFilter.maxImportance === null && scoreFilter.maxImpression === null) {
+    showStatus('������������һ���������ޣ���ִ������ɾ����', true);
+    return;
+  }
+  const confirmText = [
+    'ȷ��ɾ����ǰ����ɸѡ����𣿴˲������ɳ�����',
+    scoreFilter.maxImportance !== null ? `��Ҫ�� <= ${scoreFilter.maxImportance}` : null,
+    scoreFilter.maxImpression !== null ? `ӡ����� <= ${scoreFilter.maxImpression}` : null,
+    sourceFilter ? `��Դ = ${sourceFilter}` : null,
+    selectedCategories.length ? `���� = ${selectedCategories.join(', ')}` : null,
+    scoreFilter.scoredOnly ? '��ɾ���������¼�' : null,
+  ].filter(Boolean).join('\n');
+  if (!confirm(confirmText)) return;
+  try {
+    const payload = {
+      include_archived: !!showArchivedEvents,
+      categories: selectedCategories,
+      sources: sourceFilter ? [sourceFilter] : [],
+      scored_only: scoreFilter.scoredOnly,
+      max_importance_score: scoreFilter.maxImportance,
+      max_impression_depth: scoreFilter.maxImpression,
+    };
+    const data = await apiFetch('/events/delete-by-score', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    selectedEventIds.clear();
+    eventsPageOffset = 0;
+    await loadEvents();
+    showStatus(`��ɾ�� ${Number(data.deleted || 0)} ���ͷ��¼�`);
+  } catch (e) {
+    showStatus('����������ɾ��ʧ��: ' + e.message, true);
+  }
+}
+
+async function loadEvents() {
+  const list = $('#data-list');
+  if (!list) return;
+  list.innerHTML = '<div class="loading">������...</div>';
+  try {
+    const selectedCategories = getSelectedEventCategories();
+    const params = new URLSearchParams();
+    params.set('limit', String(eventsPageLimit));
+    params.set('offset', String(eventsPageOffset));
+    params.set('include_archived', String(showArchivedEvents));
+    if (selectedCategories.length) params.set('categories', selectedCategories.join(','));
+    const sourceFilter = (document.getElementById('event-source-filter')?.value || '').trim();
+    if (sourceFilter) params.set('sources', sourceFilter);
+    const scoreFilter = getEventScoreFilterState();
+    if (scoreFilter.scoredOnly) params.set('scored_only', 'true');
+    if (scoreFilter.maxImportance !== null) params.set('max_importance_score', String(scoreFilter.maxImportance));
+    if (scoreFilter.maxImpression !== null) params.set('max_impression_depth', String(scoreFilter.maxImpression));
+    const data = await apiFetch(`/events?${params.toString()}`);
+    latestEvents = Array.isArray(data.items) ? data.items : [];
+    eventsPageTotal = Number(data.total || 0);
+    if (!latestEvents.length && eventsPageOffset > 0) {
+      eventsPageOffset = Math.max(0, eventsPageOffset - eventsPageLimit);
+      return await loadEvents();
+    }
+    if (!latestEvents.length) {
+      list.innerHTML = '<div class="empty">���޷����������¼���¼</div>';
+      updateEventsPaginationSummary();
+      updateHistorySelectionSummary();
+      return;
+    }
+    list.innerHTML = renderEventHistoryList(latestEvents);
+    updateEventsPaginationSummary();
+    const scoreParts = [];
+    if (scoreFilter.maxImportance !== null) scoreParts.push(`��Ҫ��<=${scoreFilter.maxImportance}`);
+    if (scoreFilter.maxImpression !== null) scoreParts.push(`ӡ��<=${scoreFilter.maxImpression}`);
+    if (scoreFilter.scoredOnly) scoreParts.push('��������');
+    const suffix = scoreParts.length ? `������ɸѡ��${scoreParts.join(' / ')}` : '';
+    showStatus(`�Ѽ��� ${latestEvents.length} ���¼����� ${eventsPageTotal} ����${suffix}`);
+    updateHistorySelectionSummary();
+  } catch (e) {
+    list.innerHTML = `<div style="color:var(--danger)">����ʧ��: ${escHtml(e.message)}</div>`;
+    const el = document.getElementById('events-pagination-summary');
+    if (el) el.textContent = '��ҳ��Ϣ����ʧ��';
+  }
+}
+
+function updateEventsPaginationSummary() {
+  const el = document.getElementById('events-pagination-summary');
+  if (!el) return;
+  if (!eventsPageTotal) {
+    el.textContent = '��ǰû�п���ʾ���¼���';
+    return;
+  }
+  const start = eventsPageOffset + 1;
+  const end = Math.min(eventsPageOffset + latestEvents.length, eventsPageTotal);
+  const page = Math.floor(eventsPageOffset / eventsPageLimit) + 1;
+  const totalPages = Math.max(1, Math.ceil(eventsPageTotal / eventsPageLimit));
+  el.textContent = `�� ${page}/${totalPages} ҳ����ʾ ${start}-${end} / �� ${eventsPageTotal} ��`;
+}
+
+function updateHistorySelectionSummary() {
+  const el = document.getElementById('history-selection-summary');
+  const toggleBtn = document.getElementById('toggle-manage-btn');
+  if (!el) return;
+  const currentCount = getHistorySelectionSet(currentTab).size;
+  if (!historyManageMode) {
+    el.textContent = '����ģʽδ����';
+    if (toggleBtn) toggleBtn.textContent = '����ѡ�����';
+    return;
+  }
+  if (toggleBtn) toggleBtn.textContent = '�˳�ѡ�����';
+  el.textContent = `�ѿ�������ģʽ����ǰ${currentTab === 'snapshots' ? '����' : '�¼�'}��ѡ ${currentCount} ��`;
+}
+
+function initEventsHistoryPage() {
+  currentTab = 'events';
+  historyManageMode = false;
+  eventsPageOffset = 0;
+  const container = document.getElementById('event-category-filter');
+  if (container && !container.children.length) {
+    EVENT_CATEGORY_OPTIONS.forEach((c, i) => {
+      const item = document.createElement('label');
+      item.className = 'category-filter-item';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = c;
+      input.id = `event-cat-${i}`;
+      input.onchange = onEventCategoryFilterChange;
+      const text = document.createElement('span');
+      text.textContent = c;
+      item.appendChild(input);
+      item.appendChild(text);
+      container.appendChild(item);
+    });
+  }
+  updateHistorySelectionSummary();
+  loadEvents();
+}
+
+async function runSearch() {
+  const q = $('#search-input')?.value?.trim();
+  if (!q) {
+    if (currentTab === 'snapshots') await loadSnapshots();
+    else await loadEvents();
+    return;
+  }
+  const list = $('#data-list');
+  list.innerHTML = '<div class="loading">������...</div>';
+  if (historyManageMode) {
+    historyManageMode = false;
+    updateHistorySelectionSummary();
+  }
+  try {
+    const data = await apiFetch(`/search?q=${encodeURIComponent(q)}&limit=200&include_archived=true`);
+    if (currentTab === 'events') {
+      latestEvents = (data.events || []).filter(e => showArchivedEvents || !e.archived);
+      const selectedCategories = getSelectedEventCategories();
+      if (selectedCategories.length) {
+        latestEvents = latestEvents.filter(e => {
+          let cats = [];
+          try { cats = JSON.parse(e.categories || '[]'); } catch (ex) {}
+          return selectedCategories.some(c => cats.includes(c));
+        });
+      }
+      const sourceFilter = (document.getElementById('event-source-filter')?.value || '').trim();
+      if (sourceFilter) {
+        latestEvents = latestEvents.filter(e => String(e.source || '') === sourceFilter);
+      }
+      const scoreFilter = getEventScoreFilterState();
+      if (scoreFilter.scoredOnly) {
+        latestEvents = latestEvents.filter(e => e.importance_score !== null && e.importance_score !== undefined && e.impression_depth !== null && e.impression_depth !== undefined);
+      }
+      if (scoreFilter.maxImportance !== null) {
+        latestEvents = latestEvents.filter(e => Number(e.importance_score ?? 999999) <= scoreFilter.maxImportance);
+      }
+      if (scoreFilter.maxImpression !== null) {
+        latestEvents = latestEvents.filter(e => Number(e.impression_depth ?? 999999) <= scoreFilter.maxImpression);
+      }
+      eventsPageTotal = latestEvents.length;
+      eventsPageOffset = 0;
+      if (!latestEvents.length) {
+        list.innerHTML = '<div class="empty">δ�ҵ�ƥ���¼�</div>';
+        updateEventsPaginationSummary();
+      } else {
+        list.innerHTML = renderEventHistoryList(latestEvents);
+        updateEventsPaginationSummary();
+      }
+      updateHistorySelectionSummary();
+      showStatus(`�¼�������ɣ��� ${latestEvents.length} ��`);
+      return;
+    }
+
+    latestSnapshots = data.snapshots || [];
+    if (!latestSnapshots.length) {
+      list.innerHTML = '<div class="empty">δ�ҵ�ƥ�����</div>';
+    } else {
+      list.innerHTML = latestSnapshots.map(s => `
+        <div class="list-item" onclick='showSnapshotDetail(${JSON.stringify(s).replace(/'/g, "&#39;")})'>
+          <span class="tag">${s.type}</span>
+          <span class="list-meta">${snapshotTimeLineText(s)}</span>
+          <div class="list-preview">${escHtml(truncate(s.content, 150))}</div>
+        </div>
+      `).join('');
+    }
+    showStatus(`����������ɣ��� ${latestSnapshots.length} ��`);
+  } catch (e) {
+    list.innerHTML = `<div style="color:var(--danger)">����ʧ��: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function updateEventsPaginationSummary() {
+  const el = document.getElementById('events-pagination-summary');
+  if (!el) return;
+  if (!eventsPageTotal) {
+    el.textContent = '\u5f53\u524d\u6ca1\u6709\u53ef\u663e\u793a\u7684\u4e8b\u4ef6\u3002';
+    return;
+  }
+  const start = eventsPageOffset + 1;
+  const end = Math.min(eventsPageOffset + latestEvents.length, eventsPageTotal);
+  const page = Math.floor(eventsPageOffset / eventsPageLimit) + 1;
+  const totalPages = Math.max(1, Math.ceil(eventsPageTotal / eventsPageLimit));
+  el.textContent = `\u7b2c ${page}/${totalPages} \u9875\uff0c\u663e\u793a ${start}-${end} / \u5171 ${eventsPageTotal} \u6761`;
+}
+
+function updateHistorySelectionSummary() {
+  const el = document.getElementById('history-selection-summary');
+  const toggleBtn = document.getElementById('toggle-manage-btn');
+  if (!el) return;
+  const currentCount = getHistorySelectionSet(currentTab).size;
+  if (!historyManageMode) {
+    el.textContent = '\u7ba1\u7406\u6a21\u5f0f\u672a\u5f00\u542f';
+    if (toggleBtn) toggleBtn.textContent = '\u5f00\u542f\u9009\u62e9\u7ba1\u7406';
+    return;
+  }
+  if (toggleBtn) toggleBtn.textContent = '\u9000\u51fa\u9009\u62e9\u7ba1\u7406';
+  el.textContent = `\u5df2\u5f00\u542f\u7ba1\u7406\u6a21\u5f0f\uff1a\u5f53\u524d${currentTab === 'snapshots' ? '\u5feb\u7167' : '\u4e8b\u4ef6'}\u5df2\u9009 ${currentCount} \u6761`;
+}
+
+function initEventsHistoryPage() {
+  currentTab = 'events';
+  historyManageMode = false;
+  eventsPageOffset = 0;
+  const container = document.getElementById('event-category-filter');
+  if (container && !container.children.length) {
+    EVENT_CATEGORY_OPTIONS.forEach((c, i) => {
+      const item = document.createElement('label');
+      item.className = 'category-filter-item';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = c;
+      input.id = `event-cat-${i}`;
+      input.onchange = onEventCategoryFilterChange;
+      const text = document.createElement('span');
+      text.textContent = c;
+      item.appendChild(input);
+      item.appendChild(text);
+      container.appendChild(item);
+    });
+  }
+  updateHistorySelectionSummary();
+  loadEvents();
+}
+
+async function loadEvents() {
+  const list = $('#data-list');
+  if (!list) return;
+  list.innerHTML = '<div class="loading">\u52a0\u8f7d\u4e2d...</div>';
+  try {
+    const selectedCategories = getSelectedEventCategories();
+    const params = new URLSearchParams();
+    params.set('limit', String(eventsPageLimit));
+    params.set('offset', String(eventsPageOffset));
+    params.set('include_archived', String(showArchivedEvents));
+    if (selectedCategories.length) params.set('categories', selectedCategories.join(','));
+    const sourceFilter = (document.getElementById('event-source-filter')?.value || '').trim();
+    if (sourceFilter) params.set('sources', sourceFilter);
+    const scoreFilter = getEventScoreFilterState();
+    if (scoreFilter.scoredOnly) params.set('scored_only', 'true');
+    if (scoreFilter.maxImportance !== null) params.set('max_importance_score', String(scoreFilter.maxImportance));
+    if (scoreFilter.maxImpression !== null) params.set('max_impression_depth', String(scoreFilter.maxImpression));
+    const data = await apiFetch(`/events?${params.toString()}`);
+    latestEvents = Array.isArray(data.items) ? data.items : [];
+    eventsPageTotal = Number(data.total || 0);
+    if (!latestEvents.length && eventsPageOffset > 0) {
+      eventsPageOffset = Math.max(0, eventsPageOffset - eventsPageLimit);
+      return await loadEvents();
+    }
+    if (!latestEvents.length) {
+      list.innerHTML = '<div class="empty">\u6682\u65e0\u7b26\u5408\u6761\u4ef6\u7684\u4e8b\u4ef6\u8bb0\u5f55</div>';
+      updateEventsPaginationSummary();
+      updateHistorySelectionSummary();
+      return;
+    }
+    list.innerHTML = renderEventHistoryList(latestEvents);
+    updateEventsPaginationSummary();
+    const scoreParts = [];
+    if (scoreFilter.maxImportance !== null) scoreParts.push(`\u91cd\u8981\u6027<=${scoreFilter.maxImportance}`);
+    if (scoreFilter.maxImpression !== null) scoreParts.push(`\u5370\u8c61<=${scoreFilter.maxImpression}`);
+    if (scoreFilter.scoredOnly) scoreParts.push('\u4ec5\u5df2\u8bc4\u5206');
+    const suffix = scoreParts.length ? `\uff1b\u8bc4\u5206\u7b5b\u9009\uff1a${scoreParts.join(' / ')}` : '';
+    showStatus(`\u5df2\u52a0\u8f7d ${latestEvents.length} \u6761\u4e8b\u4ef6\uff08\u5171 ${eventsPageTotal} \u6761\uff09${suffix}`);
+    updateHistorySelectionSummary();
+  } catch (e) {
+    list.innerHTML = `<div style="color:var(--danger)">\u52a0\u8f7d\u5931\u8d25: ${escHtml(e.message)}</div>`;
+    const el = document.getElementById('events-pagination-summary');
+    if (el) el.textContent = '\u5206\u9875\u4fe1\u606f\u52a0\u8f7d\u5931\u8d25';
+  }
+}
+
+async function runSearch() {
+  const q = $('#search-input')?.value?.trim();
+  if (!q) {
+    if (currentTab === 'snapshots') await loadSnapshots();
+    else await loadEvents();
+    return;
+  }
+  const list = $('#data-list');
+  list.innerHTML = '<div class="loading">\u641c\u7d22\u4e2d...</div>';
+  if (historyManageMode) {
+    historyManageMode = false;
+    updateHistorySelectionSummary();
+  }
+  try {
+    const data = await apiFetch(`/search?q=${encodeURIComponent(q)}&limit=200&include_archived=true`);
+    if (currentTab === 'events') {
+      latestEvents = (data.events || []).filter(e => showArchivedEvents || !e.archived);
+      const selectedCategories = getSelectedEventCategories();
+      if (selectedCategories.length) {
+        latestEvents = latestEvents.filter(e => {
+          let cats = [];
+          try { cats = JSON.parse(e.categories || '[]'); } catch (ex) {}
+          return selectedCategories.some(c => cats.includes(c));
+        });
+      }
+      const sourceFilter = (document.getElementById('event-source-filter')?.value || '').trim();
+      if (sourceFilter) latestEvents = latestEvents.filter(e => String(e.source || '') === sourceFilter);
+      const scoreFilter = getEventScoreFilterState();
+      if (scoreFilter.scoredOnly) {
+        latestEvents = latestEvents.filter(e => e.importance_score !== null && e.importance_score !== undefined && e.impression_depth !== null && e.impression_depth !== undefined);
+      }
+      if (scoreFilter.maxImportance !== null) latestEvents = latestEvents.filter(e => Number(e.importance_score ?? 999999) <= scoreFilter.maxImportance);
+      if (scoreFilter.maxImpression !== null) latestEvents = latestEvents.filter(e => Number(e.impression_depth ?? 999999) <= scoreFilter.maxImpression);
+      eventsPageTotal = latestEvents.length;
+      eventsPageOffset = 0;
+      if (!latestEvents.length) {
+        list.innerHTML = '<div class="empty">\u672a\u627e\u5230\u5339\u914d\u4e8b\u4ef6</div>';
+        updateEventsPaginationSummary();
+      } else {
+        list.innerHTML = renderEventHistoryList(latestEvents);
+        updateEventsPaginationSummary();
+      }
+      updateHistorySelectionSummary();
+      showStatus(`\u4e8b\u4ef6\u641c\u7d22\u5b8c\u6210\uff0c\u5171 ${latestEvents.length} \u6761`);
+      return;
+    }
+
+    latestSnapshots = data.snapshots || [];
+    if (!latestSnapshots.length) {
+      list.innerHTML = '<div class="empty">\u672a\u627e\u5230\u5339\u914d\u5feb\u7167</div>';
+    } else {
+      list.innerHTML = latestSnapshots.map(s => `
+        <div class="list-item" onclick='showSnapshotDetail(${JSON.stringify(s).replace(/'/g, "&#39;")})'>
+          <span class="tag">${s.type}</span>
+          <span class="list-meta">${snapshotTimeLineText(s)}</span>
+          <div class="list-preview">${escHtml(truncate(s.content, 150))}</div>
+        </div>
+      `).join('');
+    }
+    showStatus(`\u5feb\u7167\u641c\u7d22\u5b8c\u6210\uff0c\u5171 ${latestSnapshots.length} \u6761`);
+  } catch (e) {
+    list.innerHTML = `<div style="color:var(--danger)">\u641c\u7d22\u5931\u8d25: ${escHtml(e.message)}</div>`;
   }
 }

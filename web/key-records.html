@@ -6,7 +6,7 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
   <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 关键记录</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260326">
+  <link rel="stylesheet" href="/static/style.css?v=20260425">
 </head>
 <body>
   <nav>
@@ -27,13 +27,21 @@
       <input type="text" id="key-record-search-input" placeholder="搜索标题 / 内容 / 标签..." onkeydown="if(event.key==='Enter')searchKeyRecords()">
       <select id="key-record-type-filter" style="max-width:180px;" onchange="loadKeyRecords()">
         <option value="">全部类型</option>
-        <option value="important_date">关键日期</option>
-        <option value="important_item">关键事项</option>
+        <option value="medication_protocol">用药方案</option>
+        <option value="health_monitoring">健康监测</option>
+        <option value="dietary_intervention">食疗干预</option>
+        <option value="anniversary_date">纪念日</option>
+        <option value="medical_review_date">复诊日期</option>
+        <option value="lifecycle_milestone">人生节点</option>
         <option value="key_collaboration">关键协作</option>
-        <option value="medical_advice">医疗建议</option>
+        <option value="commitment_agreement">承诺协议</option>
+        <option value="emotional_anchor">情感锚点</option>
+        <option value="life_pattern">生活模式</option>
       </select>
       <button class="btn btn-primary" onclick="searchKeyRecords()">搜索</button>
       <button class="btn" onclick="openAddKeyRecordModal()">添加记录</button>
+      <button class="btn" onclick="batchVectorizeKeyRecords()">批量向量化</button>
+      <button class="btn" onclick="openKeyRecordRelabelModal()">迁移/重标</button>
       <label class="checkbox-label">
         <input type="checkbox" id="key-record-include-world-books" checked onchange="loadKeyRecords()">
         检索含世界书
@@ -42,6 +50,11 @@
         <input type="checkbox" id="key-record-include-archived" onchange="loadKeyRecords()">
         显示归档
       </label>
+      <select id="key-record-export-format" style="max-width:100px;">
+        <option value="md">MD</option>
+        <option value="json">JSON</option>
+      </select>
+      <button class="btn btn-primary" onclick="exportKeyRecords()">导出当前列表</button>
     </div>
 
     <div class="card" style="padding:0">
@@ -50,9 +63,7 @@
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-  <script src="/static/app.js?v=20260326"></script>
+  <script src="/static/app.js?v=20260429"></script>
   <script>initKeyRecordsPage();</script>
 </body>
 </html>
-
-

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
+  <title>凯尔希状态机 - 使用指南</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260326">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide" class="active">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h2>这是什么</h2>
+      <div class="detail-content">凯尔希状态机是一个面向对话场景的记忆与状态系统，支持状态推演、对话反思、记忆召回、阶段回顾和自动化整理。</div>
+    </div>
+
+    <div class="card">
+      <h2>主要功能</h2>
+      <div class="guide-grid">
+        <div class="list-item" style="cursor:default"><div><span class="tag">仪表盘</span></div><div class="list-preview">查看最新快照、环境信息、自动化执行报告与 Token 汇总。</div></div>
+        <div class="list-item" style="cursor:default"><div><span class="tag">状态历史</span></div><div class="list-preview">浏览与检索快照，支持批量删除和导出。</div></div>
+        <div class="list-item" style="cursor:default"><div><span class="tag">事件历史</span></div><div class="list-preview">管理事件锚点，支持编辑、分类筛选、归档视图和批量操作。</div></div>
+        <div class="list-item" style="cursor:default"><div><span class="tag">关键记录</span></div><div class="list-preview">保存可复用的长期事实（日期、事项、协作、医疗建议）。</div></div>
+        <div class="list-item" style="cursor:default"><div><span class="tag">设定管理</span></div><div class="list-preview">维护 L1/L2 设定、Prompt 模板、运行参数和导入能力。</div></div>
+        <div class="list-item" style="cursor:default"><div><span class="tag">人格演化/向量管理</span></div><div class="list-preview">执行演化预览与应用，管理向量同步、压缩和重建。</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>快速开始</h2>
+      <div class="detail-content">1. 安装依赖：`pip install -r requirements.txt`
+2. 配置模型：在 `config.yaml` 填写 LLM 参数
+3. 启动服务：`python -m server.main`
+4. 打开页面：`http://localhost:8000`</div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+  <script src="/static/app.js?v=20260326"></script>
+</body>
+</html>
+
+

@@ -1,7 +1,7 @@
 # 复制本文件为 config.yaml 后填写真实值（config.yaml 已被 .gitignore 忽略）
 server:
   host: "0.0.0.0"
-  port: 8000
+  port: 8001
 
 llm:
   api_base: "https://your-api-provider.com/v1"
@@ -22,3 +22,18 @@ character:
 memory_store:
   type: "vector"
   max_snapshots: 7
+
+wechat:
+  enabled: true
+  # openclaw_state_dir: "C:/Users/yourname/.openclaw"
+  sync_state_path: "./data/wechat_sync_state.json"
+  session_state_path: "./data/wechat_sessions.json"
+  max_history_turns: 8
+
+# 自主生活系统中的网络搜索（如 Tavily）不走 config.yaml，
+# 而是通过运行时设置 / system_settings 配置：
+# - plan_web_search_enabled
+# - plan_web_search_api_base
+# - plan_web_search_api_key
+# 推荐 Tavily:
+# - api_base: "https://api.tavily.com/search"

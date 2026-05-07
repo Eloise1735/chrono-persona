@@ -16,23 +16,26 @@ def environment_text_for_prompt(env: dict | None) -> str:
     timeline_lines: list[str] = []
     time_text = str(env.get("time") or "").strip()
     if time_text:
-        timeline_lines.append(f"时间（UTC+8）：{time_text}")
+        timeline_lines.append(f"Time (UTC+8): {time_text}")
     date_text = str(env.get("date") or "").strip()
     if date_text:
-        timeline_lines.append(f"日期：{date_text}")
+        timeline_lines.append(f"Date: {date_text}")
     weekday = str(env.get("weekday") or "").strip()
     if weekday:
-        timeline_lines.append(f"星期：{weekday}")
+        timeline_lines.append(f"Weekday: {weekday}")
     time_period = str(env.get("time_period") or "").strip()
     if time_period:
-        timeline_lines.append(f"时段：{time_period}")
+        timeline_lines.append(f"Period: {time_period}")
     timeline_text = (
-        "【环境时序锚点（东八区）】\n" + "\n".join(f"- {line}" for line in timeline_lines)
+        "[Timeline Anchor]\n" + "\n".join(f"- {line}" for line in timeline_lines)
         if timeline_lines
         else ""
     )
     body = str(env.get("activity") or "").strip()
     synopsis = str(env.get("summary") or "").strip()
+    plan_delta = str(env.get("plan_delta") or "").strip()
+    if plan_delta:
+        synopsis = f"{synopsis}\n\nPlan delta: {plan_delta}".strip() if synopsis else f"Plan delta: {plan_delta}"
     if body and synopsis and body == synopsis:
         base = body
     elif body and synopsis:
@@ -73,41 +76,39 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
     MAX_CHARACTER_STATE_CHARS = 10000
     MAX_WORLD_BOOK_ITEMS = 3
     MAX_WORLD_BOOK_ITEM_CHARS = 200
-
+    MAX_RECENT_EVENTS = 5
+    MAX_EVENT_KEYWORDS = 4
+    MAX_EVENT_BLOCK_CHARS = 320
     PERIODS = {
-        (6, 9): "清晨",
-        (9, 12): "上午",
-        (12, 14): "中午",
-        (14, 18): "下午",
-        (18, 21): "傍晚",
-        (21, 24): "深夜",
-        (0, 6): "凌晨",
+        (6, 9): "dawn",
+        (9, 12): "morning",
+        (12, 14): "noon",
+        (14, 18): "afternoon",
+        (18, 21): "evening",
+        (21, 24): "night",
+        (0, 6): "late_night",
     }
-
-    WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-
+    WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     ENV_LLM_SYSTEM_PROMPT = (
-        "你正在执行凯尔希状态机中的环境信息生成任务。"
-        "必须严格遵循用户消息中的输入、原则与输出格式。"
-        "仅输出三个正文分段，不要输出闲聊、JSON 或 Markdown 代码块。"
-        "三个分段按顺序为：[环境正文]、[内容小结]、[检索摘要]。"
-        "其中 [检索摘要] 必须非常短，只保留供后续记忆检索使用的高信息密度摘要。"
+        "You are the environment generator. Output exactly three sections: [Environment Body], [Summary], [Retrieval Summary]. "
+        "Do not output chatty prefaces, JSON, or code blocks."
     )
 
-    def __init__(
-        self,
-        prompt_manager: PromptManager | None = None,
-        llm: LLMClient | None = None,
-    ):
+    def __init__(self, prompt_manager: PromptManager | None = None, llm: LLMClient | None = None):
         self.prompt_manager = prompt_manager
         self.llm = llm
+
+    @staticmethod
+    def _coerce_trace_summary(value: object) -> str:
+        text = str(value or "").strip()
+        return text or "(no extra life-flow trace)"
 
     @staticmethod
     def _strip_env_section_header(text: str, markers: tuple[str, ...]) -> str:
         s = text.strip()
         for marker in markers:
             if s.startswith(marker):
-                s = s[len(marker) :].lstrip()
+                s = s[len(marker):].lstrip()
                 break
         return s.strip()
 
@@ -116,42 +117,17 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         text = (raw or "").strip()
         if not text:
             return "", "", ""
-
-        parts = [
-            p.strip()
-            for p in re.split(r"\n\s*(?:-{3,}|\*{3,})\s*\n", text)
-            if p.strip()
-        ]
+        parts = [p.strip() for p in re.split(r"\n\s*(?:-{3,}|\*{3,})\s*\n", text) if p.strip()]
         if len(parts) >= 3:
-            body = cls._strip_env_section_header(
-                parts[0],
-                ("[环境正文]", "环境正文", "[Environment Body]", "Environment Body"),
-            )
-            summary = cls._strip_env_section_header(
-                parts[1],
-                ("[内容小结]", "内容小结", "[Summary]", "Summary"),
-            )
-            retrieval = cls._strip_env_section_header(
-                parts[2],
-                ("[检索摘要]", "检索摘要", "[Retrieval Summary]", "Retrieval Summary"),
-            )
+            body = cls._strip_env_section_header(parts[0], ("[????]", "????", "[Environment Body]", "Environment Body"))
+            summary = cls._strip_env_section_header(parts[1], ("[????]", "????", "[Summary]", "Summary"))
+            retrieval = cls._strip_env_section_header(parts[2], ("[????]", "????", "[Retrieval Summary]", "Retrieval Summary"))
             return body.strip(), summary.strip(), retrieval.strip()
-
         if len(parts) == 2:
-            body = cls._strip_env_section_header(
-                parts[0],
-                ("[环境正文]", "环境正文", "[Environment Body]", "Environment Body"),
-            )
-            summary = cls._strip_env_section_header(
-                parts[1],
-                ("[内容小结]", "内容小结", "[Summary]", "Summary"),
-            )
+            body = cls._strip_env_section_header(parts[0], ("[????]", "????", "[Environment Body]", "Environment Body"))
+            summary = cls._strip_env_section_header(parts[1], ("[????]", "????", "[Summary]", "Summary"))
             return body.strip(), summary.strip(), ""
-
-        body = cls._strip_env_section_header(
-            text,
-            ("[环境正文]", "环境正文", "[Environment Body]", "Environment Body"),
-        )
+        body = cls._strip_env_section_header(text, ("[????]", "????", "[Environment Body]", "Environment Body"))
         return body.strip(), "", ""
 
     @staticmethod
@@ -167,87 +143,67 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         t = (text or "").strip()
         if len(t) <= cls.MAX_CHARACTER_STATE_CHARS:
             return t
-        return (
-            t[: cls.MAX_CHARACTER_STATE_CHARS].rstrip()
-            + "\n…（角色前一状态摘要过长，此处仅保留前段供连贯参考。）"
-        )
+        return t[: cls.MAX_CHARACTER_STATE_CHARS].rstrip() + "\n...(truncated previous state for continuity)"
 
-    async def generate(
-        self,
-        time_point: datetime,
-        previous_env: dict | None,
-        context: dict,
-        *,
-        allow_retry_fallback: bool = True,
-    ) -> dict:
+    async def generate(self, time_point: datetime, previous_env: dict | None, context: dict, *, allow_retry_fallback: bool = True) -> dict:
         narr = self._narrative_local_time(time_point)
         period = self._get_period(narr.hour)
         weekday = self.WEEKDAY_NAMES[narr.weekday()]
-
         latest_snapshot = str(context.get("latest_snapshot", "") or "")
         character_state = self._clip_character_state(latest_snapshot)
         time_delta_hours = float(context.get("time_delta_hours", 0.0) or 0.0)
         recent_events = context.get("recent_events") or []
         world_book_entries = context.get("world_book_entries") or []
-
+        current_plan_activity = str(context.get("current_plan_activity") or "").strip()
+        current_plan_summary = str(context.get("current_plan_summary") or "").strip()
+        current_conversation_state = str(context.get("current_conversation_state") or "").strip()
+        recent_trace_summary = self._coerce_trace_summary(context.get("recent_trace_summary"))
+        schedule_alignment = str(context.get("schedule_alignment") or "").strip()
+        plan_delta = str(context.get("plan_delta") or "").strip()
+        disturbance_context = str(context.get("disturbance_context") or "").strip()
+        recent_disturbances = str(context.get("recent_disturbances") or "").strip()
+        disturbance_schedule_effect = str(context.get("disturbance_schedule_effect") or "").strip()
         recent_events_text = self._format_recent_events(recent_events)
         time_elapsed = self._format_time_elapsed(time_delta_hours)
         continuity = self._build_continuity(previous_env)
         match_keywords = self._extract_keywords(latest_snapshot, recent_events)
-        matched_world_books = self._match_world_book(
-            world_book_entries,
-            period,
-            match_keywords,
-        )
-        world_book_context = (
-            "\n".join(f"- {item}" for item in matched_world_books)
-            if matched_world_books
-            else "（无匹配世界书）"
-        )
-
+        matched_world_books = self._match_world_book(world_book_entries, period, match_keywords)
+        world_book_context = "\n".join(f"- {item}" for item in matched_world_books) if matched_world_books else "(no matched world book)"
         template = ""
         if self.prompt_manager is not None:
             template = await self.prompt_manager.get_prompt(KEY_PROMPT_ENVIRONMENT_GENERATION)
         if not template:
             template = (
-                "时间：{time}\n日期：{date}\n星期：{weekday}\n时间段：{time_period}\n"
-                "上一段环境：{previous_env}\n连续性提示：{continuity}\n"
-                "间隔时长：{time_elapsed}\n角色前一状态摘要：{character_state}\n"
-                "期间事件摘要：{recent_events}\n世界书注入：{world_book_context}\n\n"
-                "请严格输出三段，用分隔线 --- 隔开：\n"
-                "[环境正文]\n"
-                "...\n"
-                "---\n"
-                "[内容小结]\n"
-                "...\n"
-                "---\n"
-                "[检索摘要]\n"
-                "用 1-2 句提炼环境中最值得检索的实体、地点、动作与状态线索。"
+                "Time: {time}\nDate: {date}\nWeekday: {weekday}\nPeriod: {time_period}\n"
+                "Previous environment: {previous_env}\nContinuity hint: {continuity}\n"
+                "Elapsed time: {time_elapsed}\nPrevious state summary: {character_state}\n"
+                "Current schedule skeleton: {current_plan_summary}\nCurrent conversation state: {current_conversation_state}\n"
+                "Recent life-flow trace: {recent_trace_summary}\nSchedule alignment: {schedule_alignment}\nPlan delta: {plan_delta}\n"
+                "Recent events: {recent_events}\nDisturbance context: {disturbance_context}\n"
+                "Recent disturbances: {recent_disturbances}\nWorld book context: {world_book_context}\n\n"
+                "Output exactly three sections split by --- :\n"
+                "[Environment Body]\n...\n---\n[Summary]\n"
+                "Core focus: ...\n"
+                "Immediate changes: ...\n"
+                "Interaction facts: ...\n"
+                "Key detail hooks: ...\n"
+                "Active response: ...\n"
+                "Open loop: ...\n"
+                "Plan delta: on_track / interrupted / delayed / replaced_by_conversation / unexpected_insert / inward_digging.\n"
+                "---\n[Retrieval Summary]\n1-3 sentences with high-density searchable entities, places, actions, state changes, and unresolved items."
             )
-        elif "检索摘要" not in template and "Retrieval Summary" not in template:
+        elif "Retrieval Summary" not in template and "????" not in template:
+            template += "\n\nOutput exactly three sections split by --- :\n[Environment Body]\n...\n---\n[Summary]\n...\n---\n[Retrieval Summary]\n1-2 sentences with searchable entities, places, actions, and state lines."
+        if "disturbance_context" not in template:
             template += (
-                "\n\n请严格输出三段，并用分隔线 --- 隔开：\n"
-                "[环境正文]\n"
-                "...\n"
-                "---\n"
-                "[内容小结]\n"
-                "...\n"
-                "---\n"
-                "[检索摘要]\n"
-                "用 1-2 句提炼环境中最值得检索的实体、地点、动作与状态线索。"
+                "\n\n[Disturbance bridge]\n"
+                "Disturbance context: {disturbance_context}\n"
+                "Recent disturbances: {recent_disturbances}\n"
+                "If disturbance context is present, treat it as a real external pressure or delayed reveal and write how it bends the current rhythm."
             )
-
-        time_context_block = (
-            "【东八区时间上下文（UTC+8）】\n"
-            f"- 时间：{narr.isoformat(timespec='seconds')}\n"
-            f"- 日期：{narr.strftime('%Y年%m月%d日')}\n"
-            f"- 星期：{weekday}\n"
-            f"- 时段：{period}"
-        )
-
         rendered_prompt = template.format(
             time=narr.isoformat(timespec="seconds"),
-            date=narr.strftime("%Y年%m月%d日"),
+            date=narr.strftime("%Y-%m-%d"),
             weekday=weekday,
             time_period=period,
             previous_env=json.dumps(previous_env or {}, ensure_ascii=False),
@@ -257,42 +213,41 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             character_state=character_state,
             recent_events=recent_events_text,
             world_book_context=world_book_context,
+            current_plan_summary=current_plan_summary or "(no schedule skeleton today)",
+            current_conversation_state=current_conversation_state or "(no active conversation time claim)",
+            recent_trace_summary=recent_trace_summary,
+            schedule_alignment=schedule_alignment or "on_track",
+            plan_delta=plan_delta or "(no visible plan delta)",
+            disturbance_context=disturbance_context or "(no active disturbance)",
+            recent_disturbances=recent_disturbances or "(no recent disturbances)",
+            disturbance_schedule_effect=disturbance_schedule_effect or "none",
             location="",
             weather="",
-            activity="",
+            activity=current_plan_activity,
             atmosphere="",
         )
+        time_context_block = (
+            "[UTC+8 Context]\n"
+            f"- Time: {narr.isoformat(timespec='seconds')}\n"
+            f"- Date: {narr.strftime('%Y-%m-%d')}\n"
+            f"- Weekday: {weekday}\n"
+            f"- Period: {period}"
+        )
         rendered_prompt = f"{time_context_block}\n\n{rendered_prompt}"
-
         if self.llm is None:
             fallback = self._reuse_previous_env(previous_env) if allow_retry_fallback else None
             if fallback is None:
                 raise RuntimeError("Environment LLM is not configured.")
-            return self._build_fallback_env(
-                previous_env=fallback,
-                narr=narr,
-                period=period,
-                weekday=weekday,
-                continuity=continuity,
-            )
-
+            return self._build_fallback_env(previous_env=fallback, narr=narr, period=period, weekday=weekday, continuity=continuity)
         try:
-            raw = await self.llm.chat(
-                [
-                    {"role": "system", "content": self.ENV_LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content": rendered_prompt},
-                ],
-                temperature=0.8,
-                max_tokens=8192,
-            )
+            raw = await self.llm.chat([
+                {"role": "system", "content": self.ENV_LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": rendered_prompt},
+            ], temperature=0.8, max_tokens=8192)
             body, summary, retrieval = self.parse_environment_llm_output((raw or "").strip())
             activity_text = body or (raw or "").strip()
             summary_text = summary
-            retrieval_summary = retrieval or self._build_retrieval_summary(
-                summary_text=summary_text,
-                activity_text=activity_text,
-                recent_events_text=recent_events_text,
-            )
+            retrieval_summary = retrieval or self._build_retrieval_summary(summary_text=summary_text, activity_text=activity_text, recent_events_text=recent_events_text)
             return {
                 "time": narr.isoformat(timespec="seconds"),
                 "time_period": period,
@@ -304,6 +259,14 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "continuity": continuity,
                 "summary": summary_text,
                 "retrieval_summary": retrieval_summary,
+                "current_plan_summary": current_plan_summary,
+                "current_conversation_state": current_conversation_state,
+                "recent_trace_summary": recent_trace_summary,
+                "schedule_alignment": schedule_alignment,
+                "plan_delta": plan_delta,
+                "disturbance_context": disturbance_context,
+                "recent_disturbances": recent_disturbances,
+                "disturbance_schedule_effect": disturbance_schedule_effect,
                 "stale": False,
                 "stale_reason": "",
             }
@@ -313,13 +276,7 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             fallback = self._reuse_previous_env(previous_env)
             if fallback is None:
                 raise
-            return self._build_fallback_env(
-                previous_env=fallback,
-                narr=narr,
-                period=period,
-                weekday=weekday,
-                continuity=continuity,
-            )
+            return self._build_fallback_env(previous_env=fallback, narr=narr, period=period, weekday=weekday, continuity=continuity)
 
     @staticmethod
     def _reuse_previous_env(previous_env: dict | None) -> dict | None:
@@ -334,26 +291,17 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             "activity": activity,
             "summary": summary,
             "retrieval_summary": retrieval,
+            "disturbance_context": str(previous_env.get("disturbance_context") or "").strip(),
+            "recent_disturbances": str(previous_env.get("recent_disturbances") or "").strip(),
+            "disturbance_schedule_effect": str(previous_env.get("disturbance_schedule_effect") or "").strip(),
         }
 
-    def _build_fallback_env(
-        self,
-        *,
-        previous_env: dict,
-        narr: datetime,
-        period: str,
-        weekday: str,
-        continuity: str,
-    ) -> dict:
+    def _build_fallback_env(self, *, previous_env: dict, narr: datetime, period: str, weekday: str, continuity: str) -> dict:
         activity = str(previous_env.get("activity") or "").strip()
         summary = str(previous_env.get("summary") or "").strip()
         retrieval = str(previous_env.get("retrieval_summary") or "").strip()
         if not retrieval:
-            retrieval = self._build_retrieval_summary(
-                summary_text=summary,
-                activity_text=activity,
-                recent_events_text="",
-            )
+            retrieval = self._build_retrieval_summary(summary_text=summary, activity_text=activity, recent_events_text="")
         return {
             "time": narr.isoformat(timespec="seconds"),
             "time_period": period,
@@ -365,6 +313,9 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             "continuity": continuity,
             "summary": summary,
             "retrieval_summary": retrieval,
+            "disturbance_context": str(previous_env.get("disturbance_context") or "").strip(),
+            "recent_disturbances": str(previous_env.get("recent_disturbances") or "").strip(),
+            "disturbance_schedule_effect": str(previous_env.get("disturbance_schedule_effect") or "").strip(),
             "stale": True,
             "stale_reason": "env_llm_failed_reused_previous",
         }
@@ -373,21 +324,41 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         if not previous_env:
             return ""
         prev_period = str(previous_env.get("time_period", "") or "")
-        prev_hint = str(previous_env.get("summary", "") or "").strip()
-        if not prev_hint:
-            prev_hint = str(previous_env.get("activity") or "").strip()
-        if not prev_hint:
+        summary_text = str(previous_env.get("summary", "") or "").strip()
+        activity_text = str(previous_env.get("activity") or "").strip()
+        retrieval_text = str(previous_env.get("retrieval_summary", "") or "").strip()
+        if not summary_text and not activity_text and not retrieval_text:
             return ""
-        period_prefix = f"上一时段（{prev_period}）" if prev_period else "上一时段"
-        return f"{period_prefix}环境摘要：{prev_hint}"
+        scene = (
+            self._extract_labeled_summary_value(summary_text, ("Core focus", "Core focus:"))
+            or self._truncate_for_prompt(summary_text or activity_text or retrieval_text, 140)
+        )
+        unfinished = (
+            self._extract_labeled_summary_value(summary_text, ("Open loop", "Open loop:"))
+            or self._extract_labeled_summary_value(summary_text, ("Interaction facts", "Interaction facts:"))
+            or retrieval_text
+        )
+        motion_source = (
+            self._extract_labeled_summary_value(summary_text, ("Immediate changes", "Immediate changes:"))
+            or unfinished
+            or scene
+        )
+        lines: list[str] = [f"Previous period ({prev_period})" if prev_period else "Previous period"]
+        if scene:
+            lines.append(f"- Scene carry-over: {self._truncate_for_prompt(scene, 150)}")
+        if unfinished:
+            lines.append(f"- Unfinished thread: {self._truncate_for_prompt(unfinished, 150)}")
+        if motion_source:
+            lines.append(
+                f"- Motion into now: {self._build_motion_into_now(motion_source)}"
+            )
+        prev_plan_delta = str(previous_env.get("plan_delta") or "").strip()
+        if prev_plan_delta:
+            lines.append(f"- Previous plan delta: {prev_plan_delta}")
+        return "\n".join(lines)
 
     @staticmethod
-    def _build_retrieval_summary(
-        *,
-        summary_text: str,
-        activity_text: str,
-        recent_events_text: str,
-    ) -> str:
+    def _build_retrieval_summary(*, summary_text: str, activity_text: str, recent_events_text: str) -> str:
         summary = (summary_text or "").strip()
         if summary:
             return summary[:220]
@@ -402,23 +373,166 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             return ""
         if hours < 1:
             minutes = max(1, int(hours * 60))
-            return f"约 {minutes} 分钟"
+            return f"about {minutes} minutes"
         if hours < 24:
-            return f"约 {hours:.1f} 小时"
-        return f"约 {hours / 24:.1f} 天"
+            return f"about {hours:.1f} hours"
+        return f"about {hours / 24:.1f} days"
 
     def _format_recent_events(self, events: list[dict]) -> str:
         if not events:
-            return "（无近期事件）"
+            return "(no recent events with actionable continuity)"
         lines: list[str] = []
-        for event in events[:8]:
-            title = str(event.get("title") or "").strip()
-            description = str(event.get("description") or "").strip()
-            date = str(event.get("date") or "").strip()
-            label = title or description[:24] or "未命名事件"
-            prefix = f"[{date}] " if date else ""
-            lines.append(f"- {prefix}{label}")
+        for event in events[: self.MAX_RECENT_EVENTS]:
+            if not isinstance(event, dict):
+                continue
+            block = self._format_recent_event_block(event)
+            if block:
+                lines.append(block)
+        if not lines:
+            return "(no recent events with actionable continuity)"
         return "\n".join(lines)
+
+    @staticmethod
+    def _compact_text(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    @classmethod
+    def _truncate_for_prompt(cls, text: str, limit: int) -> str:
+        clean = cls._compact_text(text)
+        if len(clean) <= limit:
+            return clean
+        return clean[: max(0, limit - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _truncate_multiline(text: str, limit: int) -> str:
+        raw = str(text or "").strip()
+        if len(raw) <= limit:
+            return raw
+        return raw[: max(0, limit - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _parse_list_like(value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(x).strip() for x in value if str(x).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+            return [x.strip() for x in re.split(r"[;,，、]\s*|\s{2,}", raw) if x.strip()]
+        return []
+
+    @classmethod
+    def _join_list_field(cls, value: object, *, limit: int | None = None) -> str:
+        items = cls._parse_list_like(value)
+        if limit is not None:
+            items = items[:limit]
+        return ", ".join(items)
+
+    @classmethod
+    def _extract_labeled_summary_value(cls, text: str, labels: tuple[str, ...]) -> str:
+        if not text:
+            return ""
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            for label in labels:
+                plain = label[:-1] if label.endswith(":") else label
+                if line.startswith(label):
+                    return line[len(label):].strip()
+                if line.startswith(f"{plain}:"):
+                    return line[len(plain) + 1 :].strip()
+        return ""
+
+    @classmethod
+    def _build_motion_into_now(cls, text: str) -> str:
+        compact = cls._truncate_for_prompt(text, 130)
+        if not compact:
+            return ""
+        lowered = compact.lower()
+        if lowered.startswith(("current", "the current", "now")):
+            return compact
+        return f"The current period is likely to continue from: {compact}"
+
+    @classmethod
+    def _pick_detail_hooks(cls, event: dict) -> list[str]:
+        hooks: list[str] = []
+        for key in (
+            "detail_hooks",
+            "detail_hook",
+            "memory_hooks",
+            "memory_hook",
+            "notable_details",
+            "notable_detail",
+        ):
+            hooks.extend(cls._parse_list_like(event.get(key)))
+            if hooks:
+                break
+        deduped: list[str] = []
+        for hook in hooks:
+            clean = cls._truncate_for_prompt(hook, 50)
+            if clean and clean not in deduped:
+                deduped.append(clean)
+        return deduped[:2]
+
+    @classmethod
+    def _pick_keywords(cls, event: dict) -> list[str]:
+        candidates: list[str] = []
+        for key in ("trigger_keywords", "keywords", "entities"):
+            candidates.extend(cls._parse_list_like(event.get(key)))
+        if not candidates:
+            for field in ("title", "participants", "location"):
+                text = cls._compact_text(event.get(field))
+                if not text:
+                    continue
+                candidates.extend(re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]{2,}", text))
+        deduped: list[str] = []
+        for item in candidates:
+            clean = cls._truncate_for_prompt(item, 24)
+            if clean and clean not in deduped:
+                deduped.append(clean)
+            if len(deduped) >= cls.MAX_EVENT_KEYWORDS:
+                break
+        return deduped
+
+    @classmethod
+    def _format_recent_event_block(cls, event: dict) -> str:
+        title = cls._compact_text(event.get("title"))
+        date = cls._compact_text(event.get("date"))
+        what_happened = (
+            cls._compact_text(event.get("objective_record"))
+            or cls._compact_text(event.get("description"))
+            or title
+        )
+        felt_meaning = cls._compact_text(event.get("subjective_impression"))
+        impact = cls._compact_text(event.get("impact")) or cls._compact_text(event.get("open_loop"))
+        participants = cls._join_list_field(event.get("participants"), limit=4)
+        location = cls._compact_text(event.get("location"))
+        detail_hooks = cls._pick_detail_hooks(event)
+        keywords = cls._pick_keywords(event)
+        label = title or cls._truncate_for_prompt(what_happened, 36) or "unnamed_event"
+        if not label or not what_happened:
+            return ""
+        block_lines = [f"- {f'[{date}] ' if date else ''}{label}"]
+        if participants:
+            block_lines.append(f"  Participants: {participants}")
+        if location:
+            block_lines.append(f"  Location: {cls._truncate_for_prompt(location, 48)}")
+        block_lines.append(f"  What happened: {cls._truncate_for_prompt(what_happened, 120)}")
+        if felt_meaning:
+            block_lines.append(f"  Felt meaning: {cls._truncate_for_prompt(felt_meaning, 110)}")
+        if impact:
+            block_lines.append(f"  Impact/Open loop: {cls._truncate_for_prompt(impact, 110)}")
+        if detail_hooks:
+            block_lines.append(f"  Detail hooks: {'; '.join(detail_hooks)}")
+        if keywords:
+            block_lines.append(f"  Keywords: {', '.join(keywords[: cls.MAX_EVENT_KEYWORDS])}")
+        block = "\n".join(block_lines)
+        return cls._truncate_multiline(block, cls.MAX_EVENT_BLOCK_CHARS)
 
     def _extract_keywords(self, latest_snapshot: str, events: list[dict]) -> list[str]:
         words: list[str] = []
@@ -445,7 +559,6 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         matched: list[str] = []
         kw_set = {k.lower() for k in keywords if k}
         period = (time_period or "").strip().lower()
-
         for entry in entries:
             name = ""
             content = ""
@@ -464,9 +577,7 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                         if isinstance(parsed, list):
                             entry_keywords.extend([str(x).lower() for x in parsed if str(x).strip()])
                     except Exception:
-                        entry_keywords.extend(
-                            [x.strip().lower() for x in re.split(r"[,，、\s]+", raw_match) if x.strip()]
-                        )
+                        entry_keywords.extend([x.strip().lower() for x in re.split(r"[,??\s]+", raw_match) if x.strip()])
             if not content:
                 continue
             content_l = content.lower()
@@ -476,14 +587,11 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             if not hit and entry_keywords and kw_set.intersection(entry_keywords):
                 hit = True
             if not hit and kw_set:
-                for kw in kw_set:
-                    if kw and kw in content_l:
-                        hit = True
-                        break
+                hit = any(kw in content_l for kw in kw_set if kw)
             if not hit and not kw_set and len(matched) < 1:
                 hit = True
             if hit:
-                title = f"{name}：" if name else ""
+                title = f"{name}: " if name else ""
                 matched.append(f"{title}{content[: self.MAX_WORLD_BOOK_ITEM_CHARS]}")
             if len(matched) >= self.MAX_WORLD_BOOK_ITEMS:
                 break
@@ -493,4 +601,4 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         for (start, end), name in self.PERIODS.items():
             if start <= hour < end:
                 return name
-        return "未知时段"
+        return "unknown_period"

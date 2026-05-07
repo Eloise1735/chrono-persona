@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
+  <title>凯尔希状态机 - 事件历史</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260425">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history" class="active">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs">NPC 管理</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="搜索标题 / 关键词 / 内容..." onkeydown="if(event.key==='Enter')runSearch()">
+      <button class="btn btn-primary" onclick="runSearch()">搜索</button>
+      <button class="btn" onclick="openAddEventModal()">添加事件</button>
+      <label class="checkbox-label">
+        <input type="checkbox" id="toggle-archived" onchange="toggleArchivedEvents()">
+        显示已归档
+      </label>
+      <select id="history-export-format" style="max-width:100px;">
+        <option value="md">MD</option>
+        <option value="json">JSON</option>
+      </select>
+      <button class="btn btn-primary" onclick="exportVisibleHistoryItems()">导出当前列表</button>
+    </div>
+
+    <div class="events-layout">
+      <aside class="events-sidebar card">
+        <h2>分类筛选</h2>
+        <div class="list-meta" style="margin-bottom:10px;">未勾选时显示全部事件。</div>
+        <div id="event-category-filter" class="category-filter-list"></div>
+        <div style="margin-top:10px;"><button class="btn" style="width:100%;" onclick="clearEventCategoryFilter()">清空筛选</button></div>
+      </aside>
+
+      <section class="events-main">
+        <div class="card" style="margin-bottom:14px;">
+          <div class="btn-group">
+            <button class="btn" id="toggle-manage-btn" onclick="toggleHistoryManageMode()">开启选择管理</button>
+            <button class="btn" onclick="selectAllHistoryItems()">全选</button>
+            <button class="btn" onclick="clearHistorySelection()">清空选择</button>
+            <button class="btn btn-danger" onclick="deleteSelectedHistoryItems()">删除勾选</button>
+            <button class="btn btn-primary" onclick="exportSelectedHistoryItems()">导出勾选</button>
+          </div>
+          <div class="list-meta" id="history-selection-summary" style="margin-top:8px;">管理模式未开启</div>
+        </div>
+
+        <div class="card" style="padding:0"><div id="data-list"><div class="loading">加载中...</div></div></div>
+      </section>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+  <script src="/static/app.js?v=20260425"></script>
+  <script>initEventsHistoryPage();</script>
+</body>
+</html>

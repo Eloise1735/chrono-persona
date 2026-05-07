@@ -1,451 +1,615 @@
-# 凯尔希意向状态机 — AI 交接导航
+﻿# 凯尔希状态机 AI Handoff
 
-> 本文档面向接手开发的 AI 或开发者，覆盖项目架构、核心概念、数据流、模块职责与常见修改指南。
-
----
-
-## 一、项目定位
-
-本项目是一个**角色记忆与人格持久化系统**，为《明日方舟》角色"凯尔希"提供：
-
-- **时间感知状态推演**：根据两次对话间隔，自动推演角色的内心状态变化
-- **事件记忆锚点**：记录对话与生活中的关键事件，支持向量/关键词检索
-- **动态人格演化**：L2 层人格和关系模式可随事件累积自动更新
-- **结构化关键记录**：持久化用药方案、重要日期、关键物品等可执行信息
-
-系统通过 **MCP (Model Context Protocol)** 与上游 LLM 前端（如 rikkahub）集成，也可通过 REST API 独立使用。
+> 面向下一位接手这个仓库的人。  
+> 目标不是写变更流水账，而是用“产品定位 + 运行结构 + 关键链路 + 当前边界 + 接手建议”的方式，帮助你快速建立全局理解。
 
 ---
 
-## 二、技术栈
+## 0. 一句话判断这个项目是什么
+这是一个以 **“凯尔希作为持续存在的角色”** 为核心的后端系统。它不是普通聊天接口，而是一个同时维护：
 
-| 层级 | 技术 |
-|------|------|
-| 后端框架 | FastAPI (Python 3.11+) |
-| MCP 协议 | FastMCP（SSE + Streamable HTTP 双端点） |
-| 数据库 | SQLite (aiosqlite 异步) |
-| LLM 调用 | httpx → OpenAI 兼容 API |
-| 向量嵌入 | 远端 Embedding API（可选）+ 本地确定性哈希回退 |
-| 前端 | 纯静态 HTML/CSS/JS（无框架），暗色主题 |
-| 配置 | YAML (config.yaml) + 数据库运行时设置 |
+- 角色当前状态
+- 角色独立生活推进
+- 用户与角色之间的关系连续性
+- 结构化长期记忆
+- 可回溯的生活流与事件史
 
----
+的“角色状态机 + 分层记忆系统 + 轻量自主生活系统”。
 
-## 三、目录结构
+它的目标不是“保存聊天记录”，而是让上游对话系统每次开聊时都能拿到：
 
-```
-凯尔希状态机/
-├── config.yaml              # 启动配置（LLM API、数据库路径、记忆模式）
-├── config.example.yaml      # 配置模板
-├── requirements.txt         # Python 依赖（fastapi, uvicorn, aiosqlite, mcp, httpx, pyyaml）
-├── data/
-│   └── kelsey.db            # SQLite 数据库文件
-├── server/                  # 后端 Python 包
-│   ├── main.py              # FastAPI 入口：生命周期、路由挂载、页面路由
-│   ├── config.py            # YAML 配置加载 → dataclass
-│   ├── models.py            # Pydantic 数据模型（ORM 模型 + API 请求模型）
-│   ├── database.py          # 数据库层：表创建、CRUD、迁移
-│   ├── llm_client.py        # OpenAI 兼容 LLM 客户端（含 Token 追踪）
-│   ├── prompts.py           # Prompt 模板 + PromptManager + 默认设定值
-│   ├── state_machine.py     # 核心状态机：状态推演、反思、记忆检索
-│   ├── environment.py       # 环境信息生成器（时间+场景→文本）
-│   ├── memory_store.py      # 记忆存储抽象 + KeywordMemoryStore 实现
-│   ├── vector_memory_store.py # VectorMemoryStore：向量检索、同步、压缩
-│   ├── evolution.py         # 人格演化引擎：事件评分→L2更新→归档
-│   ├── automation_engine.py # 自动化编排：向量同步→演化→冷压缩
-│   ├── event_taxonomy.py    # 事件分类与标题生成规则
-│   ├── mcp_tools.py         # MCP 工具定义（6个对外工具）
-│   └── api_routes.py        # REST API 路由（CRUD + 管理端点）
-├── web/                     # 前端静态文件
-│   ├── index.html           # 仪表盘
-│   ├── snapshots.html       # 快照历史
-│   ├── events.html          # 事件历史
-│   ├── key-records.html     # 关键记录管理
-│   ├── settings.html        # 设定（人格/Prompt/配置/导入）
-│   ├── evolution.html       # 人格演化
-│   ├── vectors.html         # 向量管理
-│   ├── history.html         # 历史（旧入口，保留兼容）
-│   ├── guide.html           # 使用指南
-│   ├── app.js               # 全部前端逻辑（单文件 ~2300 行）
-│   └── style.css            # 全局样式（橄榄军绿暗色主题）
-└── deploy/                  # 部署脚本和离线 wheel 包
-```
+- 凯尔希此刻处在什么状态
+- 最近两天生活是怎样流过来的
+- 哪些变化值得记住
+- 哪些长期事实要继续生效
+- 她与 user 目前的短期关系态势如何
+- 她今天原本的安排与现实偏差是什么
 
 ---
 
-## 四、核心概念与数据模型
+## 1. 当前产品边界
+按当前代码与本窗口最后状态，系统已经明确分成以下几层：
 
-### 4.1 分层人格系统
+### 1.1 状态层
+- `snapshot`
+  - 表示“她现在怎样”
+  - 是即时切片，不负责承载完整连续叙事
 
-```
-L1（稳定底层）——不参与自动演化
-├── L1_character_background   角色背景事实
-└── L1_user_background        用户背景事实
+### 1.2 短期关系层
+- `relationship_state`
+  - 表示短期关系态势与联系时间感
+  - 负责：多久没联系、当前更想靠近还是留空间、适合主动提什么话题、对日程的节律倾向影响
+  - 不并入 L2，不并入 snapshot 正文
 
-L2（动态演化层）——可被 EvolutionEngine 自动更新
-├── L2_character_personality   角色人格状态
-└── L2_relationship_dynamics   关系模式
-```
+### 1.3 生活流层
+- `life_flow_trace`
+  - 表示某一段生活是怎样流过去的
+  - 不是 event，也不是 key record
+  - 负责承接未升格的连续生活痕迹
 
-L1/L2 的内容存储在 `system_settings` 表中，通过 `PromptManager` 读写。
+- `slowline`
+  - 表示中期、有方向、但不要求每天显性推进的生活线
+  - 例如：求职、论文、恢复、项目推进、学习线、角色自身工作线
+  - 不承担精确事实存储
 
-### 4.2 数据库表（SQLite）
+### 1.4 事件层
+- `event`
+  - 表示可单独命名、可回溯、可检索的离散锚点
+  - 当前已经刻意收紧，不再因为“有 delta”就成立
 
-| 表名 | 作用 | 关键字段 |
-|------|------|----------|
-| `state_snapshots` | 凯尔希的内心状态独白 | id, created_at, type(daily/conversation_end/accumulated), content, environment(JSON), embedding_vector_id |
-| `event_anchors` | 事件记忆锚点 | id, date, title, description, source(generated/manual/conversation), trigger_keywords(JSON), categories(JSON), archived, importance_score, impression_depth |
-| `key_records` | 结构化关键记录 | id, type(important_date/important_item/key_collaboration/medical_advice), title, content_text, tags(JSON), status(active/archived), source |
-| `system_settings` | 所有配置项（L1/L2/Prompt/向量参数/自动化开关等） | key(PK), value, category, description |
-| `memory_vectors` | 向量化记忆 | entry_id(UK), source_type, vector_json, vector_dim, vector_provider(api/local), status(active/deleted), tier(warm/cold) |
-| `memory_recall_stats` | 记忆被召回的统计 | entry_id(PK), recall_count, last_recalled_at |
-| `automation_runs` | 自动化执行报告 | trigger, ran, report_json(完整报告+Token统计) |
+### 1.5 结构化事实层
+- `key_record`
+  - 表示长期可调用、结构化、可执行的事实
+  - 是权威事实库
+  - 可驱动 `slowline`，但不与 slowline 混同
 
-### 4.3 Pydantic 模型（`models.py`）
-
-- **ORM 模型**：`StateSnapshot`, `EventAnchor`, `KeyRecord` — 与数据库行一一对应
-- **API 请求模型**：`CreateEventRequest`, `UpdateSettingRequest`, `BulkImportRequest` 等 — 用于 FastAPI 参数校验
+### 1.6 长期人格与稳定设定层
+- `L2`
+  - 长期动态人格、关系模式、生活倾向
+- `L1`
+  - 稳定背景与基础设定
 
 ---
 
-## 五、核心数据流
+## 2. 当前系统最重要的产品判断
+### 2.1 日程不再等于事件来源
+这是本轮非常关键的修正。
 
-### 5.1 对话开始 → `get_current_state`
+当前产品边界是：
+- 日程系统负责角色自己的生活推进
+- 日程执行结果不再自动写入 event
+- 日程最多只更新 plan item outcome，并在必要时补 `life_flow_trace`
+- 真实事件由：
+  - 前台对话
+  - 明确的后台事件判定链
+  - 手动记录
+  三者共同把关
 
-```
-MCP/REST 调用 (current_time, last_interaction_time)
-  │
-  ├─ 计算时间间隔 → 确定 checkpoint 数量（每 min_time_unit_hours 一个，上限30）
-  │
-  ├─ 循环每个 checkpoint：
-  │   ├─ EnvironmentGenerator.generate() → 环境文本（LLM生成或模板）
-  │   ├─ MemoryStore.search() → 历史记忆
-  │   ├─ LLM.chat(system_prompt + snapshot_generation_prompt) → 新快照
-  │   ├─ DB.insert_snapshot()
-  │   ├─ _generate_event_anchor() → LLM 判断是否产生事件 → DB.insert_event()
-  │   └─ _enforce_snapshot_limit() → 超过 max_snapshots 的旧快照向量化归档
-  │
-  ├─ AutomationEngine.run() → 向量同步 → 人格演化检查 → 冷记忆压缩
-  │
-  └─ _build_injectable_context() → 拼接 L1 + L2 + 近期热事件 + 快照 → 返回
-```
+### 2.2 日程继续存在，但已“去用户化”
+当前方向不是让角色围着 user 排日程，而是：
+- 角色有自己的独立生活安排
+- user 会通过对话影响她的状态、节律、注意力和后续计划倾向
+- 但后台不会再替双方安排“见面、共读、共同活动”之类的伪互动剧情
 
-**关键点**：返回值不仅是快照文本，而是完整的**可注入上下文块**（L1→L2→热事件→快照），上游前端应将其直接注入 system prompt。
+### 2.3 对话与自主生活等权
+系统当前设计明确要求：
+- user 对话产生的内容不能把角色自己的生活推进全部挤掉
+- 角色自主生活产生的内容也不能覆盖真实对话线
+- 注入时必须按来源平衡编排，而不是谁最近谁全占
 
-### 5.2 对话结束 → `reflect_on_conversation`
+### 2.4 现实生活细节不必强行升格为主线或事件
+目前架构已经接受一个前提：
+- 现实生活高不确定、高突发、细节膨胀
+- 它们不一定适合强行压进某条主线
+- 也不一定值得升格成 event
+- 因此需要：
+  - `slowline` 承接远景与中期线
+  - `life_flow_trace` 承接连续流
+  - `近景碎片池` 承接高张力、未必成主线的近景碎片
 
-```
-MCP/REST 调用 (conversation_summary)
-  │
-  ├─ LLM.chat(reflect_snapshot_prompt) → 对话后状态独白 → DB.insert_snapshot()
-  ├─ LLM.chat(reflect_event_prompt) → 对话事件锚点 → DB.insert_event()
-  ├─ _enforce_snapshot_limit()
-  ├─ AutomationEngine.run()
-  └─ 返回新快照内容（附自动化报告）
+---
+
+## 3. 当前总体架构
+```text
+上游聊天系统 / MCP / Web / Android
+              |
+           FastAPI
+              |
+  ---------------------------------
+  |               |               |
+StateMachine   PlanEngine      API Routes
+  |               |               |
+  |               |          CRUD / 管理 / 调试
+  |
+  |---- EnvironmentGenerator
+  |---- PromptManager
+  |---- MemoryStore
+  |       |---- KeywordMemoryStore
+  |       └---- VectorMemoryStore
+  |---- EvolutionEngine
+  |---- AutomationEngine
+  |---- LLM Clients
+  └---- Database
 ```
 
-### 5.3 对话中 → `recall_memories` / `recall_key_records` / `upsert_key_record`
+真实的系统中心仍然是：
+- `StateMachine`
 
-- `recall_memories`：MemoryStore.search() → 向量相似度 + 时间衰减 + 重要性加权
-- `recall_key_records`：关键词模糊匹配 key_records 表
-- `upsert_key_record`：按 (type, title) 去重，存在则更新
+第二核心是：
+- `PlanEngine`
 
-### 5.4 人格演化流程（`EvolutionEngine`）
-
-```
-check_status() → 自上次演化后新增事件数 >= 阈值？
-  │
-  ├─ preview()：
-  │   ├─ _score_events() → LLM 对每个事件评分（重要性0-10, 印象深度0-10）
-  │   └─ _generate_updates() → LLM 基于评分结果生成新 L2 文本 + 变更摘要
-  │
-  └─ apply()：
-      ├─ 写入新 L2_character_personality 和 L2_relationship_dynamics
-      ├─ 低于 archive_importance_threshold 的事件标记 archived=1
-      └─ 更新 last_evolution_time
-```
-
-### 5.5 自动化编排（`AutomationEngine`）
-
-在 `get_current_state` 和 `reflect_on_conversation` 执行完毕后自动运行：
-
-1. **向量同步**（`sync_eligible_vectors`）：已归档事件 + 超龄快照 → 向量化存储
-2. **人格演化**（`auto_evolution`）：事件数达阈值时自动执行 preview → apply
-3. **冷记忆压缩**（`compact_cold_memories`）：超过 cold_days_threshold 的旧向量按月分组摘要合并
-
-所有开关可在 `system_settings` 中独立控制（`automation_enabled`, `automation_vector_sync` 等）。
+当前项目不是“单 API 服务 + 一堆工具函数”，而是：
+- 一个持续运行的状态推进内核
+- 外加独立生活调度
+- 外加分层记忆注入系统
 
 ---
 
-## 六、记忆检索策略
+## 4. 启动与后台循环
+入口在：
+- [server/main.py](D:/Eloise/coding/凯尔希状态机/server/main.py)
 
-### 6.1 KeywordMemoryStore（`memory_store.py`）
+启动时主要完成：
+1. 读取 `config.yaml`
+2. 初始化 SQLite
+3. 执行 schema 补列 / 迁移
+4. 初始化主 LLM、环境专用 LLM、快照/评分专用 LLM
+5. 初始化 `PromptManager`
+6. 将 `prompts.py` 中默认设置灌入 `system_settings`
+7. 初始化 `MemoryStore`
+8. 初始化 `EvolutionEngine`
+9. 初始化 `AutomationEngine`
+10. 初始化 `StateMachine`
+11. 初始化 `PlanEngine`
+12. 挂载 MCP / REST / 静态页面
+13. 启动后台 life scheduler loop
 
-- 从已归档事件 + 已归档快照中做 SQL LIKE 关键词匹配
-- 评分 = 关键词命中率 × 时间衰减（半衰期30天）
-- **联想命中机制**：尾部候选的加权随机替换，引入多样性奖励（日期去重、分类去重）+ 冷门奖励（低召回频率条目加分）
+当前真正持续运行的是：
+- `life scheduler loop`
 
-### 6.2 VectorMemoryStore（`vector_memory_store.py`）
-
-- Embedding 策略：优先远端 API（OpenAI 兼容），失败或未配置时回退到**本地确定性哈希嵌入**（SHA256 分桶 → 归一化）
-- 检索评分 = 0.72×余弦相似度 + 0.18×时间衰减 + 0.10×重要性加权
-- 向量存储在 `memory_vectors` 表的 `vector_json` 字段中（JSON 数组）
-- 冷记忆压缩：按 `source_type:YYYY-MM` 分组，合并为摘要向量，原向量标记 deleted
-
----
-
-## 七、MCP 工具接口
-
-FastMCP 注册的工具（`mcp_tools.py`），上游 LLM 通过 MCP 协议调用：
-
-| 工具名 | 触发时机 | 参数 | 返回 |
-|--------|---------|------|------|
-| `get_current_state` | 对话开始 | current_time, last_interaction_time (ISO) | L1+L2+热事件+快照（可注入上下文） |
-| `summarize_conversation` | 对话结束前 | conversation_text | 结构化摘要 |
-| `reflect_on_conversation` | 对话结束 | conversation_summary | 新状态独白 |
-| `recall_memories` | 对话中 | query, top_k | 事件/快照记忆列表(JSON) |
-| `upsert_key_record` | 对话中 | record_type, title, content_text, ... | 写入结果 |
-| `recall_key_records` | 对话中 | query, top_k, record_type | 关键记录列表(JSON) |
-| `execute_profile_evolution` | 系统提示时 | 无 | 演化结果 |
-
-MCP 端点：
-- SSE：`/mcp/sse`
-- Streamable HTTP：`/mcp-http/mcp`（有中间件处理路径规范化）
+它负责：
+- 生成当日计划
+- 执行当前小时 plan item
+- 维护 snapshot 推进
+- 维护 relationship_state 漂移
+- 必要时触发 replan
+- 承担部分自动压缩 / 自动化调度职责
 
 ---
 
-## 八、REST API 概览
+## 5. 数据模型总览
+主要定义在：
+- [server/models.py](D:/Eloise/coding/凯尔希状态机/server/models.py)
 
-所有 REST 路由前缀 `/api`，定义在 `api_routes.py`：
+### 5.1 核心表 / 模型
+- `StateSnapshot`
+- `EventAnchor`
+- `KeyRecord`
+- `WorldBook`
+- `DailyPlan`
+- `PlanItem`
+- `LifeFlowTrace`
+- `ConversationTimeClaim`
+- `RelationshipState`
+- `SlowLine`
+- `NPCEntity`
+- `CharacterNotification`
 
-**状态机测试**：`POST /api/state/current`, `/api/state/reflect`, `/api/state/summarize`
-**记忆搜索**：`POST /api/memories/search`
-**快照 CRUD**：`GET/POST/DELETE /api/snapshots[/{id}]`
-**事件 CRUD**：`GET/POST/PUT/DELETE /api/events[/{id}]`
-**关键记录**：`GET/POST/PUT/DELETE /api/key-records[/{id}]`, `POST /api/key-records/search`
-**向量管理**：`/api/vectors/stats`, `/api/vectors/entries`, `/api/vectors/sync`, `/api/vectors/compact`
-**设定管理**：`GET/PUT /api/settings[/{key}]`, `POST /api/settings/reset/{key}`
-**演化**：`GET /api/evolution/status`, `POST /api/evolution/preview`, `POST /api/evolution/apply`
-**自动化报告**：`GET /api/automation/latest`, `/api/automation/runs`, `/api/automation/token-summary`
-**模型定价**：`GET/POST/DELETE /api/automation/model-pricing`
-**批量导入**：`POST /api/import/bulk`
-**阶段性回顾**：`POST /api/review/periodic`
-**运行时 LLM**：`GET/PUT /api/runtime/llm`
+### 5.2 当前新增但很关键的两层
+#### `RelationshipState`
+短期关系感知层，字段包括：
+- `last_meaningful_contact_at`
+- `days_since_meaningful_contact`
+- `contact_recency_bucket`
+- `connection_need`
+- `pride_or_distance`
+- `valence`
+- `arousal`
+- `life_immersion`
+- `relationship_feeling_summary`
+- `space_need_level`
+- `concern_level`
+- `proactive_topics`
+- `plan_bias_hint`
 
----
+#### `SlowLine`
+中期生活议题组织层，字段包括：
+- `theme`
+- `source_family`
+- `stage_summary`
+- `current_tension`
+- `recent_movement_summary`
+- `open_questions`
+- `salience`
+- `last_touched_at`
+- `linked_key_record_ids`
+- `linked_event_ids`
 
-## 九、配置系统
-
-### 9.1 启动配置（`config.yaml`）
-
-通过 `config.py` 加载为 `AppConfig` dataclass 树。支持以下顶层段：
-
-```yaml
-server:    # host, port
-llm:       # api_base, api_key, model
-database:  # path (SQLite文件路径)
-environment:  # min_time_unit_hours, generator
-memory_store: # type("vector"/"keyword"), max_snapshots
-character:    # system_prompt / system_prompt_file
-```
-
-### 9.2 运行时配置（`system_settings` 表）
-
-所有 Prompt 模板、L1/L2 文本、向量参数、自动化开关等均存储在数据库中，通过 `PromptManager` 读取。`prompts.py` 中的 `DEFAULT_SETTINGS` 定义了所有键的默认值、分类和描述。
-
-**配置优先级**：数据库运行时值 > config.yaml > 代码内置默认值。
-
-### 9.3 关键配置项分类
-
-| 分类 | 键名示例 | 说明 |
-|------|---------|------|
-| foundation | `L1_character_background`, `L1_user_background` | 稳定底层，不自动演化 |
-| personality | `L2_character_personality`, `L2_relationship_dynamics` | 动态层，EvolutionEngine 可更新 |
-| prompt | `prompt_snapshot_generation`, `prompt_event_anchor` 等 | 所有 LLM Prompt 模板 |
-| config | `min_time_unit_hours`, `evolution_event_threshold`, `archive_importance_threshold` | 状态机行为参数 |
-| vector | `vector_embedding_api_base`, `vector_cold_days_threshold` 等 | 向量存储参数 |
-| automation | `automation_enabled`, `automation_vector_sync` 等 | 自动化开关 |
-| runtime | `llm_api_base`, `llm_api_key`, `llm_model` | 运行时 LLM（覆盖 config.yaml） |
-
----
-
-## 十、Prompt 工程
-
-所有 Prompt 模板在 `prompts.py` 中定义，支持通过 Web 设定页面在线编辑。
-
-### 10.1 Prompt 模板列表
-
-| 键 | 用途 | 输入变量 |
-|----|------|---------|
-| `prompt_snapshot_generation` | 状态快照生成 | {environment}, {previous_snapshot}, {recent_events}, {memory_context} |
-| `prompt_event_anchor` | 事件锚点提取 | {current_snapshot}, {environment}, {system_layers}, {memory_context} |
-| `prompt_reflect_snapshot` | 对话后快照 | {previous_snapshot}, {conversation_summary}, {memory_context} |
-| `prompt_reflect_event` | 对话后事件 | {current_snapshot}, {conversation_summary}, {system_layers}, {memory_context} |
-| `prompt_conversation_summary` | 对话摘要 | {previous_snapshot}, {conversation_text}, {memory_context}, {system_layers} |
-| `prompt_periodic_review` | 阶段性回顾 | {time_range}, {snapshots_timeline}, {events_timeline}, {stats_summary}, {system_layers} |
-| `prompt_evolution_summary` | 人格演化 | {character_personality}, {relationship_dynamics}, {scored_events} |
-| `prompt_event_scoring` | 事件评分 | {events} |
-| `prompt_environment_generation` | 环境信息 | {time}, {date}, {weekday}, {time_period}, {previous_env}, {latest_snapshot}, {continuity} |
-
-### 10.2 事件锚点解析
-
-`state_machine.py` 的 `_parse_and_save_event()` 使用正则解析 LLM 输出：
-- 支持两种格式：新格式（`客观记录:` + `主观印象:`）和旧格式（`事件描述:`）
-- 提取：标题、关键词、分类
-- 如缺失标题/分类，由 `event_taxonomy.py` 自动生成
-
-### 10.3 system_prompt 构建
-
-`PromptManager.get_system_prompt()` 拼接 L1+L2 四段内容为 system prompt，传递给所有 LLM 调用。
+### 5.3 当前数据库层一个重要事实
+系统大量行为不只由代码决定，也受 `system_settings` 和 prompt 配置影响。  
+如果你发现某个行为“看起来不符合代码直觉”，优先检查：
+- `system_settings`
+- Web 设置页是否改过 prompt
+- 运行时 LLM 覆盖设置
 
 ---
 
-## 十一、前端架构
+## 6. 当前最重要的调用链
 
-### 11.1 页面结构
+## 6.1 `get_current_state`
+入口：
+- MCP `get_current_state`
+- REST `POST /api/state/current`
 
-所有页面共享同一个 `app.js` 和 `style.css`。每个页面在 `<body onload>` 中调用自己的初始化函数：
+它是真正的主链路。
 
-| 页面 | 初始化函数 | 功能 |
-|------|-----------|------|
-| `index.html` | `initDashboardPage()` | 仪表盘：最新快照、自动化报告、Token 统计、模型定价 |
-| `snapshots.html` | `initSnapshotsHistoryPage()` | 快照列表：查看/删除/导出 |
-| `events.html` | `initEventsHistoryPage()` | 事件列表：分类筛选/编辑/归档/导出 |
-| `key-records.html` | `initKeyRecordsPage()` | 关键记录：搜索/添加/编辑/删除 |
-| `settings.html` | `loadSettingsPage()` | 设定：人格层/Prompt/参数/批量导入 |
-| `evolution.html` | `loadEvolutionStatus()` | 人格演化：预览/应用/重算归档 |
-| `vectors.html` | `initVectorsPage()` | 向量管理：统计/配置/同步/压缩 |
+当前理解应是：
+1. 读取最新 snapshot、relationship_state、计划上下文、trace、events、key records 等
+2. 如有必要，做有限 catch-up 推进
+3. 维护对话占时 / conversation claim
+4. 生成最终注入块
+5. 把必要的主动通知附在结果里
 
-### 11.2 设计规范
+### 当前注入结构（最新理解）
+当前注入不应再是“很多平铺的大段摘要”，而应是按层组织。最新方向是：
+1. `L1`
+2. `L2`
+3. `近程记忆桥`
+4. `近期生活主线`
+5. `近景碎片池`
+6. `短期关系感知`
+7. `当前日程与偏差`
+8. `当前状态快照`
 
-- **配色**：橄榄军绿 × 近黑底 × 奶油文字（CSS 变量在 `:root` 中）
-- **无框架**：纯 Vanilla JS，所有 API 调用通过 `apiFetch()` 封装
-- **模态框**：`openModal()` / `closeModal()` 通用模态框系统
-- **状态栏**：底部固定 `showStatus()` 反馈条
+解释：
+- 越稳定、越长期的东西越靠前
+- 越即时、越切片的东西越靠后
+- 这样上游模型先建立“她是谁”和“她最近处在什么阶段”，再进入当下状态
 
----
+### 注入层当前的三个关键判断
+1. `conversation_summary` 四段式内容不应原样泄漏进注入
+2. `近期生活主线` 可以保留关键细节，但不能与“重要转折细节”重复
+3. `重要转折细节` 已降级，不应再作为第二份 event 列表存在
 
-## 十二、应用启动流程（`main.py`）
+## 6.2 `summarize_conversation`
+入口：
+- MCP `summarize_conversation`
+- REST `POST /api/state/summarize`
 
-```python
-lifespan(app):
-  1. Database.initialize()        # 创建表 + schema 迁移
-  2. LLMClient(config.llm, db)   # LLM 客户端（运行时可通过DB覆盖配置）
-  3. PromptManager(db)           # 初始化默认设定到 system_settings
-  4. TemplateEnvironmentGenerator(prompt_manager, llm)
-  5. VectorMemoryStore(db) 或 KeywordMemoryStore(db)  # 由 config 决定
-  6. EvolutionEngine(db, llm, prompt_manager)
-  7. AutomationEngine(db, prompt_manager, memory, evolution)
-  8. StateMachine(config, db, llm, env_gen, memory, prompt_manager, automation)
-  9. set_state_machine(sm)        # 注入 MCP 工具
-  10. set_dependencies(...)       # 注入 REST API 路由
-  11. mcp.session_manager.run()   # 启动 MCP 会话管理
+当前仍会产出结构化 conversation summary，但它的正确定位是：
+- 内部分析产物
+- 用于反思、关系评估、trace digest 提取
+- 不应再整段原样注入下次对话 prompt
 
-路由挂载：
-  /api/*         → api_routes.router
-  /mcp/*         → mcp.sse_app()
-  /mcp-http/*    → mcp.streamable_http_app()
-  /static/*      → web/ 静态文件
-  / /history /settings /events-history /snapshots-history /key-records /evolution /vectors /guide
-                 → 各 HTML 页面
-```
+## 6.3 `reflect_on_conversation`
+入口：
+- MCP `reflect_on_conversation`
+- REST `POST /api/state/reflect`
 
----
+当前理解：
+1. 基于对话 summary 和相关记忆生成 `conversation_end` snapshot
+2. 更新 / 关闭活跃对话 claim
+3. 生成 conversation 对应的 `life_flow_trace` 或 digest
+4. 触发 relationship_state 轻量更新
+5. 必要时触发自动化和 replan
 
-## 十三、LLM 客户端与 Token 追踪（`llm_client.py`）
-
-- 使用 httpx 异步客户端调用 OpenAI 兼容 API
-- `get_runtime_config()` 优先从数据库读取运行时覆盖配置
-- **Token 追踪**：`begin_usage_tracking()` / `end_usage_tracking()` 基于 `ContextVar`，跨异步调用累积 prompt_tokens、completion_tokens、requests，并按模型名分桶
-- Token 追踪数据随自动化报告持久化到 `automation_runs` 表
-
----
-
-## 十四、事件分类系统（`event_taxonomy.py`）
-
-预定义 6 个分类及其关键词：
-
-- 情感交流、学术探讨、生活足迹、床榻私语、精神碰撞、工作同步
-
-`classify_event(description, keywords)` → 关键词命中 → 返回分类列表（默认"生活足迹"）
-`make_event_title(description, keywords, categories)` → 从关键词/动作提示/分类生成 ≤16 字标题
+重要边界：
+- 当前 `reflect_on_conversation` 不应默认自动写 event
+- 如果对话里有真正值得保留的事件，应由显式事件链或人工记录处理
 
 ---
 
-## 十五、常见修改场景指南
+## 7. 事件系统的当前正确理解
+### 7.1 event 不再等于“有变化”
+当前最重要的收紧判断：
+> `delta` 只适合做 trace / fragment 候选材料，不再天然支持 event 成立。
 
-### 15.1 新增一个 MCP 工具
+### 7.2 现在只有这些东西应升格为 event
+- 明确决策 / 原则 / 承诺
+- 医疗阶段性转折
+- 高价值情感节点，并且改写彼此认知
+- 主动标记
+- 身体现象学信号被明确赋义
+- 外部变化明确改写后续生活路径
 
-1. 在 `mcp_tools.py` 添加 `@mcp.tool()` 装饰的异步函数
-2. 在 `state_machine.py` 添加对应的业务方法
-3. 如需数据库操作，在 `database.py` 添加查询方法
+### 7.3 不应自动升格为 event 的东西
+- 普通时间推进带来的 delta
+- 高突发但短促的现实碎片
+- 普通主线推进中的细部波动
+- 计划项正常执行结果
+- 仅仅“与上一时段不同”的内容
 
-### 15.2 新增一个 REST API 端点
+### 7.4 当前事件页已经是清洗工作台
+事件历史页当前支持：
+- 来源筛选：`generated / conversation / manual`
+- 分类筛选
+- 分页
+- 评分筛选：
+  - `importance_score`
+  - `impression_depth`
+  - 只看已评分事件
+- 批量删除当前评分筛选结果
 
-1. 在 `models.py` 添加请求/响应 Pydantic 模型
-2. 在 `api_routes.py` 添加路由函数（使用 `_db`, `_state_machine` 等模块级变量）
+当前新增 API：
+- `GET /api/events` 支持分数与来源筛选
+- `POST /api/events/delete-by-score`
 
-### 15.3 新增一个数据库表或字段
-
-1. 在 `database.py` 的 `_CREATE_TABLES` 中添加建表语句
-2. 在 `_ensure_schema_updates()` 中添加 `_ensure_column()` 调用（渐进迁移）
-3. 在 `models.py` 添加对应的 Pydantic 模型
-
-### 15.4 修改 Prompt 模板
-
-- 优先通过 Web 设定页面在线编辑（即时生效，存在数据库中）
-- 若要修改默认值，编辑 `prompts.py` 中的常量字符串和 `DEFAULT_SETTINGS` 字典
-- 注意保持 `{variable}` 占位符与调用处的 `.format()` 一致
-
-### 15.5 新增一个 Web 页面
-
-1. 在 `web/` 下创建 HTML 文件（参考现有页面结构，引用 `style.css` 和 `app.js`）
-2. 在 `app.js` 添加初始化函数和业务逻辑
-3. 在 `main.py` 添加 `@app.get("/新路径")` 路由
-
-### 15.6 修改记忆检索策略
-
-- 关键词模式：编辑 `memory_store.py` 的 `_compute_score()` 和 `_select_with_association()`
-- 向量模式：编辑 `vector_memory_store.py` 的 `search()` 中的评分公式（当前 0.72/0.18/0.10 权重）
-
-### 15.7 新增一个系统设定项
-
-1. 在 `prompts.py` 中定义 `KEY_xxx = "xxx"` 常量
-2. 在 `DEFAULT_SETTINGS` 中添加条目（包含 value, category, description）
-3. 在使用处通过 `prompt_manager.get_config_value(KEY_xxx)` 读取
+这套功能的定位是：
+- 帮你低成本清洗历史低密度 generated 事件
 
 ---
 
-## 十六、依赖关系图
+## 8. 日程系统的当前正确理解
+主要在：
+- [server/plan_engine.py](D:/Eloise/coding/凯尔希状态机/server/plan_engine.py)
 
-```
-main.py
-  ├── config.py          (AppConfig)
-  ├── database.py        (Database)
-  ├── llm_client.py      (LLMClient)
-  ├── prompts.py         (PromptManager, DEFAULT_SETTINGS)
-  ├── environment.py     (TemplateEnvironmentGenerator)
-  ├── memory_store.py    (KeywordMemoryStore)
-  ├── vector_memory_store.py  (VectorMemoryStore)
-  ├── evolution.py       (EvolutionEngine)
-  ├── automation_engine.py    (AutomationEngine)
-  ├── state_machine.py   (StateMachine) ← 核心，聚合以上所有
-  ├── mcp_tools.py       (FastMCP 工具) ← 引用 StateMachine + EvolutionEngine
-  └── api_routes.py      (REST 路由)   ← 引用 Database + StateMachine + 全部引擎
+### 8.1 当前日程系统的产品定位
+- 角色自己的独立生活骨架
+- 不是围绕 user 预设共同剧情的安排器
+- 不再是自动制造事件的后台来源
 
-state_machine.py 依赖：
-  Database, LLMClient, EnvironmentGenerator, MemoryStore, PromptManager, AutomationEngine
-```
+### 8.2 当前真实行为
+#### 已经实现
+- 计划项执行不再自动创建 event
+- 计划项只更新：
+  - `status`
+  - `outcome`
+  - `executed_at`
+- 必要时只补 trace
+
+#### 已经明确的产品边界
+- 不再规划与 user 的见面、共读、共同活动
+- 关系状态可以影响节律和倾向
+- 但不能直接生成 user 相关计划项
+
+### 8.3 baseline 机制
+新增：
+- `POST /api/plans/{plan_id}/use-as-baseline`
+
+用途：
+- 允许你手动调整一版日程
+- 再把它设为新的计划生成基线
+- 避免系统继续沿旧日程逻辑错误外推
 
 ---
 
-## 十七、注意事项
+## 9. 生活流层的当前理解
+### 9.1 `life_flow_trace`
+职责：
+- 承接“这一段时间是怎样流过去的”
+- 不是 event
+- 不是 key record
+- 不是 snapshot
 
-1. **数据库迁移是渐进式的**：`_ensure_schema_updates()` 在每次启动时检查并添加缺失列，不会破坏已有数据
-2. **Token 追踪使用 ContextVar**：在异步并发场景下隔离各请求的统计
-3. **向量维度必须一致**：所有向量的维度由 `vector_embedding_dim` 设定控制，切换 Embedding 模型需重建索引
-4. **LLM 输出解析容错**：事件锚点解析兼容多种格式，`"无需记录"` 是特殊跳过标记
-5. **前端无构建步骤**：直接编辑 JS/CSS/HTML 即生效（开发模式设 `KELSEY_DEV=1` 可启用热重载）
-6. **config.yaml 中包含 API Key**：已在 `.gitignore` 中排除
-7. **MCP 路径兼容**：`main.py` 中间件处理了 `/mcp-http` → `/mcp-http/mcp` 的路径规范化
-8. **批量导入**：`POST /api/import/bulk` 支持一次性导入设定、快照、事件、关键记录，带 upsert 和向量同步选项
+### 9.2 `slowline`
+职责：
+- 承接中期、有方向的生活线
+- 不必每天显性推进
+- 让“远景议题”不必硬塞进每天的细节事件里
+
+### 9.3 `近景碎片池`
+职责：
+- 承接 today / yesterday 高突发、高现实张力、难自然并入主线的碎片
+- 不要求它们都变成 event
+- 不要求它们都变成主线
+
+### 9.4 `近程记忆桥`
+职责：
+- 把更早但仍与当前相关的内容压缩成可注入背景
+- 不再平铺旧事件细节
+- 用摘要连接 today / yesterday 与更远背景
+
+### 9.5 自主生活与对话线必须等权
+这是当前架构的硬边界：
+- 近期主线编排时，自主生活内容和 conversation 内容都应保留可见位置
+- 不能谁信息更密就整体吞没另一侧
+
+---
+
+## 10. 短期关系感知层的当前理解
+`relationship_state` 的目标不是“替代关系剧情”，而是提供一种短期、可漂移、可影响生活节律的关系态势层。
+
+### 当前应影响的东西
+- 对话开场时的关系氛围
+- 可主动开启的话题
+- 更想靠近 / 观察 / 留空间 / 确认近况的倾向
+- 当天计划密度和节律偏好
+
+### 当前不应做的事
+- 不应直接变成 user 共同行动日程
+- 不应直接制造 user 相关后台事件
+- 不应把短期波动写回 L2
+
+换句话说：
+- `L2` 继续负责长期关系模式
+- `relationship_state` 负责短中期波动
+- `snapshot` 只体现即时影响
+
+---
+
+## 11. 记忆存储与检索
+抽象接口在：
+- [server/memory_store.py](D:/Eloise/coding/凯尔希状态机/server/memory_store.py)
+
+实现有两套：
+- `KeywordMemoryStore`
+- `VectorMemoryStore`
+
+### 11.1 VectorMemoryStore 仍是主路
+当前统一索引：
+- event
+- snapshot
+- key record
+- world book
+- cold summary / 压缩摘要
+
+### 11.2 冷记忆压缩仍然存在
+`VectorMemoryStore.compact_cold_memories()` 仍负责：
+- 把更久远的大量碎片压缩成摘要型记忆项
+- 减少向量噪声
+- 为更长期的连续性提供低成本背景
+
+这和新的 `近程记忆桥` 是互补关系：
+- 冷压缩更偏底层存储优化
+- 记忆桥更偏注入层展示与恢复连续性
+
+---
+
+## 12. Prompt / 配置系统的当前理解
+### 12.1 `config.yaml`
+仍负责启动级配置：
+- 服务地址
+- 主 LLM 基础配置
+- 数据库路径
+- memory store 类型
+
+### 12.2 `system_settings`
+仍负责运行时配置：
+- L1 / L2 内容
+- prompts
+- 自动化开关
+- scheduler 参数
+- vector 参数
+- plan 参数
+- 运行时 LLM 覆盖
+
+### 12.3 当前一个非常实际的判断
+如果某个行为和代码看起来不一致，请优先检查：
+1. prompt 是否被前端设置页覆盖
+2. `system_settings` 是否已有旧值
+3. 运行时是否还在用旧 prompt
+
+这是为什么过去会出现：
+- 注入结构已经改了，但展示仍像旧版本
+- 环境生成结构已改，但文本仍沿旧模板跑
+
+---
+
+## 13. API / 前端 / Android 的当前定位
+### 13.1 MCP
+仍是给上游对话系统用的主入口。
+关键工具依然包括：
+- `get_current_state`
+- `summarize_conversation`
+- `reflect_on_conversation`
+- `recall_memories`
+- `upsert_event`
+- `upsert_key_record`
+- `recall_key_records`
+- `execute_profile_evolution`
+
+### 13.2 REST API
+现在已经不仅是 MCP 的附属，而是完整的管理端 API。  
+尤其这轮后：
+- 事件历史清洗接口
+- baseline 接口
+- 计划、事件、key record、vector、debug 等管理链路
+都已经是正式产品能力的一部分。
+
+### 13.3 Web 前端
+当前前端仍然是：
+- 多页面静态 HTML
+- 大量逻辑集中在 [web/app.js](D:/Eloise/coding/凯尔希状态机/web/app.js)
+
+优点：
+- 改动快
+- 适合快速迭代产品逻辑
+
+缺点：
+- 有历史覆盖式实现
+- 后定义覆盖前定义较多
+- 后续重构成本会上升
+
+### 13.4 Android
+仍是轻量客户端，不是完整控制台。  
+不要把它当成与 Web 等价的管理入口。
+
+---
+
+## 14. 当前最值得注意的技术现实
+### 14.1 `state_machine.py` 与 `app.js` 存在“后定义覆盖前定义”
+这是当前代码最容易让接手者误判的地方。
+
+尤其在：
+- [server/state_machine.py](D:/Eloise/coding/凯尔希状态机/server/state_machine.py)
+- [web/app.js](D:/Eloise/coding/凯尔希状态机/web/app.js)
+
+当前存在：
+- 同名方法多次定义
+- 后补 override 行为
+- JS 后定义函数覆盖前定义函数
+
+这不是理想状态，但它解释了：
+- 为什么某些函数“明明前面写了旧逻辑，实际运行却是后面的版本”
+
+接手时请始终看：
+- Python 中类体里最后一个同名方法
+- JS 文件里最后一个同名函数定义
+
+### 14.2 AI_HANDOFF 曾经存在编码和内容过时问题
+这一版已经整体重写为最新架构说明。  
+不要再参考旧的乱码段落或老版本 README 来判断当前系统行为。
+
+### 14.3 数据库内容可能带有旧结构遗留文本
+例如旧 summary 中的标题文本、旧事件标题风格、旧 slowline 摘要结构等，都可能作为存量数据继续存在。  
+所以：
+- 代码修正后，页面仍可能因为旧数据而表现得像旧逻辑
+- 这时要区分：是“链路没改对”，还是“旧数据需要清洗”
+
+---
+
+## 15. 接手时建议先验证什么
+不要先看代码猜，请先跑真实行为检查。
+
+### 第一组：事件与清洗
+1. 日程执行后是否不再自动新增 event
+2. 事件历史页的来源筛选是否真实生效
+3. 分页是否能翻过 50 条
+4. 评分筛选是否只命中已评分事件
+5. “删除当前评分筛选结果”是否真的删库并清向量
+
+### 第二组：注入层
+1. `get_current_state` 是否按“长期/稳定在前，即时/切片在后”组织注入
+2. 是否还会看到四段式 conversation summary 标题原样泄漏
+3. `近期生活主线` 和 `近景碎片池` 是否仍有大面积重复
+4. 自主生活线和对话线是否都有可见位置
+
+### 第三组：关系感知与计划
+1. relationship_state 是否会随时间漂移
+2. conversation_end 后是否会更新关系感受与主动话题倾向
+3. 日程是否仍会偷偷规划与 user 的共同行动
+4. baseline 是否能成功改变后续计划生成起点
+
+---
+
+## 16. 如果继续迭代，优先级建议
+### 高优先级
+1. 清理 `state_machine.py` / `app.js` 中的历史覆盖式实现
+2. 继续收束“主线 / 碎片 / 记忆桥 / slowline”的职责边界
+3. 进一步提高事件标题质量
+4. 做更稳的历史数据清洗工具，而不是只靠人工逐条删
+
+### 中优先级
+1. 为 `relationship_state` 增加更清楚的管理/诊断可视化
+2. 为 `slowline` 增加明确的后台更新与调试入口
+3. 把事件页和计划页的“清洗/重基线”能力做得更可解释
+
+### 低优先级
+1. Android 扩展更多管理能力
+2. WeChat 桥接真正落地
+3. 更深的 NPC 生态与互动系统
+
+---
+
+## 17. 最后一句话
+当前这套系统最准确的理解是：
+
+> 一个围绕凯尔希这个角色构建的、带有独立生活推进、短期关系感知、分层记忆注入、长期事实沉淀与历史清洗能力的运行时后端。
+
+如果你接手后把它只当成“事件 CRUD + 快照 CRUD 服务”，基本一定会误判。  
+真正要守住的是：
+- 状态切片
+- 生活连续性
+- 关系短期波动
+- 结构化长期事实
+- 独立生活与对话交互的平衡

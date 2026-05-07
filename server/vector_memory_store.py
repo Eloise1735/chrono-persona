@@ -162,15 +162,23 @@ class VectorMemoryStore(MemoryStore):
             limit=batch_size,
             include_archived=True,
         )
+        pending_key_records = await self._db.get_key_records_without_vector(
+            limit=batch_size,
+            include_archived=True,
+        )
         old_snapshots = await self._db.get_snapshots_older_than_days_without_vector(
             days=snapshot_days,
             limit=batch_size,
         )
         event_count = 0
+        key_record_count = 0
         snapshot_count = 0
         for ev in pending_events:
             if await self.upsert_event_vector(int(ev.id or 0)):
                 event_count += 1
+        for record in pending_key_records:
+            if await self.upsert_key_record_vector(int(record.id or 0)):
+                key_record_count += 1
         for snap in old_snapshots:
             entry_id = f"snapshot_{snap.id}"
             await self.store(
@@ -188,6 +196,7 @@ class VectorMemoryStore(MemoryStore):
         world_book_result = await self.sync_world_book_vectors(limit=batch_size)
         return {
             "vectorized_events": event_count,
+            "vectorized_key_records": key_record_count,
             "vectorized_snapshots": snapshot_count,
             "vectorized_world_books": int(world_book_result.get("vectorized_world_books", 0)),
             "batch_size": batch_size,
@@ -234,6 +243,27 @@ class VectorMemoryStore(MemoryStore):
         await self._db.mark_world_book_vectorized(world_book_id, entry_id)
         return True
 
+    async def upsert_key_record_vector(self, record_id: int) -> bool:
+        if record_id <= 0:
+            return False
+        record = await self._db.get_key_record_by_id(record_id)
+        if not record:
+            return False
+        entry_id = f"key_record_{record_id}"
+        vector_text = self._build_key_record_vector_text(record)
+        await self.store(
+            entry_id,
+            vector_text,
+            {
+                "source_type": "key_record",
+                "source_id": record_id,
+                "title": record.title,
+                "type": record.type,
+            },
+        )
+        await self._db.mark_key_record_vectorized(record_id, entry_id)
+        return True
+
     async def delete_world_book_vector(self, world_book_id: int) -> bool:
         if world_book_id <= 0:
             return False
@@ -244,6 +274,18 @@ class VectorMemoryStore(MemoryStore):
             return False
         await self._db.mark_memory_vector_deleted(entry_id)
         await self._db.clear_world_book_vectorized(world_book_id)
+        return True
+
+    async def delete_key_record_vector(self, record_id: int) -> bool:
+        if record_id <= 0:
+            return False
+        entry_id = f"key_record_{record_id}"
+        row = await self._db.get_memory_vector(entry_id)
+        if not row:
+            await self._db.clear_key_record_vectorized(record_id)
+            return False
+        await self._db.mark_memory_vector_deleted(entry_id)
+        await self._db.clear_key_record_vectorized(record_id)
         return True
 
     async def sync_world_book_vectors(self, limit: int = 200) -> dict:
@@ -276,6 +318,51 @@ class VectorMemoryStore(MemoryStore):
             offset=0,
             limit=5000,
             source_type="world_book",
+            status="active",
+        )
+        if candidate_ids:
+            allowed = {int(x) for x in candidate_ids if int(x) > 0}
+            rows = [r for r in rows if int(r.get("source_id") or 0) in allowed]
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            vec = self._normalize_vector(self._loads_vector(row.get("vector_json")))
+            if len(vec) != len(qvec):
+                continue
+            cosine = self._cosine_similarity(qvec, vec)
+            if cosine <= 0:
+                continue
+            scored.append((cosine, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        result: list[dict] = []
+        for score, row in scored[: max(1, top_k)]:
+            result.append(
+                {
+                    "id": int(row.get("source_id") or 0),
+                    "entry_id": str(row.get("entry_id") or ""),
+                    "score": float(score),
+                    "text": str(row.get("text_content") or ""),
+                }
+            )
+        return result
+
+    async def search_key_records(
+        self,
+        query: str,
+        top_k: int = 6,
+        candidate_ids: list[int] | None = None,
+    ) -> list[dict]:
+        query_text = (query or "").strip()
+        if not query_text:
+            return []
+        cfg = await self.get_runtime_config()
+        qvec, _provider = await self._embed_text(query_text, cfg)
+        qvec = self._normalize_vector(qvec)
+        if not qvec:
+            return []
+        rows = await self._db.list_memory_vectors(
+            offset=0,
+            limit=5000,
+            source_type="key_record",
             status="active",
         )
         if candidate_ids:
@@ -337,6 +424,8 @@ class VectorMemoryStore(MemoryStore):
         await self._db.mark_memory_vector_deleted(entry_id)
         if entry_id.startswith("event_"):
             await self._db.clear_event_vectorized(int(entry_id.split("_", 1)[1]))
+        elif entry_id.startswith("key_record_"):
+            await self._db.clear_key_record_vectorized(int(entry_id.split("_", 2)[2]))
         elif entry_id.startswith("snapshot_"):
             await self._db.clear_snapshot_vectorized(int(entry_id.split("_", 1)[1]))
         elif entry_id.startswith("world_book_"):
@@ -347,7 +436,9 @@ class VectorMemoryStore(MemoryStore):
         await self._db.conn.execute("DELETE FROM memory_vectors")
         await self._db.conn.commit()
         await self._db.conn.execute("UPDATE event_anchors SET embedding_vector_id = NULL")
+        await self._db.conn.execute("UPDATE key_records SET embedding_vector_id = NULL")
         await self._db.conn.execute("UPDATE state_snapshots SET embedding_vector_id = NULL")
+        await self._db.conn.execute("UPDATE world_books SET embedding_vector_id = NULL")
         await self._db.conn.commit()
         return await self.sync_eligible_vectors()
 
@@ -569,6 +660,25 @@ class VectorMemoryStore(MemoryStore):
                 score=score,
             )
 
+        if source_type == "key_record":
+            key_record = await self._db.get_key_record_by_id(source_id)
+            if not key_record:
+                return None
+            return MemoryEntry(
+                id=entry_id,
+                text=key_record.content_text,
+                source_type="key_record",
+                source_id=source_id,
+                metadata={
+                    "title": key_record.title,
+                    "type": key_record.type,
+                    "tags": self._parse_json_list(key_record.tags),
+                    "match_keywords": self._parse_json_list(getattr(key_record, "match_keywords", "[]")),
+                    "score": round(score, 4),
+                },
+                score=score,
+            )
+
         snap = await self._db.get_snapshot_by_id(source_id)
         if not snap:
             return None
@@ -617,6 +727,8 @@ class VectorMemoryStore(MemoryStore):
             return 0.5
         if source_type == "summary":
             return 0.68
+        if source_type == "key_record":
+            return 0.76
         return 0.45
 
     @staticmethod
@@ -643,6 +755,24 @@ class VectorMemoryStore(MemoryStore):
         parts = [content]
         if name:
             parts.append(f"name: {name}")
+        if tags:
+            parts.append("tags: " + ", ".join(tags))
+        if match_keywords:
+            parts.append("match_keywords: " + ", ".join(match_keywords))
+        return "\n".join([p for p in parts if p])
+
+    @staticmethod
+    def _build_key_record_vector_text(record: object) -> str:
+        title = str(getattr(record, "title", "") or "").strip()
+        content_text = str(getattr(record, "content_text", "") or "").strip()
+        record_type = str(getattr(record, "type", "") or "").strip()
+        tags = VectorMemoryStore._parse_json_list(getattr(record, "tags", "[]"))
+        match_keywords = VectorMemoryStore._parse_json_list(getattr(record, "match_keywords", "[]"))
+        parts = [content_text]
+        if title:
+            parts.append(f"title: {title}")
+        if record_type:
+            parts.append(f"type: {record_type}")
         if tags:
             parts.append("tags: " + ", ".join(tags))
         if match_keywords:
