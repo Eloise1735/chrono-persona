@@ -4,23 +4,32 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 
 logger = logging.getLogger(__name__)
 
 from server.diagnostics import TRACE_STORE
 from server.llm_client import LLMTimeoutError, LLMTransportError, LLMUpstreamHTTPError
 from server.models import (
+    CharacterNotification,
+    CreateNPCRequest,
     CreateSnapshotRequest,
     CreateEventRequest,
+    DeleteEventsByScoreRequest,
     UpdateEventRequest,
+    DailyPlan,
     CreateKeyRecordRequest,
+    GeneratePlanRequest,
     UpdateKeyRecordRequest,
     MemorySearchRequest,
     GetCurrentStateRequest,
+    NPCEntity,
+    PlanItem,
+    ReplanRequest,
     ReflectRequest,
     SummarizeConversationRequest,
     PeriodicReviewRequest,
+    PlanBatchDeleteRequest,
     KeyRecordSearchRequest,
     UpdateSettingRequest,
     EvolutionApplyRequest,
@@ -34,6 +43,7 @@ from server.models import (
     WorldBookCreateRequest,
     WorldBookUpdateRequest,
     WorldBookAutoMetaRequest,
+    KeyRecordBatchVectorizeRequest,
     WorldBookJsonImportRequest,
     UpsertModelPricingRequest,
     BulkImportRequest,
@@ -41,7 +51,13 @@ from server.models import (
     StateSnapshot,
     EventAnchor,
     KeyRecord,
+    BulkPlanItemRequest,
+    BulkUpdatePlanRequest,
+    UpdatePlanItemRequest,
+    UpdateNPCRequest,
     WorldBook,
+    KEY_RECORD_TYPES,
+    LEGACY_KEY_RECORD_TYPE_MAP,
     format_utc_instant_z,
 )
 from server.prompts import DEFAULT_SETTINGS, KEY_MODEL_PRICING_JSON
@@ -64,6 +80,74 @@ _evolution_engine = None
 _llm_client = None
 _env_llm_client = None
 _snapshot_llm_client = None
+
+
+def _normalize_plan_action_type(value: str | None) -> str:
+    raw = str(value or "internal").strip()
+    return raw if raw in {"internal", "web_search", "npc_interaction"} else "internal"
+
+
+def _normalize_plan_source_kind(value: str | None) -> str:
+    raw = str(value or "generated").strip()
+    return raw if raw in {"generated", "routine", "carried_over", "thread", "spontaneous", "replan"} else "generated"
+
+
+def _sanitize_plan_payload(payload: dict | None) -> dict:
+    data = dict(payload or {})
+    for key in ["content", "message", "message_text", "draft", "draft_message", "user_message", "sync_request"]:
+        data.pop(key, None)
+    outline = data.get("progress_outline")
+    if isinstance(outline, dict):
+        data["progress_outline"] = {
+            "goal": str(outline.get("goal") or "").strip(),
+            "done_so_far": str(outline.get("done_so_far") or "").strip(),
+            "remaining": str(outline.get("remaining") or "").strip(),
+            "watch_points": str(outline.get("watch_points") or "").strip(),
+            "trigger_to_shift": str(outline.get("trigger_to_shift") or "").strip(),
+        }
+    if "thread_id" in data:
+        data["thread_id"] = str(data.get("thread_id") or "").strip()
+    if "progress_status" in data:
+        data["progress_status"] = str(data.get("progress_status") or "").strip()
+    if "closure_condition" in data:
+        data["closure_condition"] = str(data.get("closure_condition") or "").strip()
+    for numeric_key in ("expected_steps", "current_step"):
+        if numeric_key in data:
+            try:
+                data[numeric_key] = max(1, int(data.get(numeric_key) or 1))
+            except Exception:
+                data.pop(numeric_key, None)
+    return data
+
+
+def _plan_items_to_raw_plan(items: list[PlanItem]) -> str:
+    def _parse_action_payload(raw: str) -> dict:
+        try:
+            value = json.loads(raw or "{}")
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    payload = {
+        "items": [
+            {
+                "hour_start": int(item.hour_start),
+                "hour_end": int(item.hour_end),
+                "activity": item.activity,
+                "action_type": item.action_type,
+                "action_payload": _parse_action_payload(item.action_payload),
+                "status": item.status,
+                "outcome": item.outcome,
+                "source_kind": item.source_kind,
+                "source_ref_id": item.source_ref_id,
+                "executed_at": item.executed_at,
+            }
+            for item in items
+        ]
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+_plan_engine = None
+_npc_engine = None
 
 
 def _require_state_machine():
@@ -222,9 +306,11 @@ def set_dependencies(
     llm_client=None,
     env_llm_client=None,
     snapshot_llm_client=None,
+    plan_engine=None,
+    npc_engine=None,
 ):
     global _db, _state_machine, _memory_store, _prompt_manager, _evolution_engine
-    global _llm_client, _env_llm_client, _snapshot_llm_client
+    global _llm_client, _env_llm_client, _snapshot_llm_client, _plan_engine, _npc_engine
     _db = db
     _state_machine = state_machine
     _memory_store = memory_store
@@ -233,6 +319,8 @@ def set_dependencies(
     _llm_client = llm_client
     _env_llm_client = env_llm_client
     _snapshot_llm_client = snapshot_llm_client
+    _plan_engine = plan_engine
+    _npc_engine = npc_engine
 
 
 async def _ensure_event_meta(event: EventAnchor) -> EventAnchor:
@@ -321,12 +409,29 @@ def _extract_json_object(text: str) -> dict:
     return {}
 
 
+def _normalize_key_record_type_value(value) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw in KEY_RECORD_TYPES:
+        return raw
+    return str(LEGACY_KEY_RECORD_TYPE_MAP.get(raw) or "")
+
+
 def _serialize_world_book(item: WorldBook) -> dict:
     data = item.model_dump()
     data["tags"] = _parse_json_list(item.tags)
     data["match_keywords"] = _parse_json_list(item.match_keywords)
     data["is_active"] = bool(int(item.is_active or 0))
     data["vectorized"] = bool(str(item.embedding_vector_id or "").strip())
+    return data
+
+
+def _serialize_key_record(item: KeyRecord) -> dict:
+    data = item.model_dump()
+    data["tags"] = _parse_json_list(item.tags)
+    data["match_keywords"] = _parse_json_list(getattr(item, "match_keywords", "[]"))
+    data["vectorized"] = bool(str(getattr(item, "embedding_vector_id", "") or "").strip())
     return data
 
 
@@ -463,6 +568,277 @@ async def api_periodic_review(req: PeriodicReviewRequest):
     return result
 
 
+# ── Plans / NPCs / Notifications ──
+
+@router.get("/plans/today")
+async def api_get_today_plan():
+    if _plan_engine is None:
+        raise HTTPException(503, "Plan engine is not initialized")
+    plan = await _plan_engine.get_current_plan()
+    baseline_plan_id = await _plan_engine.get_baseline_plan_id()
+    if plan is None or plan.id is None:
+        return {"plan": None, "items": [], "baseline_plan_id": baseline_plan_id}
+    items = await _plan_engine.get_effective_plan_items(plan)
+    return {"plan": plan.model_dump(), "items": [item.model_dump() for item in items], "baseline_plan_id": baseline_plan_id}
+
+
+@router.get("/plans/history")
+async def api_list_plan_history(offset: int = 0, limit: int = 30, status: str | None = None):
+    items = await _db.list_daily_plans(offset=offset, limit=limit, status=status)
+    return {"items": [item.model_dump() for item in items]}
+
+
+@router.get("/plans/{plan_id}")
+async def api_get_plan(plan_id: int):
+    plan = await _db.get_daily_plan_by_id(plan_id)
+    if plan is None:
+        raise HTTPException(404, "Plan not found")
+    if _plan_engine is not None:
+        items = await _plan_engine.get_effective_plan_items(plan)
+    else:
+        items = await _db.list_plan_items(plan_id)
+    return {"plan": plan.model_dump(), "items": [item.model_dump() for item in items]}
+
+
+@router.delete("/plans/{plan_id}")
+async def api_delete_plan(plan_id: int):
+    plan = await _db.get_daily_plan_by_id(plan_id)
+    if plan is None:
+        raise HTTPException(404, "Plan not found")
+    deleted_items = await _db.delete_plan_items_for_plan(plan_id)
+    await _db.delete_daily_plan(plan_id)
+    return {
+        "message": "Plan deleted",
+        "plan_id": plan_id,
+        "deleted_item_count": deleted_items,
+    }
+
+
+@router.post("/plans/batch-delete")
+async def api_batch_delete_plans(req: PlanBatchDeleteRequest):
+    unique_ids: list[int] = []
+    seen: set[int] = set()
+    for raw in req.plan_ids:
+        plan_id = int(raw or 0)
+        if plan_id <= 0 or plan_id in seen:
+            continue
+        seen.add(plan_id)
+        unique_ids.append(plan_id)
+    if not unique_ids:
+        raise HTTPException(400, "No valid plan ids provided")
+
+    deleted = 0
+    failed = 0
+    deleted_item_count = 0
+    missing_ids: list[int] = []
+    for plan_id in unique_ids:
+        plan = await _db.get_daily_plan_by_id(plan_id)
+        if plan is None:
+            failed += 1
+            missing_ids.append(plan_id)
+            continue
+        deleted_item_count += await _db.delete_plan_items_for_plan(plan_id)
+        await _db.delete_daily_plan(plan_id)
+        deleted += 1
+    return {
+        "message": "Plan batch delete completed",
+        "deleted": deleted,
+        "failed": failed,
+        "deleted_item_count": deleted_item_count,
+        "missing_ids": missing_ids,
+    }
+
+
+@router.put("/plans/items/{item_id}")
+async def api_update_plan_item(item_id: int, req: UpdatePlanItemRequest):
+    item = await _db.get_plan_item_by_id(item_id)
+    if item is None:
+        raise HTTPException(404, "Plan item not found")
+    fields = {}
+    if req.hour_start is not None:
+        fields["hour_start"] = max(0, int(req.hour_start))
+    if req.hour_end is not None:
+        fields["hour_end"] = max(1, int(req.hour_end))
+    if req.activity is not None:
+        fields["activity"] = req.activity.strip()
+    if req.action_type is not None:
+        fields["action_type"] = _normalize_plan_action_type(req.action_type)
+    if req.action_payload is not None:
+        fields["action_payload"] = json.dumps(_sanitize_plan_payload(req.action_payload), ensure_ascii=False)
+    if req.status is not None:
+        fields["status"] = req.status
+    if req.outcome is not None:
+        fields["outcome"] = req.outcome.strip()
+    if req.source_kind is not None:
+        fields["source_kind"] = req.source_kind
+    if req.source_ref_id is not None:
+        fields["source_ref_id"] = req.source_ref_id
+    if fields:
+        await _db.update_plan_item(item_id, **fields)
+        updated_item = await _db.get_plan_item_by_id(item_id)
+        if updated_item is not None:
+            plan_items = await _db.list_plan_items(int(updated_item.plan_id))
+            await _db.update_daily_plan(int(updated_item.plan_id), raw_plan=_plan_items_to_raw_plan(plan_items))
+    return {"message": "Plan item updated"}
+
+
+@router.put("/plans/{plan_id}/bulk-edit")
+async def api_bulk_update_plan(plan_id: int, req: BulkUpdatePlanRequest):
+    plan = await _db.get_daily_plan_by_id(plan_id)
+    if plan is None:
+        raise HTTPException(404, "Plan not found")
+    normalized_items: list[PlanItem] = []
+    for raw in req.items:
+        hs = max(0, int(raw.hour_start))
+        he = max(1, int(raw.hour_end))
+        if he <= hs:
+            raise HTTPException(400, f"Invalid plan item range: {hs}-{he}")
+        normalized_items.append(
+            PlanItem(
+                plan_id=plan_id,
+                hour_start=hs,
+                hour_end=he,
+                activity=str(raw.activity or "").strip(),
+                action_type=_normalize_plan_action_type(raw.action_type),  # type: ignore[arg-type]
+                action_payload=json.dumps(_sanitize_plan_payload(raw.action_payload), ensure_ascii=False),
+                status=raw.status,  # type: ignore[arg-type]
+                outcome=str(raw.outcome or "").strip(),
+                source_kind=_normalize_plan_source_kind(raw.source_kind),  # type: ignore[arg-type]
+                source_ref_id=raw.source_ref_id,
+                executed_at=raw.executed_at,
+            )
+        )
+    normalized_items.sort(key=lambda item: (item.hour_start, item.hour_end, item.activity))
+    await _db.delete_plan_items_for_plan(plan_id)
+    for item in normalized_items:
+        await _db.insert_plan_item(item)
+    fresh_items = await _db.list_plan_items(plan_id)
+    await _db.update_daily_plan(plan_id, raw_plan=_plan_items_to_raw_plan(fresh_items))
+    fresh_plan = await _db.get_daily_plan_by_id(plan_id)
+    return {
+        "message": "Plan updated",
+        "plan": fresh_plan.model_dump() if fresh_plan else None,
+        "items": [item.model_dump() for item in fresh_items],
+    }
+
+
+@router.post("/plans/generate")
+async def api_generate_plan(req: GeneratePlanRequest):
+    if _plan_engine is None:
+        raise HTTPException(503, "Plan engine is not initialized")
+    plan = await _plan_engine.generate_daily_plan(req.plan_date or shanghai_now().date().isoformat())
+    items = await _db.list_plan_items(int(plan.id or 0))
+    return {"plan": plan.model_dump(), "items": [item.model_dump() for item in items]}
+
+
+@router.post("/plans/replan")
+async def api_replan(req: ReplanRequest):
+    if _plan_engine is None:
+        raise HTTPException(503, "Plan engine is not initialized")
+    plan = await _plan_engine.maybe_replan(trigger=req.trigger, context=req.context)
+    if plan is None:
+        return {"plan": None, "message": "No replan needed"}
+    items = await _db.list_plan_items(int(plan.id or 0))
+    return {"plan": plan.model_dump(), "items": [item.model_dump() for item in items]}
+
+
+@router.post("/plans/{plan_id}/use-as-baseline")
+async def api_use_plan_as_baseline(plan_id: int):
+    if _plan_engine is None:
+        raise HTTPException(503, "Plan engine is not initialized")
+    try:
+        plan = await _plan_engine.set_baseline_plan(plan_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    items = await _db.list_plan_items(int(plan.id or 0))
+    return {
+        "message": "Baseline plan updated",
+        "baseline_plan_id": int(plan.id or 0),
+        "plan": plan.model_dump(),
+        "items": [item.model_dump() for item in items],
+    }
+
+
+@router.get("/npcs")
+async def api_list_npcs(offset: int = 0, limit: int = 100, status: str | None = None):
+    items = await _db.list_npc_entities(offset=offset, limit=limit, status=status)
+    return {"items": [item.model_dump() for item in items]}
+
+
+@router.get("/npcs/{npc_id}")
+async def api_get_npc(npc_id: int):
+    item = await _db.get_npc_entity_by_id(npc_id)
+    if item is None:
+        raise HTTPException(404, "NPC not found")
+    return item.model_dump()
+
+
+@router.post("/npcs")
+async def api_create_npc(req: CreateNPCRequest):
+    item = NPCEntity(
+        name=req.name.strip(),
+        role=req.role.strip(),
+        background=req.background.strip(),
+        relationship_to_character=req.relationship_to_character.strip(),
+        personality_traits=json.dumps(req.personality_traits, ensure_ascii=False),
+        status=req.status,
+        spawn_source=req.spawn_source,
+        spawn_context=req.spawn_context.strip(),
+        notes=req.notes.strip(),
+    )
+    item.id = await _db.insert_npc_entity(item)
+    return {"id": item.id, "message": "NPC created"}
+
+
+@router.put("/npcs/{npc_id}")
+async def api_update_npc(npc_id: int, req: UpdateNPCRequest):
+    item = await _db.get_npc_entity_by_id(npc_id)
+    if item is None:
+        raise HTTPException(404, "NPC not found")
+    fields = {}
+    if req.name is not None:
+        fields["name"] = req.name.strip()
+    if req.role is not None:
+        fields["role"] = req.role.strip()
+    if req.background is not None:
+        fields["background"] = req.background.strip()
+    if req.relationship_to_character is not None:
+        fields["relationship_to_character"] = req.relationship_to_character.strip()
+    if req.personality_traits is not None:
+        fields["personality_traits"] = json.dumps(req.personality_traits, ensure_ascii=False)
+    if req.status is not None:
+        fields["status"] = req.status
+    if req.spawn_source is not None:
+        fields["spawn_source"] = req.spawn_source
+    if req.spawn_context is not None:
+        fields["spawn_context"] = req.spawn_context.strip()
+    if req.notes is not None:
+        fields["notes"] = req.notes.strip()
+    await _db.update_npc_entity(npc_id, **fields)
+    return {"message": "NPC updated"}
+
+
+@router.get("/notifications")
+async def api_list_notifications(status: str | None = "pending", offset: int = 0, limit: int = 100):
+    items = await _db.list_character_notifications(status=status, offset=offset, limit=limit)
+    return {"items": [item.model_dump() for item in items]}
+
+
+@router.post("/notifications/{notification_id}/read")
+async def api_mark_notification_read(notification_id: int):
+    item = await _db.get_character_notification_by_id(notification_id)
+    if item is None:
+        raise HTTPException(404, "Notification not found")
+    await _db.update_character_notification(notification_id, status="read")
+    return {"message": "Notification marked as read"}
+
+
+@router.get("/notifications/history")
+async def api_list_notification_history(offset: int = 0, limit: int = 100):
+    items = await _db.list_character_notifications(offset=offset, limit=limit)
+    return {"items": [item.model_dump() for item in items]}
+
+
 # ── Key Records ──
 
 @router.get("/key-records")
@@ -480,7 +856,7 @@ async def list_key_records(
         status=status,
         include_archived=include_archived,
     )
-    return {"items": [i.model_dump() for i in items]}
+    return {"items": [_serialize_key_record(i) for i in items]}
 
 
 @router.post("/key-records/search")
@@ -500,18 +876,27 @@ async def get_key_record(record_id: int):
     item = await _db.get_key_record_by_id(record_id)
     if not item:
         raise HTTPException(404, "Key record not found")
-    return item.model_dump()
+    return _serialize_key_record(item)
 
 
 @router.post("/key-records")
 async def create_key_record(req: CreateKeyRecordRequest):
     now = datetime.utcnow().isoformat()
+    normalized_type = _normalize_key_record_type_value(req.type)
     item = KeyRecord(
-        type=req.type,
+        type=(normalized_type or _state_machine._classify_key_record_type(
+            title=req.title.strip(),
+            content_text=req.content_text.strip(),
+            tags=req.tags,
+            content_json=req.content_json,
+            start_date=req.start_date,
+            end_date=req.end_date,
+        )),
         title=req.title.strip(),
         content_text=req.content_text.strip(),
         content_json=json.dumps(req.content_json, ensure_ascii=False) if req.content_json is not None else None,
         tags=json.dumps(req.tags, ensure_ascii=False),
+        match_keywords=json.dumps(req.match_keywords, ensure_ascii=False),
         start_date=req.start_date,
         end_date=req.end_date,
         status=req.status,
@@ -521,6 +906,13 @@ async def create_key_record(req: CreateKeyRecordRequest):
         updated_at=now,
     )
     record_id = await _db.insert_key_record(item)
+    upsert_method = getattr(_memory_store, "upsert_key_record_vector", None)
+    if callable(upsert_method):
+        await upsert_method(record_id)
+    try:
+        await _state_machine.refresh_related_slowline_from_key_record_id(int(record_id))
+    except Exception:
+        logger.exception("Failed to refresh slowline after API key record create: %s", record_id)
     return {"id": record_id, "message": "Key record created"}
 
 
@@ -531,7 +923,9 @@ async def update_key_record(record_id: int, req: UpdateKeyRecordRequest):
         raise HTTPException(404, "Key record not found")
     fields = {}
     if req.type is not None:
-        fields["type"] = req.type
+        normalized_type = _normalize_key_record_type_value(req.type)
+        if normalized_type:
+            fields["type"] = normalized_type
     if req.title is not None:
         fields["title"] = req.title.strip()
     if req.content_text is not None:
@@ -540,6 +934,8 @@ async def update_key_record(record_id: int, req: UpdateKeyRecordRequest):
         fields["content_json"] = json.dumps(req.content_json, ensure_ascii=False)
     if req.tags is not None:
         fields["tags"] = json.dumps(req.tags, ensure_ascii=False)
+    if req.match_keywords is not None:
+        fields["match_keywords"] = json.dumps(req.match_keywords, ensure_ascii=False)
     if req.start_date is not None:
         fields["start_date"] = req.start_date
     if req.end_date is not None:
@@ -552,6 +948,13 @@ async def update_key_record(record_id: int, req: UpdateKeyRecordRequest):
         fields["linked_event_id"] = req.linked_event_id
     if fields:
         await _db.update_key_record(record_id, **fields)
+        upsert_method = getattr(_memory_store, "upsert_key_record_vector", None)
+        if callable(upsert_method):
+            await upsert_method(record_id)
+        try:
+            await _state_machine.refresh_related_slowline_from_key_record_id(int(record_id), previous_record=item)
+        except Exception:
+            logger.exception("Failed to refresh slowline after API key record update: %s", record_id)
     return {"message": "Key record updated"}
 
 
@@ -560,8 +963,114 @@ async def delete_key_record(record_id: int):
     item = await _db.get_key_record_by_id(record_id)
     if not item:
         raise HTTPException(404, "Key record not found")
+    delete_method = getattr(_memory_store, "delete_key_record_vector", None)
+    if callable(delete_method):
+        await delete_method(record_id)
     await _db.delete_key_record(record_id)
     return {"message": "Key record deleted"}
+
+
+@router.get("/key-records/relabel-preview")
+async def key_record_relabel_preview(
+    limit: int = 200,
+    include_migrated: bool = False,
+):
+    items = await _db.get_all_key_records(offset=0, limit=max(1, min(limit, 500)), include_archived=True)
+    out: list[dict] = []
+    for item in items:
+        current_type = str(item.type or "").strip()
+        is_legacy = current_type in LEGACY_KEY_RECORD_TYPE_MAP
+        if not include_migrated and not is_legacy:
+            continue
+        suggested = _state_machine._classify_key_record_type(
+            title=str(item.title or ""),
+            content_text=str(item.content_text or ""),
+            tags=_parse_json_list(item.tags),
+            content_json=_extract_json_object(str(item.content_json or "")) if item.content_json else None,
+            start_date=item.start_date,
+            end_date=item.end_date,
+        )
+        payload = item.model_dump()
+        payload["legacy_type"] = current_type if is_legacy else None
+        payload["suggested_type"] = suggested
+        payload["needs_relabel"] = is_legacy or current_type != suggested
+        out.append(payload)
+    return {"items": out, "total": len(out)}
+
+
+@router.post("/key-records/relabel-apply")
+async def key_record_relabel_apply(payload: dict):
+    record_ids = payload.get("record_ids") or []
+    apply_all_legacy = bool(payload.get("apply_all_legacy"))
+    items = await _db.get_all_key_records(offset=0, limit=1000, include_archived=True)
+    selected: list[KeyRecord] = []
+    selected_ids = {int(x) for x in record_ids if str(x).isdigit()}
+    for item in items:
+        item_id = int(item.id or 0)
+        if apply_all_legacy and str(item.type or "").strip() in LEGACY_KEY_RECORD_TYPE_MAP:
+            selected.append(item)
+        elif item_id in selected_ids:
+            selected.append(item)
+    updated = 0
+    skipped = 0
+    for item in selected:
+        suggested = _state_machine._classify_key_record_type(
+            title=str(item.title or ""),
+            content_text=str(item.content_text or ""),
+            tags=_parse_json_list(item.tags),
+            content_json=_extract_json_object(str(item.content_json or "")) if item.content_json else None,
+            start_date=item.start_date,
+            end_date=item.end_date,
+        )
+        if not suggested or str(item.type or "").strip() == suggested:
+            skipped += 1
+            continue
+        await _db.update_key_record(int(item.id or 0), type=suggested)
+        updated += 1
+    return {"updated": updated, "skipped": skipped, "selected": len(selected)}
+
+
+@router.post("/key-records/vectorize-batch")
+async def batch_vectorize_key_records(req: KeyRecordBatchVectorizeRequest):
+    upsert_method = getattr(_memory_store, "upsert_key_record_vector", None)
+    if not callable(upsert_method):
+        raise HTTPException(400, "Current memory store does not support key record vectorization")
+
+    target_ids = [int(x) for x in req.item_ids if int(x) > 0]
+    if target_ids:
+        items = await _db.get_key_records_by_ids(target_ids)
+    else:
+        items = await _db.get_all_key_records(
+            offset=0,
+            limit=1000,
+            include_archived=req.include_archived,
+        )
+
+    processed = 0
+    vectorized = 0
+    failed = 0
+    details: list[dict] = []
+    for item in items:
+        processed += 1
+        try:
+            ok = await upsert_method(int(item.id or 0))
+            if ok:
+                vectorized += 1
+                details.append({"id": item.id, "status": "vectorized"})
+            else:
+                failed += 1
+                details.append({"id": item.id, "status": "failed", "reason": "upsert returned false"})
+        except Exception as exc:
+            failed += 1
+            details.append({"id": item.id, "status": "failed", "reason": str(exc)})
+
+    return {
+        "message": "Key record batch vectorization completed",
+        "processed": processed,
+        "vectorized": vectorized,
+        "failed": failed,
+        "details": details,
+    }
 
 
 @router.get("/world-books")
@@ -924,16 +1433,44 @@ async def list_events(
     limit: int = 50,
     include_archived: bool = False,
     categories: str | None = None,
+    sources: str | None = None,
+    scored_only: bool = False,
+    min_importance_score: float | None = None,
+    max_importance_score: float | None = None,
+    min_impression_depth: float | None = None,
+    max_impression_depth: float | None = None,
 ):
     category_list = [c.strip() for c in (categories or "").split(",") if c.strip()]
+    source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
     events = await _db.get_all_events(
         offset=offset,
         limit=limit,
         include_archived=include_archived,
         categories=category_list,
+        sources=source_list,
+        scored_only=scored_only,
+        min_importance_score=min_importance_score,
+        max_importance_score=max_importance_score,
+        min_impression_depth=min_impression_depth,
+        max_impression_depth=max_impression_depth,
     )
     normalized = [await _ensure_event_meta(e) for e in events]
-    return {"items": [e.model_dump() for e in normalized]}
+    total = await _db.count_events(
+        include_archived=include_archived,
+        categories=category_list,
+        sources=source_list,
+        scored_only=scored_only,
+        min_importance_score=min_importance_score,
+        max_importance_score=max_importance_score,
+        min_impression_depth=min_impression_depth,
+        max_impression_depth=max_impression_depth,
+    )
+    return {
+        "items": [e.model_dump() for e in normalized],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 @router.get("/events/{event_id}")
@@ -972,6 +1509,7 @@ async def create_event(req: CreateEventRequest):
         created_at=format_utc_instant_z(shanghai_time_to_utc_naive(now_shanghai)),
         trigger_keywords=json.dumps(keywords, ensure_ascii=False),
         categories=json.dumps(categories, ensure_ascii=False),
+        meta_json=json.dumps(req.meta_json, ensure_ascii=False) if req.meta_json is not None else None,
     )
     event_id = await _db.insert_event(event)
     upsert_event_vector = getattr(_memory_store, "upsert_event_vector", None)
@@ -981,6 +1519,10 @@ async def create_event(req: CreateEventRequest):
         sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
         if callable(sync_method):
             await sync_method()
+    try:
+        await _state_machine.refresh_related_slowline_from_event_id(int(event_id))
+    except Exception:
+        logger.exception("Failed to refresh slowline after API event create: %s", event_id)
     return {"id": event_id, "message": "Event created"}
 
 
@@ -999,6 +1541,8 @@ async def update_event(event_id: int, req: UpdateEventRequest):
         fields["trigger_keywords"] = json.dumps(req.trigger_keywords, ensure_ascii=False)
     if req.categories is not None:
         fields["categories"] = json.dumps(req.categories, ensure_ascii=False)
+    if req.meta_json is not None:
+        fields["meta_json"] = json.dumps(req.meta_json, ensure_ascii=False)
     if req.archived is not None:
         fields["archived"] = req.archived
     if req.importance_score is not None:
@@ -1061,6 +1605,10 @@ async def update_event(event_id: int, req: UpdateEventRequest):
             sync_method = getattr(_memory_store, "sync_eligible_vectors", None)
             if callable(sync_method):
                 await sync_method()
+        try:
+            await _state_machine.refresh_related_slowline_from_event_id(int(event_id))
+        except Exception:
+            logger.exception("Failed to refresh slowline after API event update: %s", event_id)
     return {"message": "Event updated"}
 
 
@@ -1072,6 +1620,48 @@ async def delete_event(event_id: int):
     await _db.delete_event(event_id)
     await _memory_store.delete(f"event_{event_id}")
     return {"message": "Event deleted"}
+
+
+@router.post("/events/delete-by-score")
+async def delete_events_by_score(req: DeleteEventsByScoreRequest = Body(...)):
+    total = await _db.count_events(
+        include_archived=req.include_archived,
+        categories=req.categories,
+        sources=req.sources,
+        scored_only=req.scored_only,
+        min_importance_score=req.min_importance_score,
+        max_importance_score=req.max_importance_score,
+        min_impression_depth=req.min_impression_depth,
+        max_impression_depth=req.max_impression_depth,
+    )
+    events = await _db.get_all_events(
+        offset=0,
+        limit=max(total, 1),
+        include_archived=req.include_archived,
+        categories=req.categories,
+        sources=req.sources,
+        scored_only=req.scored_only,
+        min_importance_score=req.min_importance_score,
+        max_importance_score=req.max_importance_score,
+        min_impression_depth=req.min_impression_depth,
+        max_impression_depth=req.max_impression_depth,
+    )
+    deleted = await _db.delete_events_by_filters(
+        include_archived=req.include_archived,
+        categories=req.categories,
+        sources=req.sources,
+        scored_only=req.scored_only,
+        min_importance_score=req.min_importance_score,
+        max_importance_score=req.max_importance_score,
+        min_impression_depth=req.min_impression_depth,
+        max_impression_depth=req.max_impression_depth,
+    )
+    for event in events:
+        try:
+            await _memory_store.delete(f"event_{int(event.id)}")
+        except Exception:
+            continue
+    return {"deleted": deleted, "message": f"Deleted {deleted} events"}
 
 
 # ── Keyword search ──
@@ -1635,11 +2225,16 @@ async def bulk_import(req: BulkImportRequest):
                 embedding_vector_id=item.get("embedding_vector_id"),
                 trigger_keywords=json.dumps(keywords, ensure_ascii=False),
                 categories=json.dumps(categories, ensure_ascii=False),
+                meta_json=json.dumps(item.get("meta_json"), ensure_ascii=False) if isinstance(item.get("meta_json"), dict) else item.get("meta_json"),
                 archived=_to_int_flag(item.get("archived"), 0),
                 importance_score=item.get("importance_score"),
                 impression_depth=item.get("impression_depth"),
             )
-            await _db.insert_event(event)
+            event_id = await _db.insert_event(event)
+            try:
+                await _state_machine.refresh_related_slowline_from_event_id(int(event_id))
+            except Exception:
+                logger.exception("Failed to refresh slowline after imported event: %s", event_id)
             result["events"]["imported"] += 1
         except Exception as exc:
             result["events"]["errors"].append(f"index={idx}: {exc}")
@@ -1647,16 +2242,26 @@ async def bulk_import(req: BulkImportRequest):
     # 4) Key Records
     for idx, item in enumerate(req.key_records or []):
         try:
-            record_type = str(item.get("type") or "").strip()
+            record_type = _normalize_key_record_type_value(item.get("type"))
             title = str(item.get("title") or "").strip()
             content_text = str(item.get("content_text") or "").strip()
-            if record_type not in {"important_date", "important_item", "key_collaboration", "medical_advice"}:
+            if not record_type:
+                record_type = _state_machine._classify_key_record_type(
+                    title=title,
+                    content_text=content_text,
+                    tags=_parse_json_list(item.get("tags")),
+                    content_json=item.get("content_json") if isinstance(item.get("content_json"), dict) else None,
+                    start_date=item.get("start_date"),
+                    end_date=item.get("end_date"),
+                )
+            if record_type not in KEY_RECORD_TYPES:
                 result["key_records"]["skipped"] += 1
                 continue
             if not title or not content_text:
                 result["key_records"]["skipped"] += 1
                 continue
             tags_text = _to_json_array_text(item.get("tags"))
+            match_keywords_raw = _parse_json_list(item.get("match_keywords"))
             content_json = item.get("content_json")
             if isinstance(content_json, str):
                 content_json_text = content_json
@@ -1664,6 +2269,7 @@ async def bulk_import(req: BulkImportRequest):
                 content_json_text = None
             else:
                 content_json_text = json.dumps(content_json, ensure_ascii=False)
+            match_keywords = match_keywords_raw
             status = str(item.get("status") or "active")
             if status not in {"active", "archived"}:
                 status = "active"
@@ -1679,12 +2285,20 @@ async def bulk_import(req: BulkImportRequest):
                         content_text=content_text,
                         content_json=content_json_text,
                         tags=tags_text,
+                        match_keywords=json.dumps(match_keywords, ensure_ascii=False),
                         start_date=item.get("start_date"),
                         end_date=item.get("end_date"),
                         status=status,
                         source=source,
                         linked_event_id=item.get("linked_event_id"),
                     )
+                    upsert_method = getattr(_memory_store, "upsert_key_record_vector", None)
+                    if callable(upsert_method):
+                        await upsert_method(int(existing.id))
+                    try:
+                        await _state_machine.refresh_related_slowline_from_key_record_id(int(existing.id), previous_record=existing)
+                    except Exception:
+                        logger.exception("Failed to refresh slowline after imported key record update: %s", existing.id)
                     result["key_records"]["updated"] += 1
                     continue
 
@@ -1694,6 +2308,7 @@ async def bulk_import(req: BulkImportRequest):
                 content_text=content_text,
                 content_json=content_json_text,
                 tags=tags_text,
+                match_keywords=json.dumps(match_keywords, ensure_ascii=False),
                 start_date=item.get("start_date"),
                 end_date=item.get("end_date"),
                 status=status,  # type: ignore[arg-type]
@@ -1702,7 +2317,11 @@ async def bulk_import(req: BulkImportRequest):
                 created_at=str(item.get("created_at") or now_iso),
                 updated_at=str(item.get("updated_at") or now_iso),
             )
-            await _db.insert_key_record(record)
+            record_id = await _db.insert_key_record(record)
+            try:
+                await _state_machine.refresh_related_slowline_from_key_record_id(int(record_id))
+            except Exception:
+                logger.exception("Failed to refresh slowline after imported key record create: %s", record_id)
             result["key_records"]["created"] += 1
         except Exception as exc:
             result["key_records"]["errors"].append(f"index={idx}: {exc}")

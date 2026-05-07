@@ -1,4 +1,4 @@
-"""Kelsey State Machine — FastAPI + MCP Server entry point."""
+"""Kelsey State Machine FastAPI entry point."""
 
 from __future__ import annotations
 
@@ -26,15 +26,17 @@ from server.prompts import PromptManager, DEFAULT_SETTINGS
 from server.state_machine import StateMachine
 from server.evolution import EvolutionEngine
 from server.automation_engine import AutomationEngine
+from server.npc_engine import NPCEngine
+from server.plan_engine import PlanEngine
 from server.mcp_tools import mcp, set_state_machine, set_evolution_engine
 from server.api_routes import router as api_router, set_dependencies
 
-# 与 time_display 一致：固定 UTC+8，避免 Windows 缺 tzdata 时 ZoneInfo 失败。
+# Keep logs in UTC+8 to match application-facing time displays.
 _CST = timezone(timedelta(hours=8))
 
 
 class _ShanghaiLogFormatter(logging.Formatter):
-    """日志行首 asctime 使用东八区，与业务字段一致。"""
+    """Format log timestamps in UTC+8."""
 
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone(_CST)
@@ -57,7 +59,7 @@ config = load_config()
 
 
 def _scheduler_tick_log_summary(result: dict) -> str:
-    """单行摘要，避免 idle/disabled 在默认 INFO 下完全不可见。"""
+    """Build a one-line scheduler summary for INFO logs."""
     status = str(result.get("status") or "")
     reason = str(result.get("reason") or "")
     parts = [f"status={status}"]
@@ -71,6 +73,10 @@ def _scheduler_tick_log_summary(result: dict) -> str:
         parts.append(f"latest_cst={result.get('latest_snapshot_cst')}")
     if result.get("now_cst"):
         parts.append(f"now_cst={result.get('now_cst')}")
+    if result.get("resume_at_cst"):
+        parts.append(f"resume_at={result.get('resume_at_cst')}")
+    if result.get("last_auto_snapshot_cst"):
+        parts.append(f"last_auto_cst={result.get('last_auto_snapshot_cst')}")
     if "raw_lag_hours" in result:
         parts.append(f"raw_lag_h={result.get('raw_lag_hours')}")
     if "interval_sec" in result:
@@ -79,6 +85,7 @@ def _scheduler_tick_log_summary(result: dict) -> str:
     if n_gen or status == "advanced":
         parts.append(f"generated={n_gen}")
     return " ".join(parts)
+
 
 
 async def _snapshot_scheduler_loop(state_machine: StateMachine):
@@ -107,6 +114,45 @@ async def _snapshot_scheduler_loop(state_machine: StateMachine):
             raise
         except Exception:
             logger.exception("Snapshot scheduler loop failed.")
+        await asyncio.sleep(max(5, int(interval_sec)))
+
+
+async def _life_scheduler_loop(
+    state_machine: StateMachine,
+    plan_engine: PlanEngine,
+):
+    first = True
+    while True:
+        interval_sec = 60
+        try:
+            interval_sec = await state_machine.get_snapshot_scheduler_interval_seconds()
+            if first:
+                logger.info(
+                    "Life scheduler loop running (interval_sec=%s).",
+                    interval_sec,
+                )
+                first = False
+            if await plan_engine.is_enabled():
+                await plan_engine.ensure_today_plan()
+                current_item = await plan_engine.get_current_item()
+                if current_item is not None:
+                    await plan_engine.execute_item(current_item)
+            result = await state_machine.run_snapshot_scheduler_tick()
+            if await plan_engine.is_enabled():
+                await plan_engine.maybe_replan_on_drift()
+            status = str(result.get("status") or "")
+            if status == "advanced":
+                logger.info(
+                    "Life scheduler tick: %s | %s",
+                    _scheduler_tick_log_summary(result),
+                    json.dumps(result, ensure_ascii=False),
+                )
+            else:
+                logger.info("Life scheduler tick: %s", _scheduler_tick_log_summary(result))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Life scheduler loop failed.")
         await asyncio.sleep(max(5, int(interval_sec)))
 
 
@@ -146,6 +192,9 @@ async def lifespan(app: FastAPI):
         snapshot_llm=snapshot_llm,
         automation_engine=automation_engine,
     )
+    npc_engine = NPCEngine(db, llm, prompt_manager)
+    plan_engine = PlanEngine(db, llm, prompt_manager, sm, npc_engine)
+    sm.set_plan_engine(plan_engine)
 
     set_state_machine(sm)
     set_evolution_engine(evolution_engine)
@@ -158,12 +207,14 @@ async def lifespan(app: FastAPI):
         llm_client=llm,
         env_llm_client=env_llm,
         snapshot_llm_client=snapshot_llm,
+        plan_engine=plan_engine,
+        npc_engine=npc_engine,
     )
 
     # streamable_http_app() is mounted below; its Starlette lifespan is not run when nested
     # under FastAPI, so we must start the session manager here or Streamable HTTP returns 500.
     async with mcp.session_manager.run():
-        scheduler_task = asyncio.create_task(_snapshot_scheduler_loop(sm))
+        scheduler_task = asyncio.create_task(_life_scheduler_loop(sm, plan_engine))
         logger.info("State machine ready. MCP tools registered.")
         try:
             yield
@@ -184,7 +235,7 @@ app = FastAPI(title="Kelsey State Machine", lifespan=lifespan)
 
 @app.middleware("http")
 async def log_unhandled_request_exceptions(request: Request, call_next):
-    """未捕获异常时打出完整 traceback（uvicorn 的 ASGI 日志有时只有一行）。"""
+    """Log unhandled request exceptions with a full traceback."""
     try:
         return await call_next(request)
     except Exception:
@@ -221,7 +272,7 @@ if web_dir.exists():
 
 @app.get("/favicon.ico")
 async def serve_favicon_ico():
-    """部分浏览器会默认请求 /favicon.ico；与页面 link rel=icon 指向同一吉祥物图。"""
+    """Return a lightweight favicon response if a browser asks for one."""
     path = web_dir / "favicon.jpg"
     if not path.exists():
         raise HTTPException(status_code=404)
@@ -313,6 +364,25 @@ async def serve_environment_manage():
     if page.exists():
         return FileResponse(str(page))
     return {"message": "Environment management page not found."}
+
+
+@app.get("/schedule")
+async def serve_schedule():
+    page = Path(__file__).parent.parent / "web" / "schedule.html"
+    if page.exists():
+        return FileResponse(
+            str(page),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return {"message": "Schedule page not found."}
+
+
+@app.get("/npcs")
+async def serve_npcs():
+    page = Path(__file__).parent.parent / "web" / "npcs.html"
+    if page.exists():
+        return FileResponse(str(page))
+    return {"message": "NPC page not found."}
 
 
 if __name__ == "__main__":

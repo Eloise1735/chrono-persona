@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
+  <title>凯尔希状态机 - 日程表</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260409b">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/schedule" class="active">日程表</a>
+    <a href="/npcs">NPC 管理</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="action-bar">
+      <button class="btn btn-primary" onclick="generateTodayPlan()">生成今日计划</button>
+      <button class="btn" onclick="manualReplan()">手动重规划</button>
+      <button class="btn" onclick="loadSchedulePage()">刷新</button>
+    </div>
+
+    <div class="card">
+      <h2>重规划测试</h2>
+      <div class="form-group">
+        <label for="manual-replan-context">手动重规划上下文</label>
+        <textarea id="manual-replan-context" placeholder="例如：下午临时插入一项高优先级外勤协调任务，需压缩 17:00 之后的部分安排，但不应改动上午已完成事项。">下午临时插入一项高优先级外勤协调任务，需压缩 17:00 之后的部分安排，但不应改动上午已完成事项。</textarea>
+      </div>
+      <div class="list-meta">点击“手动重规划”时会把这里的上下文传给后端，便于测试局部改动与 merge 效果。</div>
+    </div>
+
+    <div class="card">
+      <h2>今日计划</h2>
+      <div id="schedule-summary"><div class="loading">加载中...</div></div>
+      <div style="margin-top:16px;">
+        <div class="btn-group" style="margin-bottom:10px;">
+          <button class="btn btn-primary" onclick="saveCurrentPlanBulkEditor()">保存完整日程</button>
+          <button class="btn" onclick="resetCurrentPlanBulkEditor()">重置为当前内容</button>
+        </div>
+        <div class="form-group">
+          <label for="schedule-bulk-editor">完整日程编辑器（JSON）</label>
+          <textarea id="schedule-bulk-editor" style="min-height:320px;" placeholder='{"items":[...]}'></textarea>
+        </div>
+        <div class="list-meta">支持直接编辑当前整份计划；保存后会同步刷新上方完整日程和时间轴。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>计划历史</h2>
+      <div class="btn-group" style="margin-bottom:12px;">
+        <button class="btn" id="schedule-history-toggle-manage-btn" onclick="toggleScheduleHistoryManageMode()">开启选择管理</button>
+        <button class="btn" onclick="selectAllScheduleHistory()">全选当前列表</button>
+        <button class="btn" onclick="clearScheduleHistorySelection()">清空勾选</button>
+        <button class="btn btn-danger" onclick="deleteSelectedScheduleHistory()">删除勾选</button>
+        <button class="btn" onclick="setScheduleHistoryExpanded(false)">一键折叠</button>
+        <button class="btn" onclick="setScheduleHistoryExpanded(true)">全部展开</button>
+        <button class="btn" onclick="loadPlanHistory()">刷新历史</button>
+      </div>
+      <div id="schedule-history-selection-summary" class="list-meta" style="margin-bottom:10px;">管理模式未开启</div>
+      <div id="schedule-history"><div class="loading">加载中...</div></div>
+    </div>
+
+    <div class="card">
+      <h2>时间轴</h2>
+      <div id="schedule-timeline"><div class="loading">加载中...</div></div>
+    </div>
+
+    <div class="card">
+      <h2>计划项详情 / 编辑</h2>
+      <div id="schedule-item-editor"><div class="empty">点击某个计划项后可在此编辑。</div></div>
+    </div>
+
+    <div class="card">
+      <h2>主动消息</h2>
+      <div class="btn-group" style="margin-bottom:12px;">
+        <button class="btn" onclick="loadNotificationsForSchedule()">未读</button>
+        <button class="btn" onclick="loadNotificationHistory()">历史</button>
+      </div>
+      <div id="notification-list"><div class="loading">加载中...</div></div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+  <script src="/static/app.js?v=20260409d"></script>
+  <script src="/static/schedule-page.js?v=20260506a"></script>
+  <script>initSchedulePage();</script>
+</body>
+</html>

@@ -31,6 +31,8 @@ python -m server.main
 - Web 管理面板: http://localhost:8000
 - 历史记录: http://localhost:8000/history
 - 关键记录: http://localhost:8000/key-records
+- 日程表: http://localhost:8000/schedule
+- NPC 管理: http://localhost:8000/npcs
 - MCP SSE 端点: http://localhost:8000/mcp/sse
 - REST API: http://localhost:8000/api/
 - 向量管理: http://localhost:8000/vectors
@@ -117,6 +119,19 @@ python -m server.main
 | POST | `/api/memories/search` | 测试 recall_memories |
 | POST | `/api/review/periodic` | 生成阶段性回顾（可自定义起止日期） |
 | POST | `/api/import/bulk` | 一键批量导入（settings/snapshots/events/key_records） |
+| GET | `/api/plans/today` | 今日计划与计划项 |
+| GET | `/api/plans/history` | 历史计划列表 |
+| GET | `/api/plans/{id}` | 某个计划详情 |
+| PUT | `/api/plans/items/{id}` | 编辑计划项 |
+| POST | `/api/plans/generate` | 手动生成计划 |
+| POST | `/api/plans/replan` | 手动触发重规划 |
+| GET | `/api/npcs` | NPC 列表 |
+| GET | `/api/npcs/{id}` | NPC 详情 |
+| POST | `/api/npcs` | 创建 NPC |
+| PUT | `/api/npcs/{id}` | 更新 NPC |
+| GET | `/api/notifications` | 通知列表（支持 status） |
+| GET | `/api/notifications/history` | 通知历史 |
+| POST | `/api/notifications/{id}/read` | 标记通知已读 |
 
 ## 配置项说明
 
@@ -157,3 +172,28 @@ memory_store:
 - 自动化报告包含本次完整流程的 LLM Token 统计（输入/输出/总计/请求次数）
 - 仪表盘新增可折叠“Token 汇总”卡片，展示今日/本周/累计 Token 与请求数
 - Token 汇总卡片支持按模型单价进行成本估算，并展示模型成本拆分（按 USD / 1M tokens 计）
+
+## 自主生活系统
+
+项目现已支持计划驱动的自主生活循环：
+
+- `PlanEngine`：生成每日计划、执行计划项、在对话或重大事件后重规划
+- `NPCEngine`：维护 NPC 实体并推演互动影响
+- `character_notifications`：角色主动给用户发送的消息队列
+- `web_search`：计划项中的联网搜索能力，当前优先兼容 Tavily
+
+网络搜索配置走运行时设置，不在 `config.yaml` 中：
+
+- `plan_web_search_enabled`
+- `plan_web_search_api_base`
+- `plan_web_search_api_key`
+
+如果使用 Tavily，推荐填：
+
+- `plan_web_search_enabled = true`
+- `plan_web_search_api_base = https://api.tavily.com/search`
+- `plan_web_search_api_key = <你的 Tavily Key>`
+
+## 测试指南
+
+完整测试步骤见 `TEST_GUIDE_AUTONOMOUS_LIFE.md`。

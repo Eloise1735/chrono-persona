@@ -4,19 +4,23 @@ Tools:
   - get_current_state: Called at conversation start
   - summarize_conversation: Called before conversation end reflection
   - reflect_on_conversation: Called at conversation end
-  - recall_memories: Called during conversation for memory retrieval
+  - recall_memories: Called proactively during conversation for memory retrieval
   - upsert_event: Store narrative events during conversation
-  - upsert_key_record: Store structured key records during conversation
-  - recall_key_records: Retrieve structured key records during conversation
+  - upsert_key_record: Store structured key records during conversation, defaulting to automatic classification into the new 10-type taxonomy
+  - recall_key_records: Called proactively during conversation for structured record retrieval
 
-Recommended tool policy:
-  1) If user asks about medication advice, collaborative plans, anniversaries, gifts,
-     or previously agreed actionable details, call recall_key_records first.
-  2) If conversation produces a narrative event worth keeping in timeline memory,
-     call upsert_event to persist it in event history.
-  3) If conversation produces new actionable structured info (tables/checklists/instructions),
-     call upsert_key_record to persist it.
-  4) Event anchors are narrative timeline memory; key records are precise executable memory.
+Proactive memory policy — call recall tools on your own initiative, do not wait for the user to ask:
+  1) When the conversation touches a person, place, object, date, or event that may have a history,
+     call recall_memories BEFORE responding, so your reply can naturally reference or connect to the past.
+  2) When the conversation involves medications, plans, anniversaries, gifts, or any previously agreed
+     actionable details, call recall_key_records FIRST to retrieve the relevant structured facts.
+  3) When an emotion, situation, or topic the user describes reminds you of something — even vaguely —
+     call recall_memories to check whether there is a relevant past event or state snapshot.
+  4) Do NOT wait for the user to say "do you remember" or "we talked about this before".
+     Proactive recall is what makes memory feel alive.
+  5) If conversation produces a narrative event worth keeping, call upsert_event.
+  6) If conversation produces new structured actionable info, call upsert_key_record. Prefer leaving record_type as auto unless you are certain.
+  7) Event anchors are narrative timeline memory; key records are precise executable memory.
 """
 
 from __future__ import annotations
@@ -67,7 +71,9 @@ async def get_current_state(current_time: str, last_interaction_time: str | None
         last_interaction_time: 兼容旧调用保留，可不传；实际推进不依赖该值
 
     Returns:
-        可直接注入会话上下文的文本块，顺序为：L1 -> L2 -> 当前状态快照
+        可直接注入会话上下文的文本块，顺序为：L1 -> L2 -> 当前状态快照。
+        注意：在整个对话过程中，遇到任何与过往经历、事件、约定、人物相关的话题，
+        应主动调用 recall_memories 或 recall_key_records——不要等对方开口询问。
     """
     if _state_machine is None:
         return "错误：状态机未初始化"
@@ -92,6 +98,14 @@ async def get_current_state(current_time: str, last_interaction_time: str | None
         raise
     if _evolution_engine is None:
         tracer.finish_ok(evolution_check="skipped")
+        notifications = await _state_machine.db.list_character_notifications(status="pending", limit=10)
+        if notifications:
+            await _mark_notifications_delivered(notifications)
+            return (
+                f"{result}\n\n"
+                "[角色主动消息]\n"
+                + "\n".join(f"- {item.message_text}" for item in notifications)
+            )
         return result
     pending = await tracer.run("evolution.get_pending_preview", _evolution_engine.get_pending_preview())
     if pending:
@@ -121,7 +135,26 @@ async def get_current_state(current_time: str, last_interaction_time: str | None
         evolution_check="not_due",
         pending_event_count=int(status.get("event_count") or 0),
     )
+    notifications = await _state_machine.db.list_character_notifications(status="pending", limit=10)
+    if notifications:
+        await _mark_notifications_delivered(notifications)
+        result = (
+            f"{result}\n\n"
+            "[角色主动消息]\n"
+            + "\n".join(f"- {item.message_text}" for item in notifications)
+        )
     return result
+
+
+async def _mark_notifications_delivered(notifications) -> None:
+    for item in notifications:
+        if item.id is None:
+            continue
+        await _state_machine.db.update_character_notification(
+            int(item.id),
+            status="delivered",
+            delivered_at=item.delivered_at or __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        )
 
 
 @mcp.tool()
@@ -164,14 +197,35 @@ async def reflect_on_conversation(conversation_summary: str) -> str:
 
 @mcp.tool()
 async def recall_memories(query: str, top_k: int = 5) -> str:
-    """对话过程中调用。搜索凯尔希的过往记忆（事件锚点和历史快照）。
+    """对话中主动调用。搜索凯尔希的过往记忆（事件锚点 + 历史状态快照）。
+
+    【何时调用——不要等对方先开口，以下情形应主动检索】
+    - 对话提及任何人名、地名、物品、活动，且你觉得过去可能有相关经历
+    - 对方描述的情绪、处境、困境让你联想到过去某个相似的时刻
+    - 对话出现时间词（"上次"、"之前"、"那天"、某个日期、节气节日）
+    - 你想用过往经历来回应当前话题——安慰、举例、对比、延续某个未竟的话题
+    - 对话触及你们之间的共同经历、默契、旧约或习惯，哪怕对方只是侧面提及
+    - 你自己有一种"这件事好像和什么有关"的模糊感，不确定时也应该调用来确认
+
+    【不要做的事】
+    - 不要等对方说"你还记得吗"、"我们之前聊过"才调用——那是被动响应，不是记忆
+    - 不要因为"可能没有记录"就放弃调用——宁可调用后发现空结果，也不要遗漏真实的记忆关联
+
+    【如何构造 query】
+    - 用 2-4 个关键词组合，覆盖人物 + 事件 + 情感多个维度，空格分隔
+    - 例：对话提到"最近睡眠不太好" → query: "睡眠 失眠 休息 身体状态"
+    - 例：对方提起某次出行 → query: 地名 + 交通方式 + 同行人名
+    - 例：对话中的情绪词"委屈""疲惫""兴奋" → 可直接加入 query 捕捉情感相似的历史片段
+
+    【调用频率】
+    一次正常对话中，1-3 次是合理的。跟随话题流转，遇到关联点就调用。
 
     Args:
-        query: 搜索关键词或描述
+        query: 搜索关键词或描述（建议 2-4 个词，空格分隔）
         top_k: 返回的最大结果数量
 
     Returns:
-        相关记忆条目列表（JSON格式）
+        相关记忆条目列表（JSON格式），含事件锚点与历史快照
     """
     if _state_machine is None:
         return "错误：状态机未初始化"
@@ -183,9 +237,9 @@ async def recall_memories(query: str, top_k: int = 5) -> str:
 
 @mcp.tool()
 async def upsert_key_record(
-    record_type: str,
     title: str,
     content_text: str,
+    record_type: str = "auto",
     tags: list[str] | None = None,
     content_json: str | None = None,
     start_date: str | None = None,
@@ -197,7 +251,9 @@ async def upsert_key_record(
     """对话过程中调用。仅写入「关键记录」表（不修改世界书/事件锚点）。
 
     Args:
-        record_type: 记录类型。可选 important_date / important_item / key_collaboration / medical_advice
+        record_type: 记录类型。可选 auto（默认）或 medication_protocol / health_monitoring /
+            dietary_intervention / anniversary_date / medical_review_date / lifecycle_milestone /
+            key_collaboration / commitment_agreement / emotional_anchor / life_pattern
         title: 记录标题（建议简短明确）
         content_text: 记录正文（可包含表格文本）
         tags: 标签列表（可选）
@@ -225,7 +281,7 @@ async def upsert_key_record(
         except json.JSONDecodeError:
             parsed_json = {"raw": content_json}
     result = await _state_machine.upsert_key_record(
-        record_type=record_type,
+        record_type=record_type if str(record_type or "").strip().lower() != "auto" else None,
         title=title,
         content_text=content_text,
         tags=tags or [],
@@ -292,27 +348,39 @@ async def recall_key_records(
     include_archived: bool = False,
     include_world_books: bool = True,
 ) -> str:
-    """对话过程中调用。检索结构化关键记录；可选合并世界书（关键词匹配 + 已向量化时的向量相似度）。
+    """对话中主动调用。检索结构化关键记录（用药方案、重要日期、协作计划、信物等），可选合并世界书。
+
+    【何时调用——不要等对方先开口，以下情形应主动检索】
+    - 对话涉及身体状况、病症、药物、治疗方案——先调用查档，不要靠记忆回答
+    - 对方提到纪念日、约定日期、某个"我们说好"的事——调用确认具体细节
+    - 对话中出现信物、礼物、某件有特殊意义的物品
+    - 对方提到某个协作中的任务、进度、分工——调用而不是凭印象说
+    - 你隐约记得有一条关于某事的记录，但不确定细节——调用来确认，不要凭感觉
+    - 话题涉及时间敏感信息（截止日期、下次复诊、周期性安排）
+
+    【与 recall_memories 的分工】
+    - 本工具（recall_key_records）= 精确、可执行的结构化事实：医嘱、计划、日期、物品
+    - recall_memories = 叙事性的时间线记忆：发生过什么、当时的感受
+    - 两者可以连续调用：先用本工具确认事实，再用 recall_memories 找情感叙事背景
+
+    【如何构造 query】
+    - 覆盖标题词 + 实体名词 + 动作词，至少 2-4 个关键词，空格分隔
+    - 例：对话提到药物 → "用药方案 源石 镇痛 华法林"
+    - 例：对话提到某个约定 → "协作计划 约定 [对方名字] [活动名]"
+    - 例：纪念日相关 → "纪念日 周年 [日期关键词] [人名]"
 
     Args:
-        query: 搜索词或描述。建议至少提供2-4个关键词并用空格分隔（例如：用药方案 源石 镇痛 华法林）
-        top_k: 返回条数（关键记录与世界书条目统一排序后截断）
-        record_type: 可选的类型过滤（仅作用于关键记录表）
-        include_archived: 是否包含归档记录
-        include_world_books: 是否并入启用中的世界书检索结果
+        query: 搜索词或描述（建议 2-4 个关键词，空格分隔）
+        top_k: 返回条数（关键记录与世界书统一排序后截断）
+        record_type: 可选类型过滤：medication_protocol / health_monitoring / dietary_intervention /
+            anniversary_date / medical_review_date / lifecycle_milestone / key_collaboration /
+            commitment_agreement / emotional_anchor / life_pattern
+        include_archived: 是否包含归档记录（查历史方案时设为 True）
+        include_world_books: 是否并入世界书（需要设定/背景时保持 True）
 
     Returns:
-        JSON 列表，顺序固定：先关键记录（按 updated_at 新近优先），后世界书（固定至多 3 条，且不超过 top_k）。
-        字段说明：`_memory_tier` 为 `primary`（关键记录）或 `supplementary`（世界书）；`_usage_hint`、`_content_for_prompt`
-        供拼入模型上下文时区分「对话沉淀事实」与「静态设定参考」，避免把世界书当成用户刚说的话。
-
-    调用建议：
-        - 当用户提到病症、药名、纪念日、信物、共同计划等“具体可执行信息”时优先调用本工具。
-        - query 优先使用“多关键词组合”而非单词查询，建议覆盖标题词、实体名词、动作词与正文关键短语。
-        - 需要设定/背景条目的语义或关键词命中时保持 include_world_books=True。
-        - 若命中后仍需时间线叙事，再调用 recall_memories（事件/快照向量库）。
-        - 写入持久化事实请仅用 upsert_key_record，不要试图写入世界书。
-        - 默认先查 active 记录；需要历史方案时再 include_archived=True。
+        JSON 列表，先关键记录后世界书。`_memory_tier` 字段区分 primary（关键记录）与 supplementary（世界书）。
+        `_content_for_prompt` 为推荐直接引用的文本片段。
     """
     if _state_machine is None:
         return "错误：状态机未初始化"

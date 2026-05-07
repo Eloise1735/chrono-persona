@@ -9,6 +9,15 @@ popd
 
 set "WEB_URL="
 set "URL_FILE=%PROJECT_DIR%\deploy\web_url.txt"
+set "PORT=8000"
+
+if exist "%PROJECT_DIR%\config.yaml" (
+    for /f "tokens=1,2 delims=:" %%A in ('findstr /r /c:"^[ ]*port[ ]*:[ ]*[0-9][0-9]*" "%PROJECT_DIR%\config.yaml"') do (
+        set "PORT=%%B"
+    )
+)
+set "PORT=%PORT: =%"
+if "%PORT%"=="" set "PORT=8000"
 
 :: 支持命令行覆盖：
 :: open_web.bat http://47.115.35.155:8000
@@ -30,7 +39,7 @@ if "%WEB_URL%"=="" (
 )
 
 if "%WEB_URL%"=="" (
-    set "WEB_URL=http://127.0.0.1:8000"
+    set "WEB_URL=http://127.0.0.1:%PORT%"
 )
 
 :open

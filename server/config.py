@@ -52,6 +52,15 @@ class CharacterConfig:
 
 
 @dataclass
+class WeChatConfig:
+    enabled: bool = True
+    openclaw_state_dir: str | None = None
+    sync_state_path: str = "./data/wechat_sync_state.json"
+    session_state_path: str = "./data/wechat_sessions.json"
+    max_history_turns: int = 8
+
+
+@dataclass
 class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -59,6 +68,7 @@ class AppConfig:
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     memory_store: MemoryStoreConfig = field(default_factory=MemoryStoreConfig)
     character: CharacterConfig = field(default_factory=CharacterConfig)
+    wechat: WeChatConfig = field(default_factory=WeChatConfig)
 
 
 def _dict_to_dataclass(cls, data: dict):
@@ -107,5 +117,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         cfg.memory_store = _dict_to_dataclass(MemoryStoreConfig, raw["memory_store"])
     if "character" in raw:
         cfg.character = _dict_to_dataclass(CharacterConfig, raw["character"])
+    if "wechat" in raw:
+        cfg.wechat = _dict_to_dataclass(WeChatConfig, raw["wechat"])
 
     return cfg

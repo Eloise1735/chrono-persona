@@ -415,6 +415,22 @@ input[type="checkbox"] {
   overflow-y: auto;
 }
 
+.history-item {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.history-item:last-child {
+  border-bottom: none;
+}
+
+.history-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
 /* ── Guide grid ── */
 .guide-grid {
   display: grid;
@@ -430,7 +446,14 @@ input[type="checkbox"] {
   gap: 16px;
   align-items: start;
 }
-.events-sidebar { position: sticky; top: 56px; }
+.events-sidebar {
+  position: sticky;
+  top: 56px;
+  max-height: calc(100vh - 76px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  padding-right: 12px;
+}
 .category-filter-list {
   display: flex;
   flex-direction: column;
@@ -456,7 +479,11 @@ input[type="checkbox"] {
 .events-main { min-width: 0; }
 @media (max-width: 900px) {
   .events-layout { grid-template-columns: 1fr; }
-  .events-sidebar { position: static; }
+  .events-sidebar {
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+  }
 }
 
 /* ── Search bar ── */
@@ -581,4 +608,3 @@ nav .logo {
 .status-bar {
   border-top-color: var(--border);
 }
-

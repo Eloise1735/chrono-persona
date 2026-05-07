@@ -6,7 +6,7 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
   <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 事件历史</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260326">
+  <link rel="stylesheet" href="/static/style.css?v=20260425">
 </head>
 <body>
   <nav>
@@ -16,6 +16,8 @@
     <a href="/snapshots-history">状态历史</a>
     <a href="/events-history" class="active">事件历史</a>
     <a href="/key-records">关键记录</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs">NPC 管理</a>
     <a href="/settings">设定管理</a>
     <a href="/environment-manage">环境管理</a>
     <a href="/evolution">人格演化</a>
@@ -24,49 +26,100 @@
 
   <div class="container">
     <div class="search-bar">
-      <input type="text" id="search-input" placeholder="搜索标题 / 关键词 / 内容..." onkeydown="if(event.key==='Enter')runSearch()">
+      <input
+        type="text"
+        id="search-input"
+        placeholder="搜索标题 / 关键词 / 内容..."
+        onkeydown="if(event.key==='Enter')runSearch()"
+      >
       <button class="btn btn-primary" onclick="runSearch()">搜索</button>
       <button class="btn" onclick="openAddEventModal()">添加事件</button>
       <label class="checkbox-label">
         <input type="checkbox" id="toggle-archived" onchange="toggleArchivedEvents()">
         显示已归档
       </label>
+      <select id="history-export-format" style="max-width:100px;">
+        <option value="md">MD</option>
+        <option value="json">JSON</option>
+      </select>
+      <button class="btn btn-primary" onclick="exportVisibleHistoryItems()">导出当前列表</button>
     </div>
 
     <div class="events-layout">
       <aside class="events-sidebar card">
-        <h2>分类筛选</h2>
-        <div class="list-meta" style="margin-bottom:10px;">未勾选时显示全部事件。</div>
+        <h2>筛选条件</h2>
+        <div class="list-meta" style="margin-bottom:10px;">未勾选分类时显示全部事件。</div>
+
+        <div class="form-group">
+          <label>来源</label>
+          <select id="event-source-filter" onchange="onEventSourceFilterChange()" style="width:100%;">
+            <option value="">全部来源</option>
+            <option value="generated">generated</option>
+            <option value="conversation">conversation</option>
+            <option value="manual">manual</option>
+          </select>
+        </div>
+
         <div id="event-category-filter" class="category-filter-list"></div>
-        <div style="margin-top:10px;"><button class="btn" style="width:100%;" onclick="clearEventCategoryFilter()">清空筛选</button></div>
+
+        <hr style="margin:14px 0;border:none;border-top:1px solid var(--border-subtle);">
+
+        <h2>评分筛选</h2>
+        <div class="form-group">
+          <label>重要性 ≤</label>
+          <input type="number" id="event-max-importance-filter" min="0" max="10" step="0.1" placeholder="例如 4.5">
+        </div>
+        <div class="form-group">
+          <label>印象深度 ≤</label>
+          <input type="number" id="event-max-impression-filter" min="0" max="10" step="0.1" placeholder="例如 4.0">
+        </div>
+        <label class="checkbox-label" style="margin-bottom:10px;">
+          <input type="checkbox" id="event-scored-only-filter">
+          只看已评分事件
+        </label>
+        <div class="btn-group" style="display:flex;flex-wrap:wrap;gap:8px;">
+          <button class="btn" onclick="applyEventScoreFilter()">应用评分筛选</button>
+          <button class="btn" onclick="clearEventScoreFilter()">清空评分筛选</button>
+        </div>
+
+        <div style="margin-top:10px;">
+          <button class="btn" style="width:100%;" onclick="clearEventCategoryFilter()">清空分类筛选</button>
+        </div>
       </aside>
 
       <section class="events-main">
         <div class="card" style="margin-bottom:14px;">
           <div class="btn-group">
             <button class="btn" id="toggle-manage-btn" onclick="toggleHistoryManageMode()">开启选择管理</button>
-            <button class="btn" onclick="selectAllHistoryItems()">全选</button>
+            <button class="btn" onclick="selectAllHistoryItems()">全选本页</button>
             <button class="btn" onclick="clearHistorySelection()">清空选择</button>
             <button class="btn btn-danger" onclick="deleteSelectedHistoryItems()">删除勾选</button>
-            <select id="history-export-format" style="max-width:100px;">
-              <option value="txt">TXT</option>
-              <option value="md">MD</option>
-              <option value="json">JSON</option>
-            </select>
+            <button class="btn btn-danger" onclick="deleteEventsByCurrentScoreFilter()">删除当前评分筛选结果</button>
             <button class="btn btn-primary" onclick="exportSelectedHistoryItems()">导出勾选</button>
           </div>
           <div class="list-meta" id="history-selection-summary" style="margin-top:8px;">管理模式未开启</div>
         </div>
 
-        <div class="card" style="padding:0"><div id="data-list"><div class="loading">加载中...</div></div></div>
+        <div class="card" style="padding:0">
+          <div id="data-list">
+            <div class="loading">加载中...</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <div class="btn-group">
+            <button class="btn" onclick="goEventsPage(-1)">上一页</button>
+            <button class="btn" onclick="goEventsPage(1)">下一页</button>
+          </div>
+          <div class="list-meta" id="events-pagination-summary" style="margin-top:8px;">分页信息加载中...</div>
+        </div>
       </section>
     </div>
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-  <script src="/static/app.js?v=20260326"></script>
+  <script src="/static/app.js?v=20260505c"></script>
+  <script src="/static/events-page.js?v=20260506a"></script>
   <script>initEventsHistoryPage();</script>
 </body>
 </html>
-
-
