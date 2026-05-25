@@ -6,7 +6,7 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
   <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 设定管理</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260326">
+  <link rel="stylesheet" href="/static/style.css?v=20260512-nav">
 </head>
 <body>
   <nav>
@@ -16,9 +16,13 @@
     <a href="/snapshots-history">状态历史</a>
     <a href="/events-history">事件历史</a>
     <a href="/key-records">关键记录</a>
+    <a href="/world-books">世界书</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs">NPC 管理</a>
     <a href="/settings" class="active">设定管理</a>
     <a href="/environment-manage">环境管理</a>
     <a href="/evolution">人格演化</a>
+    <a href="/ob">OB 记忆</a>
     <a href="/vectors">向量管理</a>
   </nav>
 
@@ -56,13 +60,10 @@
         <h2>Prompt 模板</h2>
         <div class="grid-2">
           <div class="form-group"><div class="label-row"><label>prompt_snapshot_generation</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_snapshot_generation')">填入默认</button></div><textarea id="setting-prompt_snapshot_generation"></textarea></div>
-          <div class="form-group"><div class="label-row"><label>prompt_event_anchor</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_event_anchor')">填入默认</button></div><textarea id="setting-prompt_event_anchor"></textarea></div>
           <div class="form-group"><div class="label-row"><label>prompt_reflect_snapshot</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_reflect_snapshot')">填入默认</button></div><textarea id="setting-prompt_reflect_snapshot"></textarea></div>
-          <div class="form-group"><div class="label-row"><label>prompt_reflect_event</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_reflect_event')">填入默认</button></div><textarea id="setting-prompt_reflect_event"></textarea></div>
           <div class="form-group"><div class="label-row"><label>prompt_conversation_summary</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_conversation_summary')">填入默认</button></div><textarea id="setting-prompt_conversation_summary"></textarea></div>
           <div class="form-group"><div class="label-row"><label>prompt_periodic_review</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_periodic_review')">填入默认</button></div><textarea id="setting-prompt_periodic_review"></textarea></div>
           <div class="form-group"><div class="label-row"><label>prompt_evolution_summary</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_evolution_summary')">填入默认</button></div><textarea id="setting-prompt_evolution_summary"></textarea></div>
-          <div class="form-group"><div class="label-row"><label>prompt_event_scoring</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_event_scoring')">填入默认</button></div><textarea id="setting-prompt_event_scoring"></textarea></div>
           <div class="form-group"><div class="label-row"><label>prompt_environment_generation</label><button type="button" class="btn btn-mini" onclick="applyPromptDefault('prompt_environment_generation')">填入默认</button></div><textarea id="setting-prompt_environment_generation"></textarea></div>
         </div>
       </div>
@@ -80,7 +81,6 @@
         <h2>运行参数</h2>
         <div class="grid-3">
           <div class="form-group"><label>min_time_unit_hours（小时）</label><input type="text" id="setting-min_time_unit_hours" placeholder="例如 8、0.5、8h、8小时"></div>
-          <div class="form-group"><label>inject_hot_events_limit</label><input type="text" id="setting-inject_hot_events_limit"></div>
           <div class="form-group"><label>vector_embedding_dim</label><input type="text" id="setting-vector_embedding_dim"></div>
           <div class="form-group"><label>vector_sync_batch_size</label><input type="text" id="setting-vector_sync_batch_size"></div>
           <div class="form-group"><label>vector_snapshot_days_threshold</label><input type="text" id="setting-vector_snapshot_days_threshold"></div>
@@ -161,7 +161,7 @@
 
       <div class="card">
         <h2>快照与评分专用 LLM</h2>
-        <div class="list-meta">用于快照生成、事件评分等流程。未启用时自动回退主 LLM。</div>
+        <div class="list-meta">用于快照生成等后台流程。未启用时自动回退主 LLM。</div>
         <div class="grid-2">
           <div class="form-group">
             <label>启用开关</label>
@@ -219,5 +219,3 @@
   <script>loadSettingsPage();</script>
 </body>
 </html>
-
-

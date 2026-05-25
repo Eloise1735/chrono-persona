@@ -6,7 +6,7 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
   <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 环境管理</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260327">
+  <link rel="stylesheet" href="/static/style.css?v=20260512-nav">
 </head>
 <body>
   <nav>
@@ -16,16 +16,20 @@
     <a href="/snapshots-history">状态历史</a>
     <a href="/events-history">事件历史</a>
     <a href="/key-records">关键记录</a>
+    <a href="/world-books">世界书</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs">NPC 管理</a>
     <a href="/settings">设定管理</a>
     <a href="/environment-manage" class="active">环境管理</a>
     <a href="/evolution">人格演化</a>
+    <a href="/ob">OB 记忆</a>
     <a href="/vectors">向量管理</a>
   </nav>
 
   <div class="container">
     <div class="tabs" id="environment-manage-tabs">
       <div class="tab active" data-tab="history" onclick="switchEnvironmentManageTab('history')">环境历史</div>
-      <div class="tab" data-tab="world-books" onclick="switchEnvironmentManageTab('world-books')">世界书</div>
+      <a class="tab" href="/world-books">世界书管理</a>
     </div>
 
     <div id="environment-manage-tab-history">
@@ -46,27 +50,6 @@
       </div>
       <div class="card" style="padding:0">
         <div id="environment-history-list"><div class="loading">加载中...</div></div>
-      </div>
-    </div>
-
-    <div id="environment-manage-tab-world-books" style="display:none;">
-      <div class="card">
-        <div class="btn-group" style="flex-wrap:wrap;align-items:center;gap:8px">
-          <button class="btn btn-primary" onclick="openCreateWorldBookModal()">新增条目</button>
-          <button type="button" class="btn" onclick="document.getElementById('world-book-json-import-input')?.click()">批量导入 JSON</button>
-          <input type="file" id="world-book-json-import-input" accept=".json,application/json" style="display:none" aria-hidden="true">
-          <label class="checkbox-label" style="margin:0">
-            <input type="checkbox" id="world-book-import-skip-disabled" checked>
-            跳过酒馆中已禁用的条目
-          </label>
-          <button class="btn" onclick="loadWorldBooks()">刷新</button>
-          <button class="btn" onclick="autoFillWorldBookMeta()">自动补标题/关键词</button>
-          <button class="btn" onclick="syncWorldBookVectors()">向量化全部启用条目</button>
-        </div>
-        <div class="list-meta" style="margin-top:8px">支持 SillyTavern（酒馆）导出的世界书 JSON（含 <code>entries</code> 对象）；也支持本页导出的条目数组或单条对象。导入条目会打上「酒馆导入」或「JSON导入」标签便于区分。</div>
-      </div>
-      <div class="card" style="padding:0">
-        <div id="world-book-list"><div class="loading">加载中...</div></div>
       </div>
     </div>
 

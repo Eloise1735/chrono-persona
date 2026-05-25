@@ -71,6 +71,7 @@ class EventAnchor(BaseModel):
     embedding_vector_id: str | None = None
     trigger_keywords: str = "[]"
     categories: str = "[]"
+    meta_json: str | None = None
     archived: int = 0
     importance_score: float | None = None
     impression_depth: float | None = None
@@ -97,11 +98,13 @@ class KeyRecord(BaseModel):
     content_text: str = ""
     content_json: str | None = None
     tags: str = "[]"
+    match_keywords: str = "[]"
     start_date: str | None = None
     end_date: str | None = None
     status: Literal["active", "archived"] = "active"
     source: Literal["manual", "conversation", "generated"] = "manual"
     linked_event_id: int | None = None
+    embedding_vector_id: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
@@ -136,7 +139,7 @@ class PlanItem(BaseModel):
     hour_start: int = 0
     hour_end: int = 1
     activity: str = ""
-    action_type: Literal["internal", "message_user", "web_search", "npc_interaction"] = "internal"
+    action_type: Literal["internal", "web_search", "npc_interaction"] = "internal"
     action_payload: str = "{}"
     status: Literal["pending", "executing", "done", "skipped"] = "pending"
     outcome: str = ""
@@ -167,6 +170,46 @@ class LifeFlowTrace(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
+class DisturbancePulse(BaseModel):
+    id: int | None = None
+    occur_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    reveal_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    status: Literal["pending", "injected", "consumed", "suppressed"] = "pending"
+    channel_type: Literal["endogenous_reveal", "external_incident"] = "endogenous_reveal"
+    source_family: Literal[
+        "relationship",
+        "body",
+        "task",
+        "npc",
+        "environment",
+        "device",
+        "public_world",
+    ] = "task"
+    seed_kind: Literal[
+        "event",
+        "key_record",
+        "plan_item",
+        "life_flow",
+        "npc",
+        "conversation_claim",
+        "world_state",
+    ] = "event"
+    seed_ref_id: int | None = None
+    blind_spot_reason: str = ""
+    reveal_channel: str = ""
+    title: str = ""
+    factual_payload_json: str = "{}"
+    impact_hint: str = ""
+    salience: float = 0.5
+    novelty_score: float = 0.5
+    cooldown_until: str | None = None
+    fingerprint: str = ""
+    linked_snapshot_id: int | None = None
+    linked_event_id: int | None = None
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+
+
 class ConversationTimeClaim(BaseModel):
     id: int | None = None
     status: Literal["active", "closed"] = "active"
@@ -176,6 +219,79 @@ class ConversationTimeClaim(BaseModel):
     context_summary: str = ""
     latest_snapshot_id: int | None = None
     closing_snapshot_id: int | None = None
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+
+
+class RelationshipState(BaseModel):
+    id: int | None = None
+    last_meaningful_contact_at: str | None = None
+    hours_since_meaningful_contact: float = 0.0
+    days_since_meaningful_contact: int = 0
+    contact_recency_bucket: Literal["active", "cooling", "distant", "stale"] = "active"
+    connection_need: float = 0.5
+    pride_or_distance: float = 0.5
+    valence: float = 0.5
+    arousal: float = 0.5
+    life_immersion: float = 0.5
+    relationship_feeling_summary: str = ""
+    space_need_level: float = 0.5
+    concern_level: float = 0.5
+    proactive_topics: str = "[]"
+    plan_bias_hint: str = ""
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+
+
+class RelationshipThought(BaseModel):
+    id: int | None = None
+    thought_date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
+    source_snapshot_id: int | None = None
+    source_env_id: str | None = None
+    topic_line: str = ""
+    thought_type: Literal[
+        "say",
+        "ask",
+        "do_if_present",
+        "wait",
+        "doubt",
+        "reconsider",
+        "timing_sensitive",
+        "mood_dependent",
+    ] = "reconsider"
+    content: str = ""
+    salience: float = 0.5
+    dedupe_fingerprint: str = ""
+    resolution_status: Literal["open", "cooled", "superseded"] = "open"
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+
+
+class SlowLine(BaseModel):
+    id: int | None = None
+    thread_key: str = ""
+    theme: str = ""
+    scope: Literal["user_side", "character_side", "shared"] = "shared"
+    source_family: Literal["health", "study", "work", "relationship", "logistics", "daily_life"] = "daily_life"
+    memory_role: Literal["bridge_core", "active_thread_detail", "trigger_only", "archive_reference"] = "active_thread_detail"
+    progress_status: Literal["open", "advancing", "paused", "ready_to_close", "completed", "dropped"] = "open"
+    tension_level: Literal["low", "medium", "high"] = "medium"
+    unresolved_level: Literal["low", "medium", "high"] = "medium"
+    preload_priority: float = 0.5
+    stage_summary: str = ""
+    trajectory_summary: str = ""
+    current_tension: str = ""
+    recent_shift_summary: str = ""
+    recent_movement_summary: str = ""
+    last_meaningful_shift_at: str | None = None
+    emotional_tension: Literal["stable", "strained", "brittle", "tender", "suspended", "unresolved"] = "stable"
+    affective_direction: Literal["approach", "avoidance", "ambivalence", "endurance", "repair"] = "endurance"
+    open_questions: str = "[]"
+    salience: float = 0.5
+    last_touched_at: str | None = None
+    linked_key_record_ids: str = "[]"
+    linked_event_ids: str = "[]"
+    status: Literal["active", "archived"] = "active"
     created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
@@ -224,6 +340,7 @@ class CreateEventRequest(BaseModel):
     source: Literal["generated", "manual", "conversation"] = "manual"
     trigger_keywords: list[str] = Field(default_factory=list)
     categories: list[str] | None = None
+    meta_json: dict | None = None
 
 
 class UpdateEventRequest(BaseModel):
@@ -231,9 +348,21 @@ class UpdateEventRequest(BaseModel):
     description: str | None = None
     trigger_keywords: list[str] | None = None
     categories: list[str] | None = None
+    meta_json: dict | None = None
     archived: int | None = None
     importance_score: float | None = None
     impression_depth: float | None = None
+
+
+class DeleteEventsByScoreRequest(BaseModel):
+    include_archived: bool = False
+    categories: list[str] = Field(default_factory=list)
+    sources: list[Literal["generated", "manual", "conversation"]] = Field(default_factory=list)
+    scored_only: bool = True
+    min_importance_score: float | None = None
+    max_importance_score: float | None = None
+    min_impression_depth: float | None = None
+    max_impression_depth: float | None = None
 
 
 class CreateKeyRecordRequest(BaseModel):
@@ -253,6 +382,7 @@ class CreateKeyRecordRequest(BaseModel):
     content_text: str
     content_json: dict | None = None
     tags: list[str] = Field(default_factory=list)
+    match_keywords: list[str] = Field(default_factory=list)
     start_date: str | None = None
     end_date: str | None = None
     status: Literal["active", "archived"] = "active"
@@ -277,6 +407,7 @@ class UpdateKeyRecordRequest(BaseModel):
     content_text: str | None = None
     content_json: dict | None = None
     tags: list[str] | None = None
+    match_keywords: list[str] | None = None
     start_date: str | None = None
     end_date: str | None = None
     status: Literal["active", "archived"] | None = None
@@ -304,6 +435,11 @@ class WorldBookAutoMetaRequest(BaseModel):
     item_ids: list[int] = Field(default_factory=list)
     overwrite_title: bool = False
     overwrite_keywords: bool = False
+
+
+class KeyRecordBatchVectorizeRequest(BaseModel):
+    item_ids: list[int] = Field(default_factory=list)
+    include_archived: bool = False
 
 
 class WorldBookJsonImportRequest(BaseModel):
@@ -343,12 +479,29 @@ class UpdatePlanItemRequest(BaseModel):
     hour_start: int | None = None
     hour_end: int | None = None
     activity: str | None = None
-    action_type: Literal["internal", "message_user", "web_search", "npc_interaction"] | None = None
+    action_type: Literal["internal", "web_search", "npc_interaction"] | None = None
     action_payload: dict | None = None
     status: Literal["pending", "executing", "done", "skipped"] | None = None
     outcome: str | None = None
     source_kind: Literal["generated", "routine", "carried_over", "thread", "spontaneous", "replan"] | None = None
     source_ref_id: int | None = None
+
+
+class BulkPlanItemRequest(BaseModel):
+    hour_start: int
+    hour_end: int
+    activity: str
+    action_type: Literal["internal", "web_search", "npc_interaction"] = "internal"
+    action_payload: dict = Field(default_factory=dict)
+    status: Literal["pending", "executing", "done", "skipped"] = "pending"
+    outcome: str = ""
+    source_kind: Literal["generated", "routine", "carried_over", "thread", "spontaneous", "replan"] = "generated"
+    source_ref_id: int | None = None
+    executed_at: str | None = None
+
+
+class BulkUpdatePlanRequest(BaseModel):
+    items: list[BulkPlanItemRequest] = Field(default_factory=list)
 
 
 class CreateNPCRequest(BaseModel):
@@ -424,6 +577,7 @@ class UpsertKeyRecordToolRequest(BaseModel):
     content_text: str
     content_json: dict | None = None
     tags: list[str] = Field(default_factory=list)
+    match_keywords: list[str] = Field(default_factory=list)
     start_date: str | None = None
     end_date: str | None = None
     status: Literal["active", "archived"] = "active"

@@ -24,7 +24,7 @@ from server.models import (
     EventAnchor,
     KeyRecord,
     LifeFlowTrace,
-    RelationshipState,
+    RelationshipThought,
     SlowLine,
     KEY_RECORD_TYPES,
     LEGACY_KEY_RECORD_TYPE_MAP,
@@ -63,7 +63,6 @@ from server.prompts import (
     KEY_L1_USER_BACKGROUND,
     KEY_L2_CHARACTER_PERSONALITY,
     KEY_L2_LIFE_STATUS,
-    KEY_L2_RELATIONSHIP_DYNAMICS,
 )
 from server.automation_engine import AutomationEngine
 
@@ -124,16 +123,250 @@ class StateMachine:
         self._maintenance_lock = asyncio.Lock()
         self._deferred_maintenance_queue: list[dict] = []
         self._deferred_maintenance_task: asyncio.Task | None = None
-        self._deferred_event_queue: list[dict] = []
-        self._deferred_event_task: asyncio.Task | None = None
-        self._deferred_event_snapshot_ids: set[int] = set()
         self._env_retry_lock = asyncio.Lock()
         self._deferred_env_retry_queue: list[dict] = []
         self._deferred_env_retry_task: asyncio.Task | None = None
         self.plan_engine = None
+        self.ob_client = None
 
     def set_plan_engine(self, plan_engine) -> None:
         self.plan_engine = plan_engine
+
+    def set_ob_client(self, ob_client) -> None:
+        self.ob_client = ob_client
+
+    async def _ob_breath_text(
+        self,
+        *,
+        query: str = "",
+        domain: str = "",
+        limit: int = 3,
+    ) -> str:
+        if self.ob_client is None:
+            return ""
+        if int(limit or 0) <= 0:
+            return ""
+        try:
+            buckets = await self.ob_client.breath(
+                query=query,
+                domain=domain or None,
+                limit=max(1, int(limit or 3)),
+            )
+        except Exception:
+            logger.exception("OB breath failed (domain=%s).", domain)
+            return ""
+        return self._format_ob_buckets_text(buckets)
+
+    async def _ob_feel_context_text(
+        self,
+        *,
+        character_life_limit: int = 1,
+        other_limit: int = 2,
+    ) -> str:
+        if self.ob_client is None:
+            return ""
+        char_limit = max(0, int(character_life_limit or 0))
+        non_limit = max(0, int(other_limit or 0))
+        if char_limit + non_limit <= 0:
+            return ""
+        try:
+            buckets = await self.ob_client.list_buckets(include_archive=False)
+        except Exception:
+            logger.exception("OB feel context failed.")
+            return ""
+        feels = [
+            bucket for bucket in buckets
+            if self.ob_client._bucket_type(getattr(bucket, "metadata", {}) or {}) == "feel"
+        ]
+        feels.sort(key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""), reverse=True)
+        character_life: list = []
+        other: list = []
+        for bucket in feels:
+            domains = {
+                str(d).strip().lower()
+                for d in (getattr(bucket, "metadata", {}) or {}).get("domain", [])
+                if str(d).strip()
+            }
+            if "character_life" in domains:
+                if len(character_life) < char_limit:
+                    character_life.append(bucket)
+                continue
+            if len(other) < non_limit:
+                other.append(bucket)
+        selected = character_life + other
+        selected.sort(key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""), reverse=True)
+        for bucket in selected:
+            bucket.score = 50.0
+        return self._format_ob_buckets_text(selected)
+
+    def _format_ob_buckets_text(self, buckets: list) -> str:
+        lines: list[str] = []
+        for bucket in buckets:
+            meta = getattr(bucket, "metadata", {}) or {}
+            name = str(meta.get("name") or getattr(bucket, "id", "") or "OB memory").strip()
+            domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip())
+            content = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
+            if not content:
+                continue
+            label = f"{name}" + (f" [{domains}]" if domains else "")
+            lines.append(f"- {label}: {content[:360]}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_snapshot_generated_ob_bucket(bucket) -> bool:
+        meta = getattr(bucket, "metadata", {}) or {}
+        tags = {str(tag).strip().lower() for tag in meta.get("tags", []) if str(tag).strip()}
+        source = str(meta.get("source") or "").strip().lower()
+        if source == "snapshot_scheduler":
+            return True
+        if meta.get("snapshot_id") or meta.get("checkpoint_cst"):
+            return True
+        return "snapshot" in tags and "environment" in tags
+
+    async def _ob_breath_event_dicts_for_environment(
+        self,
+        *,
+        query: str = "",
+        limit: int = 5,
+    ) -> list[dict]:
+        if self.ob_client is None:
+            return []
+        target = max(1, int(limit or 5))
+
+        async def _breath_once(search_query: str, cap: int) -> list:
+            try:
+                return await self.ob_client.breath(
+                    query=search_query,
+                    domain=None,
+                    limit=max(target, min(50, cap)),
+                )
+            except Exception:
+                logger.exception("OB environment event breath failed.")
+                return []
+
+        buckets = await _breath_once(query, target * 5)
+        if len(buckets) < target and str(query or "").strip():
+            fallback_ids = {str(getattr(bucket, "id", "")) for bucket in buckets}
+            for bucket in await _breath_once("", target * 5):
+                if str(getattr(bucket, "id", "")) not in fallback_ids:
+                    buckets.append(bucket)
+
+        items: list[dict] = []
+        seen: set[str] = set()
+        for bucket in buckets:
+            bucket_id = str(getattr(bucket, "id", "") or "").strip()
+            if bucket_id and bucket_id in seen:
+                continue
+            seen.add(bucket_id)
+            if self._is_snapshot_generated_ob_bucket(bucket):
+                continue
+            meta = getattr(bucket, "metadata", {}) or {}
+            content = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
+            if not content:
+                continue
+            created = str(meta.get("created") or meta.get("last_active") or "").strip()
+            tags = [str(tag).strip() for tag in meta.get("tags", []) if str(tag).strip()]
+            domains = [str(domain).strip() for domain in meta.get("domain", []) if str(domain).strip()]
+            items.append(
+                {
+                    "title": str(meta.get("name") or bucket_id or "OB event").strip(),
+                    "date": created.split("T")[0] if created else "",
+                    "description": content[:520],
+                    "open_loop": str(meta.get("open_loop") or "").strip(),
+                    "trigger_keywords": tags + domains,
+                    "source": "ob_breath",
+                    "bucket_id": bucket_id,
+                }
+            )
+            if len(items) >= target:
+                break
+        return items
+
+    async def _ob_hold_snapshot_feel(
+        self,
+        *,
+        title: str,
+        content: str,
+        tags: list[str] | None = None,
+        importance: int = 4,
+        valence: float = 0.5,
+        arousal: float = 0.35,
+        created: str | None = None,
+        extra_metadata: dict | None = None,
+    ) -> str:
+        if self.ob_client is None:
+            return ""
+        try:
+            return await self.ob_client.hold(
+                content,
+                tags=tags or ["character_life"],
+                importance=importance,
+                domain=["character_life"],
+                valence=valence,
+                arousal=arousal,
+                bucket_type="feel",
+                name=title,
+                created=created,
+                extra_metadata=extra_metadata,
+            )
+        except Exception:
+            logger.exception("OB snapshot feel hold failed.")
+            return ""
+
+    async def _ob_hold_environment_trace(
+        self,
+        *,
+        title: str,
+        content: str,
+        tags: list[str] | None = None,
+        importance: int = 5,
+        valence: float = 0.5,
+        arousal: float = 0.35,
+        created: str | None = None,
+        extra_metadata: dict | None = None,
+    ) -> str:
+        if self.ob_client is None:
+            return ""
+        body = str(content or "").strip()
+        if not body:
+            return ""
+        try:
+            return await self.ob_client.hold(
+                body,
+                tags=tags or ["environment_trace", "character_life"],
+                importance=importance,
+                domain=["character_life"],
+                valence=valence,
+                arousal=arousal,
+                bucket_type="dynamic",
+                name=title,
+                created=created,
+                extra_metadata=extra_metadata,
+            )
+        except Exception:
+            logger.exception("OB environment trace hold failed.")
+            return ""
+
+    def _build_environment_trace_content(self, env: dict | None) -> str:
+        if not env or not isinstance(env, dict):
+            return ""
+        retrieval = self._compact_structured_memory_text(str(env.get("retrieval_summary") or "").strip())
+        summary = self._compact_structured_memory_text(str(env.get("summary") or "").strip())
+        activity = self._compact_structured_memory_text(str(env.get("activity") or "").strip())
+        plan_delta = self._compact_structured_memory_text(str(env.get("plan_delta") or "").strip())
+        disturbance = self._compact_structured_memory_text(str(env.get("disturbance_context") or "").strip())
+        recent_disturbances = self._compact_structured_memory_text(str(env.get("recent_disturbances") or "").strip())
+        lines: list[str] = []
+        primary = retrieval or summary or activity
+        if primary:
+            lines.append(primary[:900])
+        if plan_delta and plan_delta != "(no visible plan delta)":
+            lines.append(f"Plan delta: {plan_delta[:240]}")
+        if disturbance and disturbance != "(no active disturbance)":
+            lines.append(f"Disturbance: {disturbance[:240]}")
+        if recent_disturbances and recent_disturbances != "(no recent disturbances)":
+            lines.append(f"Recent disturbances: {recent_disturbances[:240]}")
+        return "\n".join(lines).strip()[:1400]
 
     async def _ensure_active_conversation_time_claim(
         self,
@@ -449,7 +682,6 @@ class StateMachine:
         checkpoint_time: datetime,
         current_plan_summary: str,
         current_plan_activity: str,
-        world_book_entries: list[dict],
         recent_events: list[EventAnchor],
     ) -> list[dict]:
         candidates: list[dict] = []
@@ -478,35 +710,6 @@ class StateMachine:
                         "intrusion_cost": 0.2,
                         "world_relevance_score": 0.52,
                         "plausibility_score": 0.58,
-                    }
-                )
-            )
-        if world_book_entries:
-            top_entry = world_book_entries[0]
-            entry_name = str(top_entry.get("name") or "").strip() or "当前环境"
-            candidates.append(
-                self._normalize_disturbance_candidate(
-                    {
-                        "channel_type": "external_incident",
-                        "source_family": "environment",
-                        "seed_kind": "world_state",
-                        "seed_ref_id": int(top_entry.get("id") or 0) or None,
-                        "blind_spot_reason": "ambient_accumulation",
-                        "reveal_channel": "ambient_shift",
-                        "title": f"{entry_name} 的外部波动开始压进当下场景",
-                        "what_changed": f"与 {entry_name} 相关的外部条件出现了实际变化，并开始影响当前位置或手头安排。",
-                        "why_now": "之前只是背景信息，到这个 checkpoint 才转化为不得不处理的现实摩擦。",
-                        "visible_manifestation": "环境条件、空间使用、通行或工作手感突然变得不再顺滑。",
-                        "impact_hint": "这更像世界本身主动逼近，而不是角色主观情绪的放大。",
-                        "detail_hook": f"与 {entry_name} 相关的提示信息在屏幕边缘弹出",
-                        "open_thread": "需要判断这次外界波动是短噪声还是会继续扩大。",
-                        "continuity_score": 0.54,
-                        "pressure_score": 0.44,
-                        "novelty_score": 0.46,
-                        "timing_score": 0.42,
-                        "intrusion_cost": 0.26,
-                        "world_relevance_score": 0.6,
-                        "plausibility_score": 0.62,
                     }
                 )
             )
@@ -551,7 +754,6 @@ class StateMachine:
         current_plan_activity: str,
         recent_trace_summary: str,
         plan_delta: str,
-        world_book_entries: list[dict],
     ) -> list[dict]:
         candidates: list[dict] = []
         for event in recent_events[:4]:
@@ -706,7 +908,6 @@ class StateMachine:
                 checkpoint_time=checkpoint_time,
                 current_plan_summary=current_plan_summary,
                 current_plan_activity=current_plan_activity,
-                world_book_entries=world_book_entries,
                 recent_events=recent_events,
             )
         )
@@ -830,7 +1031,6 @@ class StateMachine:
         environment_context_details: dict,
         recent_events: list[EventAnchor],
         recent_key_records: list[KeyRecord],
-        world_book_entries: list[dict],
     ) -> dict:
         del previous_env
         recent_pulses = await self._list_recent_disturbances()
@@ -849,7 +1049,6 @@ class StateMachine:
             current_plan_activity=current_plan_activity,
             recent_trace_summary=recent_trace_summary,
             plan_delta=plan_delta,
-            world_book_entries=world_book_entries,
         )
         scored = [self._score_disturbance_candidate(candidate, recent_pulses) for candidate in candidates]
         scored = [candidate for candidate in scored if float(candidate.get("score") or 0.0) >= 1.65]
@@ -952,144 +1151,6 @@ class StateMachine:
     @staticmethod
     def _clamp_unit(value: float) -> float:
         return max(0.0, min(round(float(value), 4), 1.0))
-
-    async def _get_or_create_relationship_state(self) -> RelationshipState:
-        state = await self.db.get_latest_relationship_state()
-        if state is not None:
-            return state
-        now = format_utc_instant_z(datetime.utcnow())
-        state = RelationshipState(
-            last_meaningful_contact_at=now,
-            hours_since_meaningful_contact=0.0,
-            days_since_meaningful_contact=0,
-            contact_recency_bucket="active",
-            relationship_feeling_summary="最近仍保持着可感知的联结，关系影响清晰但并不压倒生活本身。",
-            proactive_topics=json.dumps([], ensure_ascii=False),
-            plan_bias_hint="今日节律可按角色自身生活推进，不预设与用户的共同行动。",
-            created_at=now,
-            updated_at=now,
-        )
-        state_id = await self.db.insert_relationship_state(state)
-        latest = await self.db.get_latest_relationship_state()
-        if latest is not None:
-            return latest
-        state.id = int(state_id)
-        return state
-
-    @staticmethod
-    def _relationship_bucket(hours_since: float) -> str:
-        if hours_since <= 24:
-            return "active"
-        if hours_since <= 72:
-            return "cooling"
-        if hours_since <= 168:
-            return "distant"
-        return "stale"
-
-    async def _refresh_relationship_state(
-        self,
-        *,
-        conversation_summary: str = "",
-        latest_snapshot_text: str = "",
-    ) -> RelationshipState:
-        state = await self._get_or_create_relationship_state()
-        now = shanghai_now()
-        last_contact_dt = None
-        if str(state.last_meaningful_contact_at or "").strip():
-            try:
-                last_contact_dt = self._parse_iso_datetime(str(state.last_meaningful_contact_at))
-            except Exception:
-                last_contact_dt = None
-        if str(conversation_summary or "").strip():
-            last_contact_dt = now
-        hours_since = 0.0
-        if last_contact_dt is not None:
-            hours_since = max(0.0, (now - last_contact_dt).total_seconds() / 3600.0)
-        days_since = max(0, int(hours_since // 24))
-        connection_need = 0.35 + min(hours_since, 240.0) * 0.0021
-        pride_or_distance = 0.55 if hours_since >= 72 else 0.42
-        concern_level = min(0.35 + hours_since * 0.0025, 0.92)
-        space_need_level = 0.42
-        valence = max(0.18, 0.68 - hours_since * 0.0017)
-        arousal = min(0.82, 0.38 + hours_since * 0.0021)
-        life_immersion = min(0.88, 0.45 + hours_since * 0.0017)
-        topics: list[str] = []
-        summary = "关系仍在近场影响中，联结感明确。"
-        plan_bias_hint = "今日节律仍可按角色自身安排推进，同时保留少量关系层面的注意力余波。"
-        bucket = self._relationship_bucket(hours_since)
-
-        if bucket == "active":
-            summary = "最近联系仍近，关系的余温仍在，注意力容易回到刚刚发生的互动与未说尽的话。"
-            topics = ["延续上次未说完的话题", "确认对方当前状态", "轻轻追问仍悬而未决的线索"]
-            plan_bias_hint = "今日更容易被近期互动牵引，但不应预设与用户的共同行动。"
-        elif bucket == "cooling":
-            summary = "联系刚刚拉开一点距离，关系仍在心里，但会更多转化为留意、回想与判断是否适合靠近。"
-            topics = ["询问近况", "回收上次对话留下的线索", "确认是否需要空间或支持"]
-            plan_bias_hint = "今日更适合维持自己的生活节律，同时为可能的再次对话留出一点弹性。"
-        elif bucket == "distant":
-            summary = "已有一段时间没有实质联系，关系感开始转为更明显的想念、担忧或克制的观察。"
-            topics = ["确认近况是否安稳", "提起仍在意的旧线索", "在不逼近的前提下表达关心"]
-            plan_bias_hint = "今日更适合沉入自身事务，但情绪与注意力可能间歇性回到这段关系。"
-            space_need_level = 0.5
-        else:
-            summary = "联系已经明显疏远，关系不至于消失，但它会以更压缩、更隐性的方式影响情绪与节律。"
-            topics = ["若重新开启对话，可先从近况与低压话题入手", "避免预设亲密互动", "优先确认彼此当下是否有谈话空间"]
-            plan_bias_hint = "今日应以角色自身生活为主，仅保留非常轻的关系感知背景。"
-            pride_or_distance = 0.64
-            life_immersion = 0.74
-
-        conv_text = str(conversation_summary or "").strip()
-        if conv_text:
-            lowered = conv_text.lower()
-            if any(word in conv_text for word in ("承诺", "共识", "确认", "决定", "原则")):
-                valence += 0.08
-                connection_need -= 0.08
-                summary = "最近的对话带来了更清楚的关系确认，短期内联结感更稳，靠近的意愿也更明确。"
-                topics = ["承接刚刚形成的共识", "确认落实方式", "继续推进已经打开的话题"]
-                plan_bias_hint = "今日情绪更稳，但仍应让后续安排以角色自身事务为主，不将用户写入日程。"
-            elif any(word in conv_text for word in ("害怕", "担心", "不安", "想念", "舍不得", "难过")):
-                concern_level += 0.1
-                arousal += 0.06
-                connection_need += 0.06
-                summary = "最近的对话留下了明显的情绪余波，关系感更敏感，也更容易引出牵挂或想确认近况的冲动。"
-                topics = ["确认对方是否安好", "回应刚刚出现的情绪线索", "温和延续尚未安放的感受"]
-            elif any(word in lowered for word in ("空间", "暂停", "冷静", "之后再说")):
-                space_need_level += 0.18
-                pride_or_distance += 0.08
-                summary = "最近的对话提示这段关系暂时更需要边界与空间，靠近的意愿仍在，但表达方式应更克制。"
-                topics = ["低压力确认", "尊重空间的前提下留一条可回来的线", "避免逼近式推进"]
-
-        connection_need = self._clamp_unit(connection_need)
-        pride_or_distance = self._clamp_unit(pride_or_distance)
-        concern_level = self._clamp_unit(concern_level)
-        space_need_level = self._clamp_unit(space_need_level)
-        valence = self._clamp_unit(valence)
-        arousal = self._clamp_unit(arousal)
-        life_immersion = self._clamp_unit(life_immersion)
-
-        payload = {
-            "last_meaningful_contact_at": format_utc_instant_z(shanghai_time_to_utc_naive(last_contact_dt or now)),
-            "hours_since_meaningful_contact": round(hours_since, 1),
-            "days_since_meaningful_contact": days_since,
-            "contact_recency_bucket": bucket,
-            "connection_need": connection_need,
-            "pride_or_distance": pride_or_distance,
-            "valence": valence,
-            "arousal": arousal,
-            "life_immersion": life_immersion,
-            "relationship_feeling_summary": summary,
-            "space_need_level": space_need_level,
-            "concern_level": concern_level,
-            "proactive_topics": json.dumps(topics[:3], ensure_ascii=False),
-            "plan_bias_hint": plan_bias_hint,
-        }
-        if state.id is not None:
-            await self.db.update_relationship_state(int(state.id), **payload)
-        else:
-            created = RelationshipState(**payload)
-            await self.db.insert_relationship_state(created)
-        latest = await self.db.get_latest_relationship_state()
-        return latest or RelationshipState(**payload)
 
     def _infer_life_flow_theme(self, summary: str, details: dict | None = None, *, source: str = "environment") -> str:
         text = "\n".join(
@@ -1474,11 +1535,6 @@ class StateMachine:
             )
             await self._trace_await(
                 tracer,
-                "refresh_relationship_state.get_current_state",
-                self._refresh_relationship_state(latest_snapshot_text=current_content),
-            )
-            await self._trace_await(
-                tracer,
                 "refresh_slowlines.get_current_state",
                 self._refresh_slowlines(),
             )
@@ -1573,7 +1629,6 @@ class StateMachine:
                     "conversation_context": str(active_claim.context_summary or ""),
                 }
 
-            await self._refresh_relationship_state()
             await self._refresh_slowlines()
 
             latest_snapshot = await self.db.get_latest_snapshot()
@@ -1709,9 +1764,7 @@ class StateMachine:
                     character_personality = await self.prompt_manager.get_layer_content(
                         KEY_L2_CHARACTER_PERSONALITY
                     )
-                    relationship_dynamics = await self.prompt_manager.get_layer_content(
-                        KEY_L2_RELATIONSHIP_DYNAMICS
-                    )
+                    relationship_dynamics = "（关系动态已迁入 OB 记忆主干；后台反思不再读取 L2 关系结论。）"
                     life_status = await self.prompt_manager.get_layer_content(
                         KEY_L2_LIFE_STATUS
                     )
@@ -1753,6 +1806,25 @@ class StateMachine:
                     self.db.insert_snapshot(snap),
                     snapshot_chars=len(new_content or ""),
                 )
+                await self._trace_await(
+                    tracer,
+                    "ob_hold_conversation_snapshot_feel",
+                    self._ob_hold_snapshot_feel(
+                        title=f"{shanghai_now().isoformat(timespec='seconds')} 对话结束快照",
+                        content=new_content,
+                        tags=["snapshot", "feel", "conversation_end"],
+                        importance=5,
+                        valence=0.5,
+                        arousal=0.4,
+                        created=snap.created_at,
+                        extra_metadata={
+                            "snapshot_id": int(snap_id or 0),
+                            "source": "conversation_reflection",
+                            "source_kind": "state_snapshot",
+                        },
+                    ),
+                    snapshot_id=int(snap_id or 0),
+                )
                 closed_claim = await self._trace_await(
                     tracer,
                     "close_active_conversation_claim",
@@ -1791,26 +1863,18 @@ class StateMachine:
                 )
                 await self._trace_await(
                     tracer,
-                    "refresh_relationship_state.after_conversation",
-                    self._refresh_relationship_state(
-                        conversation_summary=conversation_summary,
-                        latest_snapshot_text=new_content,
-                    ),
-                )
-                await self._trace_await(
-                    tracer,
                     "refresh_slowlines.after_conversation",
                     self._refresh_slowlines(),
                 )
-                self._schedule_deferred_event_generation(
-                    snapshot_id=int(snap_id or 0),
-                    snapshot_content=new_content,
-                    environment={},
-                    memory_text=memory_text,
-                    checkpoint_time=shanghai_now(),
-                    defer_vectorization=True,
-                    conversation_summary=conversation_summary,
-                    conversation_started_at=str((closed_claim.started_at if closed_claim else "") or ""),
+                await self._trace_await(
+                    tracer,
+                    "append_relationship_thought.after_conversation",
+                    self._append_relationship_thought_from_context(
+                        source_snapshot_id=int(snap_id or 0),
+                        source_env_id="conversation_end",
+                        snapshot_text=new_content,
+                        conversation_summary=conversation_summary,
+                    ),
                 )
             finally:
                 llm_usage = self.snapshot_llm.end_usage_tracking()
@@ -2175,8 +2239,9 @@ class StateMachine:
         content_json: dict | None,
         start_date: str | None,
         end_date: str | None,
+        life_scope: str | None = None,
     ) -> KeyRecord | None:
-        exact = await self.db.get_key_record_by_type_title(normalized_type, title)
+        exact = await self.db.get_key_record_by_type_title(normalized_type, title, life_scope=life_scope)
         if exact is not None:
             return exact
         incoming_blob = self._build_key_record_match_blob(
@@ -2190,6 +2255,7 @@ class StateMachine:
             offset=0,
             limit=24,
             record_type=normalized_type,
+            life_scope=life_scope,
             include_archived=True,
         )
         best: KeyRecord | None = None
@@ -2430,6 +2496,90 @@ class StateMachine:
             deduped.append(compact)
         return "；".join(deduped)[:560]
 
+    def _looks_like_archive_payload(self, text: str) -> bool:
+        compact = self._compact_structured_memory_text(text)
+        if not compact:
+            return False
+        parameter_tokens = (
+            "度数", "散光", "频率", "每周", "颜色", "尺码", "面料", "参数", "配给",
+            "偏好", "记录", "计划", "提醒", "建议", "镜片", "验光", "咖啡", "运动",
+            "血样", "检测项", "路线", "强度", "禁忌", "用途", "决策方式",
+        )
+        archive_hits = sum(1 for token in parameter_tokens if token in compact)
+        list_markers = sum(compact.count(marker) for marker in ("1.", "2.", "3.", "-", "："))
+        return archive_hits >= 3 or (archive_hits >= 2 and list_markers >= 4)
+
+    def _extract_display_core(self, text: str, *, max_len: int = 120) -> str:
+        compact = self._compact_structured_memory_text(text)
+        if not compact:
+            return ""
+        compact = re.sub(r"^(起点|最近|当前卡点|待观察|纵向概括|关键细节)[:：]\s*", "", compact)
+        parts = [seg.strip() for seg in re.split(r"[；;。]\s*", compact) if seg.strip()]
+        if not parts:
+            return compact[:max_len]
+        preferred = []
+        for part in parts:
+            if any(token in part for token in ("危机", "崩溃", "嫉妒", "退出", "疼", "麻木", "等待", "拒绝", "决定", "转向", "卡点", "观察", "未定", "待")):
+                preferred.append(part)
+        candidate = preferred[0] if preferred else parts[0]
+        return candidate[:max_len]
+
+    def _build_display_stage_summary(
+        self,
+        *,
+        source_family: str,
+        title: str,
+        latest_change: str,
+        next_watch_point: str,
+        fallback_text: str,
+    ) -> str:
+        title_compact = self._compact_structured_memory_text(title)[:36]
+        latest_core = self._extract_display_core(latest_change, max_len=120)
+        watch_core = self._extract_display_core(next_watch_point, max_len=90)
+        fallback_core = self._extract_display_core(fallback_text, max_len=120)
+        if self._looks_like_archive_payload("\n".join([title, latest_change, next_watch_point, fallback_text])):
+            if latest_core:
+                return f"{title_compact}：{latest_core}" if title_compact else latest_core
+            if watch_core:
+                return f"{title_compact}：{watch_core}" if title_compact else watch_core
+        core = latest_core or watch_core or fallback_core
+        if not core:
+            return title_compact
+        if title_compact and self._keyword_overlap_score(title_compact.lower(), core.lower()) < 0.5:
+            return f"{title_compact}：{core}"[:150]
+        return core[:150]
+
+    def _build_display_trajectory_summary(
+        self,
+        *,
+        previous_baseline: str,
+        latest_change: str,
+        current_tension: str,
+        existing: str,
+    ) -> str:
+        parts: list[str] = []
+        start = self._extract_display_core(previous_baseline or existing, max_len=90)
+        shift = self._extract_display_core(latest_change, max_len=100)
+        tension = self._extract_display_core(current_tension, max_len=80)
+        if start:
+            parts.append(f"起点：{start}")
+        if shift and not any(self._keyword_overlap_score(shift.lower(), p.lower()) >= 0.8 for p in parts):
+            parts.append(f"最近：{shift}")
+        if tension and not any(self._keyword_overlap_score(tension.lower(), p.lower()) >= 0.8 for p in parts):
+            parts.append(f"当前卡点：{tension}")
+        return "；".join(parts)[:240]
+
+    def _strip_title_prefix(self, label: str, text: str) -> str:
+        compact_label = self._compact_structured_memory_text(label)
+        compact_text = self._compact_structured_memory_text(text)
+        if not compact_text:
+            return ""
+        if compact_label and compact_text.startswith(f"{compact_label}："):
+            return compact_text[len(compact_label) + 1 :].strip()
+        if compact_label and self._keyword_overlap_score(compact_label.lower(), compact_text.lower()) >= 0.92:
+            return compact_text
+        return compact_text
+
     def _build_slowline_theme(self, *, title: str, source_family: str) -> str:
         cleaned = self._compact_structured_memory_text(title)
         if cleaned:
@@ -2455,6 +2605,474 @@ class StateMachine:
                 continue
             kept.append(line)
         return "\n".join(kept) if kept else "（更早的背景已被近期生活主线充分覆盖）"
+
+    def _detail_fingerprint(self, text: str) -> str:
+        compact = self._compact_structured_memory_text(str(text or "").strip())
+        normalized = self._normalize_thread_key(compact)
+        return normalized[:180]
+
+    def _collect_recent_life_detail_fingerprints(self, recent_life_text: str) -> set[str]:
+        lines = str(recent_life_text or "").splitlines()
+        fingerprints: set[str] = set()
+        in_detail_block = False
+        for raw_line in lines:
+            line = str(raw_line or "").rstrip()
+            stripped = line.strip()
+            if not stripped:
+                in_detail_block = False
+                continue
+            if "关键细节" in stripped:
+                in_detail_block = True
+                continue
+            if in_detail_block and stripped.startswith("-"):
+                bullet_text = re.sub(r"^\s*-\s*", "", stripped)
+                if "：" in bullet_text:
+                    bullet_text = bullet_text.split("：", 1)[1]
+                fp = self._detail_fingerprint(bullet_text)
+                if fp:
+                    fingerprints.add(fp)
+                continue
+            if in_detail_block:
+                in_detail_block = False
+        return fingerprints
+
+    def _build_relationship_thought_fingerprint(self, topic_line: str, thought_type: str, content: str) -> str:
+        base = self._normalize_thread_key(f"{topic_line} {thought_type} {content}")
+        if not base:
+            base = "relationship-thought"
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()[:24]
+
+    def _infer_relationship_shadow_attributes(self, text: str) -> dict[str, str]:
+        lowered = str(text or "").lower()
+        urgency = "medium"
+        if any(token in lowered for token in ("立刻", "马上", "尽快", "今天", "今晚", "明天", "按时", "到点")):
+            urgency = "high"
+        elif any(token in lowered for token in ("改天", "之后", "以后", "有空", "长期", "慢慢")):
+            urgency = "low"
+        horizon = "near_term"
+        if any(token in lowered for token in ("长期", "以后", "慢慢", "一直")):
+            horizon = "long_term"
+        elif any(token in lowered for token in ("今天", "今晚", "立刻", "马上", "到点")):
+            horizon = "immediate"
+        activation_style = "opportunistic"
+        if any(token in lowered for token in ("氛围", "时机", "合适", "状态", "看情况")):
+            activation_style = "mood_sensitive"
+        elif any(token in lowered for token in ("等她", "等你", "她先", "用户先", "对方先")):
+            activation_style = "user_initiated"
+        elif any(token in lowered for token in ("几点", "按时", "定好", "固定", "约好时间")):
+            activation_style = "fixed_time"
+        shared_assumption_strength = "medium"
+        if any(token in lowered for token in ("约定", "说好", "共识", "承诺", "答应")):
+            shared_assumption_strength = "high"
+        elif any(token in lowered for token in ("想法", "也许", "如果", "看情况")):
+            shared_assumption_strength = "low"
+        return {
+            "urgency": urgency,
+            "horizon": horizon,
+            "activation_style": activation_style,
+            "shared_assumption_strength": shared_assumption_strength,
+        }
+
+    def _build_relationship_thought_content(
+        self,
+        *,
+        topic_line: str,
+        anchor_text: str,
+        attrs: dict[str, str],
+    ) -> tuple[str, str]:
+        horizon = attrs.get("horizon", "near_term")
+        activation_style = attrs.get("activation_style", "opportunistic")
+        urgency = attrs.get("urgency", "medium")
+        thought_type = "reconsider"
+        if activation_style == "user_initiated":
+            thought_type = "wait"
+            lead = f"{topic_line} 这条线更适合等她先把入口打开，我暂时不把它推进成既定动作。"
+        elif activation_style == "mood_sensitive":
+            thought_type = "mood_dependent"
+            lead = f"{topic_line} 还在心里，但更像需要看时机、氛围和当下状态再决定是否提起。"
+        elif horizon == "long_term":
+            thought_type = "timing_sensitive"
+            lead = f"{topic_line} 更像一条长期挂念，不需要在今天立刻兑现，先保留它的余波即可。"
+        elif horizon == "immediate" and urgency == "high":
+            thought_type = "ask"
+            lead = f"如果她此刻出现，我更可能先从 {topic_line} 试着确认一步，但没有合适入口时也不急着硬推。"
+        else:
+            thought_type = "reconsider"
+            lead = f"{topic_line} 这条线还在心里，若她主动提起，我大概会顺着它继续判断下一步。"
+        anchor = self._compact_structured_memory_text(anchor_text)
+        if anchor and self._keyword_overlap_score(anchor.lower(), lead.lower()) < 0.58:
+            lead = f"{lead} 目前更在意的是：{anchor}"
+        return thought_type, lead[:220]
+
+    async def _list_plan_relationship_shadow_hints(self, *, limit: int = 8) -> list[dict]:
+        if self.plan_engine is None:
+            return []
+        plan = await self.plan_engine.get_current_plan()
+        if plan is None or plan.id is None:
+            return []
+        items = await self.db.list_plan_items(int(plan.id))
+        hints: list[dict] = []
+        for item in items:
+            payload = self._parse_json_object(item.action_payload)
+            shadow_hint = self._compact_structured_memory_text(str(payload.get("relationship_shadow_hint") or "").strip())
+            if not shadow_hint:
+                continue
+            hints.append(
+                {
+                    "topic_line": self._compact_structured_memory_text(
+                        str(payload.get("intended_objective") or item.activity or "与用户相关的未启动线").strip()
+                    )[:80],
+                    "anchor_text": shadow_hint,
+                    "salience": 0.84 if item.status == "pending" else 0.7,
+                }
+            )
+        return hints[:limit]
+
+    async def _append_relationship_thought_from_context(
+        self,
+        *,
+        source_snapshot_id: int | None,
+        source_env_id: str | None,
+        snapshot_text: str,
+        environment_text: str = "",
+        conversation_summary: str = "",
+    ) -> RelationshipThought | None:
+        today = shanghai_now().date().isoformat()
+        slowlines = await self.db.list_slowlines(status="active", limit=12)
+        candidates: list[dict] = []
+        for hint in await self._list_plan_relationship_shadow_hints():
+            anchor_text = str(hint.get("anchor_text") or "").strip()
+            if not anchor_text:
+                continue
+            candidates.append(
+                {
+                    "topic_line": str(hint.get("topic_line") or "与用户相关的未启动线").strip(),
+                    "anchor_text": anchor_text,
+                    "salience": float(hint.get("salience") or 0.72),
+                }
+            )
+        for line in slowlines:
+            scope = str(getattr(line, "scope", "shared") or "shared")
+            if scope not in {"user_side", "shared"}:
+                continue
+            topic_line = self._compact_structured_memory_text(str(line.theme or "").strip())[:80]
+            anchor_text = self._compact_structured_memory_text(
+                str(line.current_tension or "").strip()
+                or ", ".join(self._parse_json_list(line.open_questions)[:1])
+                or str(line.stage_summary or "").strip()
+            )
+            if not topic_line or not anchor_text:
+                continue
+            salience = float(line.salience or 0.0)
+            if scope == "user_side":
+                salience += 0.08
+            candidates.append(
+                {
+                    "topic_line": topic_line,
+                    "anchor_text": anchor_text,
+                    "salience": salience,
+                }
+            )
+        if conversation_summary.strip():
+            candidates.append(
+                {
+                    "topic_line": "刚刚结束的对话余波",
+                    "anchor_text": self._compact_structured_memory_text(conversation_summary)[:140],
+                    "salience": 0.92,
+                }
+            )
+        if not candidates:
+            return None
+        context_blob = self._normalize_thread_key(
+            "\n".join(
+                part for part in [snapshot_text or "", environment_text or "", conversation_summary or ""] if part
+            )
+        )
+        ranked: list[tuple[float, dict]] = []
+        for candidate in candidates:
+            topic_line = str(candidate.get("topic_line") or "").strip()
+            anchor_text = str(candidate.get("anchor_text") or "").strip()
+            attrs = self._infer_relationship_shadow_attributes(f"{topic_line}\n{anchor_text}")
+            score = float(candidate.get("salience") or 0.0)
+            if context_blob:
+                score += min(
+                    0.18,
+                    self._keyword_overlap_score(
+                        self._normalize_thread_key(f"{topic_line} {anchor_text}"),
+                        context_blob,
+                    ),
+                )
+            ranked.append((score, {"topic_line": topic_line, "anchor_text": anchor_text, "attrs": attrs}))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        top_score, top = ranked[0]
+        if top_score < 0.48:
+            return None
+        thought_type, content = self._build_relationship_thought_content(
+            topic_line=str(top["topic_line"]),
+            anchor_text=str(top["anchor_text"]),
+            attrs=dict(top["attrs"]),
+        )
+        fingerprint = self._build_relationship_thought_fingerprint(str(top["topic_line"]), thought_type, content)
+        existing = await self.db.get_relationship_thought_by_fingerprint(
+            thought_date=today,
+            dedupe_fingerprint=fingerprint,
+            resolution_status="open",
+        )
+        if existing is not None and existing.id is not None:
+            await self.db.update_relationship_thought(
+                int(existing.id),
+                source_snapshot_id=source_snapshot_id,
+                source_env_id=source_env_id,
+                salience=max(float(existing.salience or 0.0), float(min(top_score, 0.98))),
+                content=content,
+            )
+            refreshed = await self.db.get_relationship_thought_by_fingerprint(
+                thought_date=today,
+                dedupe_fingerprint=fingerprint,
+                resolution_status="open",
+            )
+            return refreshed or existing
+        thought = RelationshipThought(
+            thought_date=today,
+            source_snapshot_id=source_snapshot_id,
+            source_env_id=source_env_id,
+            topic_line=str(top["topic_line"]),
+            thought_type=thought_type,
+            content=content,
+            salience=float(min(top_score, 0.98)),
+            dedupe_fingerprint=fingerprint,
+            resolution_status="open",
+        )
+        thought_id = await self.db.insert_relationship_thought(thought)
+        thoughts = await self.db.list_relationship_thoughts(thought_date=today, resolution_status="open", limit=24)
+        for item in thoughts:
+            if int(item.id or 0) == int(thought_id):
+                return item
+        thought.id = int(thought_id)
+        return thought
+
+    @staticmethod
+    def _infer_tension_level(*texts: str) -> str:
+        joined = " ".join(str(text or "").strip() for text in texts if str(text or "").strip())
+        if not joined:
+            return "low"
+        high_markers = (
+            "危机", "崩溃", "嫉妒", "厌恶", "撕裂", "死亡", "自杀", "求救", "痛苦", "冲突", "边界", "无法接受",
+            "受阻", "麻木", "压垮", "绝望", "震荡", "审判", "过载", "存在性",
+        )
+        medium_markers = (
+            "观察", "等待", "跟进", "犹豫", "拖延", "调整", "波动", "变化", "重写", "摩擦", "担心", "预约",
+        )
+        if any(token in joined for token in high_markers):
+            return "high"
+        if any(token in joined for token in medium_markers):
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _infer_unresolved_level(progress_status: str, current_tension: str, open_question: str) -> str:
+        if str(progress_status or "") in {"completed", "dropped"}:
+            return "low"
+        if current_tension or open_question:
+            return "high" if len((current_tension or "") + (open_question or "")) >= 20 else "medium"
+        if str(progress_status or "") in {"paused", "open", "ready_to_close"}:
+            return "medium"
+        return "low"
+
+    def _infer_emotional_tension(self, *, tension_level: str, unresolved_level: str, scope: str, text: str) -> str:
+        lowered = str(text or "")
+        if tension_level == "high" and "嫉妒" in lowered:
+            return "brittle"
+        if tension_level == "high" and unresolved_level == "high":
+            return "unresolved"
+        if "安抚" in lowered or "照顾" in lowered or "陪伴" in lowered:
+            return "tender"
+        if str(scope or "") == "user_side" and unresolved_level != "low":
+            return "strained"
+        if tension_level == "medium":
+            return "suspended"
+        return "stable"
+
+    @staticmethod
+    def _infer_affective_direction(text: str) -> str:
+        lowered = str(text or "")
+        if any(token in lowered for token in ("靠近", "陪伴", "确认", "安抚", "拥抱", "回到", "联系")):
+            return "approach"
+        if any(token in lowered for token in ("推迟", "回避", "删减", "停止", "不想再", "离开")):
+            return "avoidance"
+        if any(token in lowered for token in ("修复", "重建", "重排", "干预", "支持")):
+            return "repair"
+        if any(token in lowered for token in ("等待", "承受", "维持", "观察")):
+            return "endurance"
+        return "ambivalence"
+
+    def _infer_memory_role(
+        self,
+        *,
+        source_family: str,
+        progress_status: str,
+        scope: str,
+        tension_level: str,
+        unresolved_level: str,
+        current_tension: str,
+        text: str,
+    ) -> str:
+        blob = f"{text}\n{current_tension}"
+        if self._looks_like_archive_payload(blob):
+            return "trigger_only"
+        if source_family in {"logistics"} or any(token in blob for token in ("尺码", "参数", "颜色", "频率", "度数", "配方", "偏好")):
+            return "trigger_only"
+        if any(token in blob for token in ("计划", "偏好", "验光", "运动", "饮食", "采购", "账本", "费用", "收入来源", "短期", "中期", "长期", "框架")) and tension_level != "high" and unresolved_level != "high":
+            return "trigger_only"
+        if progress_status in {"completed", "dropped"} and tension_level == "low" and unresolved_level == "low":
+            return "archive_reference"
+        if unresolved_level == "high" or tension_level == "high":
+            return "bridge_core" if scope in {"user_side", "shared"} else "active_thread_detail"
+        if progress_status in {"open", "advancing", "paused", "ready_to_close"}:
+            return "active_thread_detail"
+        return "archive_reference"
+
+    @staticmethod
+    def _compute_preload_priority(
+        *,
+        scope: str,
+        memory_role: str,
+        progress_status: str,
+        tension_level: str,
+        unresolved_level: str,
+        source_family: str,
+    ) -> float:
+        score = 0.18
+        if scope in {"user_side", "shared"}:
+            score += 0.16
+        if memory_role == "bridge_core":
+            score += 0.28
+        elif memory_role == "active_thread_detail":
+            score += 0.18
+        elif memory_role == "trigger_only":
+            score -= 0.18
+        elif memory_role == "archive_reference":
+            score -= 0.24
+        score += {"low": 0.0, "medium": 0.08, "high": 0.18}.get(tension_level, 0.0)
+        score += {"low": 0.0, "medium": 0.06, "high": 0.14}.get(unresolved_level, 0.0)
+        if progress_status in {"paused", "open", "ready_to_close"}:
+            score += 0.06
+        if progress_status in {"completed", "dropped"}:
+            score -= 0.16
+        if source_family == "relationship":
+            score += 0.06
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _score_level(level: str) -> float:
+        return {"low": 0.18, "medium": 0.56, "high": 0.92}.get(str(level or "").strip(), 0.4)
+
+    def _compute_recency_score(self, timestamp: str | None, *, now: datetime | None = None) -> float:
+        raw = str(timestamp or "").strip()
+        if not raw:
+            return 0.22
+        now_dt = now or shanghai_now()
+        try:
+            shifted = self._parse_iso_datetime(raw)
+        except Exception:
+            parsed_date = self._safe_parse_iso_date(raw)
+            if parsed_date is None:
+                return 0.22
+            shifted = parsed_date
+        age_hours = max(0.0, (now_dt - shifted).total_seconds() / 3600.0)
+        if age_hours <= 12:
+            return 1.0
+        if age_hours <= 24:
+            return 0.88
+        if age_hours <= 72:
+            return 0.68
+        if age_hours <= 168:
+            return 0.46
+        if age_hours <= 336:
+            return 0.28
+        return 0.14
+
+    def _compute_continuity_score(self, slowline: SlowLine) -> float:
+        linked_events = len(self._json_int_list(getattr(slowline, "linked_event_ids", "[]")))
+        linked_records = len(self._json_int_list(getattr(slowline, "linked_key_record_ids", "[]")))
+        trajectory = self._compact_structured_memory_text(str(getattr(slowline, "trajectory_summary", "") or ""))
+        score = 0.18
+        score += min(0.42, linked_events * 0.08 + linked_records * 0.05)
+        if len(trajectory) >= 40:
+            score += 0.16
+        if str(getattr(slowline, "recent_shift_summary", "") or "").strip():
+            score += 0.08
+        return min(1.0, score)
+
+    @staticmethod
+    def _compute_relationship_score(scope: str, source_family: str) -> float:
+        score = 0.18
+        if scope == "user_side":
+            score += 0.44
+        elif scope == "shared":
+            score += 0.36
+        if source_family == "relationship":
+            score += 0.12
+        elif source_family in {"health", "study", "work"}:
+            score += 0.06
+        return min(1.0, score)
+
+    def _compute_novelty_score(self, *, summary: str, recent_shift: str) -> float:
+        shift = self._compact_structured_memory_text(recent_shift)
+        if not shift:
+            return 0.18
+        overlap = self._keyword_overlap_score(
+            self._normalize_thread_key(summary),
+            self._normalize_thread_key(shift),
+        )
+        return max(0.08, min(1.0, 0.92 - overlap))
+
+    def _compute_embodiment_score(self, text: str) -> float:
+        compact = self._compact_structured_memory_text(text)
+        if not compact:
+            return 0.0
+        score = 0.12
+        if any(token in compact for token in ("疼", "痛", "麻木", "哭", "抱", "摸", "吃", "睡", "呼吸", "心跳", "布洛芬", "生理期")):
+            score += 0.38
+        if any(token in compact for token in ("说", "问", "回", "低语", "报告", "承认")):
+            score += 0.24
+        if any(token in compact for token in ("凌晨", "中午", "下午", "深夜", "下课", "返回")):
+            score += 0.12
+        return min(1.0, score)
+
+    def _compute_archive_penalty(self, *, text: str, source_family: str, memory_role: str) -> float:
+        if memory_role == "archive_reference":
+            return 0.92
+        if memory_role == "trigger_only":
+            return 0.76
+        if self._looks_like_archive_payload(text):
+            return 0.74
+        if source_family == "logistics":
+            return 0.62
+        return 0.08
+
+    def _compute_current_relevance_score(self, *, text: str, context_blob: str) -> float:
+        compact = self._compact_structured_memory_text(text)
+        if not compact or not context_blob:
+            return 0.18
+        overlap = self._keyword_overlap_score(
+            self._normalize_thread_key(compact),
+            self._normalize_thread_key(context_blob),
+        )
+        return min(1.0, 0.18 + overlap * 0.82)
+
+    def _compute_historical_depth_score(self, slowline: SlowLine, *, now: datetime | None = None) -> float:
+        score = 0.1
+        touched = str(getattr(slowline, "last_meaningful_shift_at", "") or getattr(slowline, "last_touched_at", "") or "").strip()
+        if touched:
+            recency = self._compute_recency_score(touched, now=now)
+            score += max(0.0, 0.72 - recency)
+        linked_total = len(self._json_int_list(getattr(slowline, "linked_event_ids", "[]"))) + len(self._json_int_list(getattr(slowline, "linked_key_record_ids", "[]")))
+        if linked_total >= 3:
+            score += 0.16
+        if linked_total >= 6:
+            score += 0.12
+        return min(1.0, score)
 
     async def _persist_key_record_process_payload(
         self,
@@ -2514,6 +3132,17 @@ class StateMachine:
             str(payload.get("progress_status") or "").strip() or latest_change,
             fallback="completed" if str(record.status or "") == "archived" else "advancing",
         )
+        memory_role = str(payload.get("memory_role") or "").strip()
+        if memory_role not in {"bridge_core", "active_thread_detail", "trigger_only", "archive_reference"}:
+            memory_role = self._infer_memory_role(
+                source_family=source_family,
+                progress_status=progress_status,
+                scope=scope,
+                tension_level=self._infer_tension_level(latest_change, next_watch_point, str(record.content_text or "")),
+                unresolved_level=self._infer_unresolved_level(progress_status, next_watch_point, next_watch_point),
+                current_tension=next_watch_point,
+                text="\n".join([str(record.title or ""), str(record.content_text or ""), latest_change]),
+            )
         thread_hint = self._build_record_thread_hint(
             title=str(record.title or ""),
             tags=tags,
@@ -2540,6 +3169,7 @@ class StateMachine:
                 "latest_change": latest_change,
                 "previous_baseline": previous_baseline,
                 "next_watch_point": next_watch_point,
+                "memory_role": memory_role,
             }
         )
         serialized = json.dumps(normalized_payload, ensure_ascii=False)
@@ -2582,6 +3212,17 @@ class StateMachine:
             block = self._extract_event_field_block(str(event.description or ""), ["Key detail hooks", "detail_hooks"])
             detail_hooks = self._extract_detail_hooks_from_text(block or str(event.description or ""), limit=3)
         detail_hooks = [self._compact_structured_memory_text(str(item).strip())[:80] for item in detail_hooks if str(item).strip()][:3]
+        memory_role = str(payload.get("memory_role") or "").strip()
+        if memory_role not in {"bridge_core", "active_thread_detail", "trigger_only", "archive_reference"}:
+            memory_role = self._infer_memory_role(
+                source_family=source_family,
+                progress_status=progress_effect,
+                scope=scope,
+                tension_level=self._infer_tension_level(str(event.title or ""), str(event.description or ""), open_loop, " ".join(detail_hooks)),
+                unresolved_level=self._infer_unresolved_level(progress_effect, open_loop, open_loop),
+                current_tension=open_loop,
+                text="\n".join([str(event.title or ""), str(event.description or ""), " ".join(detail_hooks)]),
+            )
         thread_hint = " ".join(
             token
             for token in [
@@ -2610,6 +3251,7 @@ class StateMachine:
                 "progress_effect": progress_effect,
                 "detail_hooks": detail_hooks,
                 "open_loop": open_loop,
+                "memory_role": memory_role,
             }
         )
         serialized = json.dumps(normalized_payload, ensure_ascii=False)
@@ -2666,6 +3308,26 @@ class StateMachine:
         latest_change = self._compact_structured_memory_text(str(payload.get("latest_change") or "").strip())
         previous_baseline = self._compact_structured_memory_text(str(payload.get("previous_baseline") or "").strip())
         next_watch_point = self._compact_structured_memory_text(str(payload.get("next_watch_point") or "").strip())
+        memory_role = str(payload.get("memory_role") or "active_thread_detail").strip()
+        tension_level = self._infer_tension_level(latest_change, next_watch_point, str(record.content_text or ""))
+        unresolved_level = self._infer_unresolved_level(progress_status, next_watch_point, next_watch_point)
+        emotional_tension = self._infer_emotional_tension(
+            tension_level=tension_level,
+            unresolved_level=unresolved_level,
+            scope=scope,
+            text="\n".join([str(record.title or ""), str(record.content_text or ""), latest_change, next_watch_point]),
+        )
+        affective_direction = self._infer_affective_direction(
+            "\n".join([str(record.title or ""), str(record.content_text or ""), latest_change, next_watch_point])
+        )
+        preload_priority = self._compute_preload_priority(
+            scope=scope,
+            memory_role=memory_role,
+            progress_status=progress_status,
+            tension_level=tension_level,
+            unresolved_level=unresolved_level,
+            source_family=source_family,
+        )
         thread_key = self._normalize_thread_key(str(payload.get("thread_id") or "").strip())
         theme = self._build_slowline_theme(title=str(record.title or ""), source_family=source_family)
         hint_blob = self._compact_structured_memory_text(str(payload.get("thread_hint") or "").strip()) or " ".join(
@@ -2693,16 +3355,37 @@ class StateMachine:
             latest_change=latest_change,
             progress_status=progress_status,
         )
+        stage_summary = self._build_display_stage_summary(
+            source_family=source_family,
+            title=str(record.title or ""),
+            latest_change=latest_change,
+            next_watch_point=next_watch_point,
+            fallback_text=str(record.content_text or ""),
+        )
+        trajectory_display = self._build_display_trajectory_summary(
+            previous_baseline=previous_baseline,
+            latest_change=latest_change,
+            current_tension=next_watch_point,
+            existing=trajectory_summary,
+        ) or trajectory_summary
         fields = {
             "thread_key": thread_key,
             "theme": theme,
             "scope": scope,
             "source_family": source_family,
+            "memory_role": memory_role,
             "progress_status": progress_status,
-            "stage_summary": latest_change[:260],
-            "trajectory_summary": trajectory_summary[:560],
+            "tension_level": tension_level,
+            "unresolved_level": unresolved_level,
+            "preload_priority": preload_priority,
+            "stage_summary": stage_summary[:180],
+            "trajectory_summary": trajectory_display[:240],
             "current_tension": ("" if progress_status in {"completed", "dropped"} else next_watch_point[:180]),
-            "recent_movement_summary": latest_change[:260],
+            "recent_shift_summary": self._extract_display_core(latest_change, max_len=140),
+            "recent_movement_summary": self._extract_display_core(latest_change, max_len=140),
+            "last_meaningful_shift_at": str(record.updated_at or record.created_at or "") or None,
+            "emotional_tension": emotional_tension,
+            "affective_direction": affective_direction,
             "open_questions": json.dumps([next_watch_point] if next_watch_point and progress_status not in {"completed", "dropped"} else [], ensure_ascii=False),
             "salience": 0.78 if scope == "user_side" else 0.66,
             "last_touched_at": str(record.updated_at or record.created_at or "") or None,
@@ -2724,6 +3407,27 @@ class StateMachine:
         progress_status = str(payload.get("progress_effect") or "advancing")
         detail_hooks = [self._compact_structured_memory_text(str(item).strip()) for item in (payload.get("detail_hooks") or []) if str(item).strip()]
         open_loop = self._compact_structured_memory_text(str(payload.get("open_loop") or "").strip())
+        memory_role = str(payload.get("memory_role") or "active_thread_detail").strip()
+        stage_summary = detail_hooks[0] if detail_hooks else self._compact_structured_memory_text(str(event.title or event.description or "").strip())
+        tension_level = self._infer_tension_level(str(event.title or ""), str(event.description or ""), open_loop, " ".join(detail_hooks))
+        unresolved_level = self._infer_unresolved_level(progress_status, open_loop, open_loop)
+        emotional_tension = self._infer_emotional_tension(
+            tension_level=tension_level,
+            unresolved_level=unresolved_level,
+            scope=scope,
+            text="\n".join([str(event.title or ""), str(event.description or ""), open_loop, " ".join(detail_hooks)]),
+        )
+        affective_direction = self._infer_affective_direction(
+            "\n".join([str(event.title or ""), str(event.description or ""), open_loop, " ".join(detail_hooks)])
+        )
+        preload_priority = self._compute_preload_priority(
+            scope=scope,
+            memory_role=memory_role,
+            progress_status=progress_status,
+            tension_level=tension_level,
+            unresolved_level=unresolved_level,
+            source_family=source_family,
+        )
         thread_key = self._normalize_thread_key(str(payload.get("thread_id") or "").strip())
         theme = self._build_slowline_theme(title=str(event.title or ""), source_family=source_family)
         hint_blob = self._compact_structured_memory_text(str(payload.get("thread_hint") or "").strip()) or " ".join(
@@ -2745,13 +3449,25 @@ class StateMachine:
             linked_event_ids.update(self._json_int_list(slowline.linked_event_ids))
             existing_trajectory = str(getattr(slowline, "trajectory_summary", "") or "")
             previous_stage = str(getattr(slowline, "stage_summary", "") or "")
-        stage_summary = detail_hooks[0] if detail_hooks else self._compact_structured_memory_text(str(event.title or event.description or "").strip())
         trajectory_summary = self._merge_trajectory_summary(
             existing=existing_trajectory,
             previous_baseline=previous_stage,
             latest_change=stage_summary,
             progress_status=progress_status,
         )
+        stage_display = self._build_display_stage_summary(
+            source_family=source_family,
+            title=str(event.title or ""),
+            latest_change=stage_summary,
+            next_watch_point=open_loop,
+            fallback_text=str(event.description or ""),
+        )
+        trajectory_display = self._build_display_trajectory_summary(
+            previous_baseline=previous_stage,
+            latest_change=stage_summary,
+            current_tension=open_loop,
+            existing=trajectory_summary,
+        ) or trajectory_summary
         open_questions = self._parse_json_list(getattr(slowline, "open_questions", "[]")) if slowline is not None else []
         if open_loop:
             open_questions.append(open_loop)
@@ -2760,11 +3476,19 @@ class StateMachine:
             "theme": theme,
             "scope": scope,
             "source_family": source_family,
+            "memory_role": memory_role,
             "progress_status": progress_status,
-            "stage_summary": stage_summary[:260],
-            "trajectory_summary": trajectory_summary[:560],
+            "tension_level": tension_level,
+            "unresolved_level": unresolved_level,
+            "preload_priority": preload_priority,
+            "stage_summary": stage_display[:180],
+            "trajectory_summary": trajectory_display[:240],
             "current_tension": ("" if progress_status in {"completed", "dropped"} else open_loop[:180]),
-            "recent_movement_summary": stage_summary[:260],
+            "recent_shift_summary": self._extract_display_core(stage_summary, max_len=140),
+            "recent_movement_summary": self._extract_display_core(stage_summary, max_len=140),
+            "last_meaningful_shift_at": str(event.created_at or "") or None,
+            "emotional_tension": emotional_tension,
+            "affective_direction": affective_direction,
             "open_questions": json.dumps(list(dict.fromkeys([q for q in open_questions if q]))[:6], ensure_ascii=False),
             "salience": max(0.62, min(0.92, 0.55 + float(event.importance_score or 0.0) / 20.0)),
             "last_touched_at": str(event.created_at or "") or None,
@@ -2885,470 +3609,167 @@ class StateMachine:
         }
         return any(keyword in line_theme for keyword in fallback_map.get(theme_text, ()))
 
-    async def _build_relationship_state_text(self) -> str:
-        state = await self._refresh_relationship_state()
-        topics = self._parse_json_list(state.proactive_topics)
-        tendency = "靠近"
-        if state.space_need_level >= 0.7:
-            tendency = "保留空间"
-        elif state.concern_level >= 0.72:
-            tendency = "想确认近况"
-        elif state.pride_or_distance >= 0.62:
-            tendency = "观察"
-        hours_gap = float(getattr(state, "hours_since_meaningful_contact", 0.0) or 0.0)
-        hours_text = f"{hours_gap:.1f}".rstrip("0").rstrip(".")
-        lines = [
-            f"- 最近实质联系间隔：{hours_text} 小时（{state.contact_recency_bucket}）",
-            f"- 当前关系感受：{str(state.relationship_feeling_summary or '').strip() or '关系处在可感知但克制的短期波动中。'}",
-            f"- 当前更偏向：{tendency}",
-        ]
-        if topics:
-            lines.append("- 可主动开启的话题：")
-            lines.extend(f"  - {topic}" for topic in topics[:3])
-        return "\n".join(lines)
-
-    async def _build_recent_life_line_digest(self, today_str: str, yesterday_str: str) -> str:
-        traces, events = await self._load_recent_injection_materials(
-            today_str=today_str,
-            yesterday_str=yesterday_str,
-            today_limit=8,
-            yesterday_limit=8,
+    def _compute_mainline_score(self, group: dict, *, now: datetime | None = None) -> float:
+        summary = str(group.get("summary") or "")
+        recent_shift = str(group.get("recent_shift") or "")
+        trajectory = str(group.get("trajectory") or "")
+        scope = str(group.get("scope") or "shared")
+        source_family = str(group.get("source_family") or "daily_life")
+        memory_role = str(group.get("memory_role") or "active_thread_detail")
+        recency = self._compute_recency_score(str(group.get("last_shift_at") or ""), now=now)
+        tension = self._score_level(str(group.get("tension_level") or "medium"))
+        unresolved = self._score_level(str(group.get("unresolved_level") or "medium"))
+        relationship = self._compute_relationship_score(scope, source_family)
+        embodiment = self._compute_embodiment_score("\n".join([summary, recent_shift]))
+        continuity = min(1.0, 0.18 + 0.12 * len(group.get("events") or []) + 0.08 * len(group.get("records") or []))
+        novelty = self._compute_novelty_score(summary=summary or trajectory, recent_shift=recent_shift)
+        archive_penalty = self._compute_archive_penalty(
+            text="\n".join([summary, trajectory, recent_shift]),
+            source_family=source_family,
+            memory_role=memory_role,
         )
-        slowlines = await self.db.list_slowlines(status="active", limit=10)
-        if slowlines:
-            groups: list[dict] = []
-            for slowline in slowlines:
-                line_traces: list[LifeFlowTrace] = []
-                line_events: list[EventAnchor] = []
-                for trace in traces:
-                    details = self._parse_life_flow_details(trace.details_json)
-                    theme = str(
-                        details.get("life_theme")
-                        or self._infer_life_flow_theme(str(trace.summary or ""), details, source=str(trace.source or ""))
-                    )
-                    if self._theme_matches_slowline(theme, slowline):
-                        line_traces.append(trace)
-                for event in events:
-                    if self._theme_matches_slowline(self._infer_event_theme(event), slowline):
-                        line_events.append(event)
-                if not line_traces and not line_events:
-                    continue
-                groups.append(
-                    {
-                        "label": self._compact_structured_memory_text(str(slowline.theme or "").strip()) or "持续生活线",
-                        "scope": str(getattr(slowline, "scope", "shared") or "shared"),
-                        "progress_status": str(getattr(slowline, "progress_status", "open") or "open"),
-                        "summary": self._compact_structured_memory_text(
-                            str(slowline.stage_summary or slowline.recent_movement_summary or "").strip()
-                        ),
-                        "trajectory": self._compact_structured_memory_text(
-                            str(getattr(slowline, "trajectory_summary", "") or "").strip()
-                        ),
-                        "open_question": self._compact_structured_memory_text(
-                            ", ".join(self._parse_json_list(slowline.open_questions)[:1])
-                        ),
-                        "events": line_events[:5],
-                        "traces": line_traces[:3],
-                        "salience": float(slowline.salience or 0.0),
-                    }
-                )
-            if groups:
-                ordered_groups = sorted(
-                    groups,
-                    key=lambda item: (
-                        1 if item.get("scope") == "user_side" else 0,
-                        1 if item.get("progress_status") not in {"completed", "dropped"} else 0,
-                        float(item.get("salience") or 0.0),
-                    ),
-                    reverse=True,
-                )
-                lines: list[str] = []
-                for group in ordered_groups[:4]:
-                    summary = self._compact_structured_memory_text(str(group.get("summary") or "").strip())
-                    if not summary:
-                        continue
-                    status_hint = {
-                        "paused": "已被压住",
-                        "ready_to_close": "接近收束",
-                        "completed": "阶段完成",
-                        "dropped": "暂时放弃",
-                    }.get(str(group.get("progress_status") or ""), "持续推进")
-                    lines.append(f"【{group.get('label') or '生活线'}】{summary}（{status_hint}）")
-                    trajectory = self._compact_structured_memory_text(str(group.get("trajectory") or "").strip())
-                    if trajectory and self._keyword_overlap_score(trajectory.lower(), summary.lower()) < 0.72:
-                        lines.append(f"纵向概括：{trajectory}")
-                    detail_lines: list[str] = []
-                    for trace in group.get("traces") or []:
-                        trace_text = self._compact_structured_memory_text(str(trace.summary or "").strip())
-                        if trace_text and self._keyword_overlap_score(trace_text.lower(), summary.lower()) < 0.75:
-                            detail_lines.append(f"  - [{trace.trace_date}] {trace_text}")
-                    for event in group.get("events") or []:
-                        if not isinstance(event, EventAnchor):
-                            continue
-                        desc = self._compact_structured_memory_text(
-                            self._normalize_event_detail(event.description or event.title or "")
-                        )
-                        if not desc or self._keyword_overlap_score(desc.lower(), summary.lower()) >= 0.7:
-                            continue
-                        detail_lines.append(f"  - [{event.date}] {(event.title or '').strip() or '未命名事件'}：{desc}")
-                    if detail_lines:
-                        lines.append("关键细节：")
-                        lines.extend(detail_lines[:5])
-                    open_question = self._compact_structured_memory_text(str(group.get("open_question") or "").strip())
-                    if open_question:
-                        lines.append(f"待续：{open_question}")
-                    lines.append("")
-                compact = "\n".join(line for line in lines if line is not None).strip()
-                if compact:
-                    return compact
-        groups: list[dict] = []
-        theme_names = {
-            "relationship": "关系/对话线",
-            "medical": "医疗线",
-            "study": "学习线",
-            "work": "工作/项目线",
-            "mobility": "出行线",
-            "routine": "生活节律线",
-            "conversation": "对话线",
-            "general": "日常推进线",
-        }
-        for slowline in slowlines:
-            line_traces = []
-            line_events = []
-            for trace in traces:
-                details = self._parse_life_flow_details(trace.details_json)
-                theme = str(details.get("life_theme") or self._infer_life_flow_theme(str(trace.summary or ""), details, source=str(trace.source or "")))
-                if self._theme_matches_slowline(theme, slowline):
-                    line_traces.append(trace)
-            for event in events:
-                if self._theme_matches_slowline(self._infer_event_theme(event), slowline):
-                    line_events.append(event)
-            if not line_traces and not line_events:
-                continue
-            groups.append(
-                {
-                    "label": str(slowline.theme or "").strip() or "持续生活线",
-                    "source_family": str(slowline.source_family or "autonomous"),
-                    "summary": str(slowline.stage_summary or slowline.recent_movement_summary or "").strip(),
-                    "open_question": ", ".join(self._parse_json_list(slowline.open_questions)[:1]),
-                    "events": line_events[:5],
-                    "traces": line_traces[:3],
-                    "salience": float(slowline.salience or 0.0),
-                }
-            )
-        if not groups:
-            theme_groups: dict[str, dict] = {}
-            for trace in traces:
-                details = self._parse_life_flow_details(trace.details_json)
-                theme = str(details.get("life_theme") or self._infer_life_flow_theme(str(trace.summary or ""), details, source=str(trace.source or "")))
-                theme_groups.setdefault(
-                    theme,
-                    {
-                        "label": theme_names.get(theme, theme),
-                        "source_family": self._source_family_for_trace(trace),
-                        "summary": str(trace.summary or "").strip(),
-                        "open_question": "",
-                        "events": [],
-                        "traces": [],
-                        "salience": 0.5,
-                    },
-                )
-                theme_groups[theme]["traces"].append(trace)
-            for event in events:
-                theme = self._infer_event_theme(event)
-                if theme in theme_groups:
-                    theme_groups[theme]["events"].append(event)
-            groups = list(theme_groups.values())
-        conversation_groups = [group for group in groups if group.get("source_family") in {"conversation", "mixed"}]
-        autonomous_groups = [group for group in groups if group.get("source_family") == "autonomous"]
-        ordered_groups: list[dict] = []
-        if conversation_groups:
-            ordered_groups.append(max(conversation_groups, key=lambda item: float(item.get("salience") or 0.0)))
-        if autonomous_groups:
-            candidate = max(autonomous_groups, key=lambda item: float(item.get("salience") or 0.0))
-            if candidate not in ordered_groups:
-                ordered_groups.append(candidate)
-        for group in sorted(groups, key=lambda item: float(item.get("salience") or 0.0), reverse=True):
-            if group not in ordered_groups:
-                ordered_groups.append(group)
-        lines: list[str] = []
-        for group in ordered_groups[:4]:
-            summary = str(group.get("summary") or "").strip()
-            if not summary and group.get("traces"):
-                summary = str(group["traces"][0].summary or "").strip()
-            if not summary:
-                continue
-            lines.append(f"- {group.get('label') or '生活线'}：{summary}")
-            detail_lines: list[str] = []
-            for trace in group.get("traces") or []:
-                trace_text = str(trace.summary or "").strip()
-                if trace_text and self._keyword_overlap_score(trace_text.lower(), summary.lower()) < 0.75:
-                    detail_lines.append(f"  - [{trace.trace_date}] {trace_text}")
-            for event in group.get("events") or []:
-                if not isinstance(event, EventAnchor):
-                    continue
-                desc = self._normalize_event_detail(event.description or event.title or "")
-                if not desc or self._keyword_overlap_score(desc.lower(), summary.lower()) >= 0.7:
-                    continue
-                detail_lines.append(f"  - [{event.date}] {(event.title or '').strip() or '未命名事件'}：{desc}")
-            if detail_lines:
-                lines.append("  关键细节：")
-                lines.extend(detail_lines[:5])
-            open_question = str(group.get("open_question") or "").strip()
-            if open_question:
-                lines.append(f"  待续：{open_question}")
-        return "\n".join(lines) if lines else "（近两日暂无可聚合的生活主线）"
+        score = (
+            tension * 0.22
+            + unresolved * 0.2
+            + relationship * 0.18
+            + recency * 0.16
+            + embodiment * 0.12
+            + continuity * 0.07
+            + novelty * 0.05
+        ) - archive_penalty * 0.24
+        return max(0.0, min(1.0, score))
 
-    async def _build_recent_turning_details_text(
+    def _compute_bridge_score(
+        self,
+        slowline: SlowLine,
+        *,
+        context_blob: str,
+        excluded_thread_keys: set[str],
+        now: datetime | None = None,
+    ) -> float:
+        thread_key = self._normalize_thread_key(str(getattr(slowline, "thread_key", "") or ""))
+        if thread_key and thread_key in excluded_thread_keys:
+            return 0.0
+        memory_role = str(getattr(slowline, "memory_role", "active_thread_detail") or "active_thread_detail")
+        source_family = str(getattr(slowline, "source_family", "daily_life") or "daily_life")
+        scope = str(getattr(slowline, "scope", "shared") or "shared")
+        summary_blob = "\n".join(
+            [
+                str(getattr(slowline, "trajectory_summary", "") or ""),
+                str(getattr(slowline, "recent_shift_summary", "") or ""),
+                str(getattr(slowline, "current_tension", "") or ""),
+                ", ".join(self._parse_json_list(getattr(slowline, "open_questions", "[]"))[:2]),
+            ]
+        )
+        recency = self._compute_recency_score(
+            str(getattr(slowline, "last_meaningful_shift_at", "") or getattr(slowline, "last_touched_at", "") or ""),
+            now=now,
+        )
+        continuity = self._compute_continuity_score(slowline)
+        unresolved = self._score_level(str(getattr(slowline, "unresolved_level", "medium") or "medium"))
+        relationship = self._compute_relationship_score(scope, source_family)
+        current_relevance = self._compute_current_relevance_score(text=summary_blob, context_blob=context_blob)
+        historical_depth = self._compute_historical_depth_score(slowline, now=now)
+        archive_penalty = self._compute_archive_penalty(text=summary_blob, source_family=source_family, memory_role=memory_role)
+        mainline_overlap_penalty = min(1.0, self._compute_current_relevance_score(text=summary_blob, context_blob=context_blob) if recency > 0.68 else 0.0)
+        score = (
+            continuity * 0.22
+            + unresolved * 0.18
+            + relationship * 0.14
+            + current_relevance * 0.2
+            + historical_depth * 0.18
+            + max(0.0, 1.0 - recency) * 0.1
+        ) - archive_penalty * 0.28 - mainline_overlap_penalty * 0.12
+        return max(0.0, min(1.0, score))
+
+    def _score_mainline_detail_candidate(
         self,
         *,
-        today_str: str,
-        yesterday_str: str,
-        today_limit: int,
-        yesterday_limit: int,
-    ) -> str:
-        traces, events = await self._load_recent_injection_materials(
-            today_str=today_str,
-            yesterday_str=yesterday_str,
-            today_limit=today_limit,
-            yesterday_limit=yesterday_limit,
-        )
-        slowline_text = await self._build_recent_life_line_digest(today_str, yesterday_str)
-        reference = slowline_text.lower()
-        lines: list[str] = []
-        for trace in traces:
-            summary = str(trace.summary or "").strip()
-            if not summary:
-                continue
-            if self._keyword_overlap_score(summary.lower(), reference) >= 0.72:
-                continue
-            lines.append(f"- [{trace.trace_date}] {summary}")
-        for event in events:
-            title = (event.title or "").strip() or "未命名事件"
-            desc = self._normalize_event_detail(event.description or "")
-            combined = f"{title}\n{desc}".lower()
-            if self._keyword_overlap_score(combined, reference) >= 0.68:
-                continue
-            lines.append(f"- [{event.date}] {title}：{desc}")
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for line in lines:
-            key = re.sub(r"\s+", " ", line.strip().lower())
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            deduped.append(line)
-        return "\n".join(deduped[:6]) if deduped else "（近景碎片已被上方主线充分覆盖）"
+        text: str,
+        summary: str,
+        scope: str,
+        source_family: str,
+        kind: str,
+    ) -> float:
+        compact = self._compact_structured_memory_text(text)
+        if not compact:
+            return 0.0
+        if self._looks_like_archive_payload(compact):
+            return 0.0
+        score = 0.16
+        if self._keyword_overlap_score(compact.lower(), summary.lower()) < 0.82:
+            score += 0.16
+        score += {"low": 0.02, "medium": 0.12, "high": 0.28}.get(self._infer_tension_level(compact), 0.08)
+        if any(token in compact for token in ("说", "问", "回", "抱", "摸", "疼", "哭", "吃", "睡", "停", "看", "去")):
+            score += 0.14
+        if any(token in compact for token in ("转向", "决定", "拒绝", "改写", "确认", "约定", "进入", "报告", "出现")):
+            score += 0.16
+        if scope in {"user_side", "shared"}:
+            score += 0.12
+        if source_family == "relationship":
+            score += 0.08
+        if kind == "event":
+            score += 0.05
+        return score
 
-    async def _build_memory_bridge_text(self, *, before_date: str, limit: int = 5) -> str:
-        slowlines = await self.db.list_slowlines(status="active", limit=max(6, limit + 2))
-        if slowlines:
-            lines: list[str] = []
-            for slowline in slowlines[:5]:
-                trajectory = self._compact_structured_memory_text(
-                    str(getattr(slowline, "trajectory_summary", "") or "").strip()
-                )
-                if not trajectory:
-                    trajectory = self._compact_structured_memory_text(str(slowline.stage_summary or "").strip())
-                if not trajectory:
-                    continue
-                stage_summary = self._compact_structured_memory_text(str(slowline.stage_summary or "").strip())
-                label = self._compact_structured_memory_text(str(slowline.theme or "").strip()) or "持续生活线"
-                tension = self._compact_structured_memory_text(str(slowline.current_tension or "").strip())
-                open_question = self._compact_structured_memory_text(
-                    ", ".join(self._parse_json_list(slowline.open_questions)[:1])
-                )
-                if stage_summary and self._keyword_overlap_score(stage_summary.lower(), trajectory.lower()) >= 0.82 and not tension and not open_question:
-                    continue
-                line = f"- {label}：{trajectory}"
-                if tension and self._keyword_overlap_score(tension.lower(), trajectory.lower()) < 0.75:
-                    line += f"；当前卡点：{tension}"
-                elif open_question and self._keyword_overlap_score(open_question.lower(), trajectory.lower()) < 0.75:
-                    line += f"；待观察：{open_question}"
-                lines.append(line)
-            if lines:
-                return "\n".join(lines[:5])
-        events = await self.db.get_recent_events_before_date(before_date, limit=limit, include_archived=False)
-        older_events = [event for event in events if str(event.date or "") < before_date]
-        traces = await self.db.get_recent_life_flow_traces(limit=limit + 2)
-        older_traces = [trace for trace in traces if str(trace.trace_date or "") < before_date]
-        lines: list[str] = []
-        if older_traces:
-            lines.append("更早的生活背景仍延续在这些阶段线上：")
-            for trace in older_traces[:2]:
-                lines.append(f"- [{trace.trace_date}] {str(trace.summary or '').strip()}")
-        if older_events:
-            lines.append("更早但仍有影响的事件锚点包括：")
-            for event in older_events[:3]:
-                title = (event.title or "").strip() or "未命名事件"
-                lines.append(f"- [{event.date}] {title}")
-        return "\n".join(lines) if lines else "（更早的背景暂时已被近景主线充分吸收）"
+    def _score_fragment_candidate(
+        self,
+        *,
+        text: str,
+        scope: str,
+        source_family: str,
+    ) -> float:
+        compact = self._compact_structured_memory_text(text)
+        if not compact:
+            return 0.0
+        if self._looks_like_archive_payload(compact):
+            return 0.0
+        score = 0.1
+        score += {"low": 0.02, "medium": 0.1, "high": 0.18}.get(self._infer_tension_level(compact), 0.06)
+        if len(compact) >= 36:
+            score += 0.08
+        if any(token in compact for token in ("凌晨", "中午", "下午", "傍晚", "深夜", "返回", "下课", "终端", "布洛芬", "生理期")):
+            score += 0.1
+        if scope in {"user_side", "shared"}:
+            score += 0.08
+        if source_family == "relationship":
+            score += 0.06
+        return score
 
-    async def _build_injectable_context(self, snapshot_text: str) -> str:
-        l1_char = await self.prompt_manager.get_layer_content(KEY_L1_CHARACTER_BACKGROUND)
-        l1_user = await self.prompt_manager.get_layer_content(KEY_L1_USER_BACKGROUND)
-        l2_char = await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY)
-        l2_rel = await self.prompt_manager.get_layer_content(KEY_L2_RELATIONSHIP_DYNAMICS)
-        l2_life = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
-        relationship_state = await self._refresh_relationship_state(latest_snapshot_text=snapshot_text)
-        today_limit = await self._get_inject_hot_events_limit()
-        yesterday_limit = await self._get_inject_yesterday_events_limit()
-        now_shanghai = shanghai_now()
-        today_str = now_shanghai.date().isoformat()
-        yesterday_str = (now_shanghai.date() - timedelta(days=1)).isoformat()
-        plan_summary = "（今日尚无计划）"
-        plan_progress_awareness = "（今日暂无明显的事项推进压力）"
-        if self.plan_engine is not None:
-            try:
-                plan_summary = await self.plan_engine.get_plan_summary_text()
-                plan_progress_awareness = await self.plan_engine.get_plan_progress_awareness_text()
-            except Exception:
-                logger.exception("Failed to load plan summary for injectable context.")
-        recent_trace_text = await self._build_recent_life_line_digest(today_str, yesterday_str)
-        recent_event_detail_text = await self._build_recent_turning_details_text(
-            today_str=today_str,
-            yesterday_str=yesterday_str,
-            today_limit=today_limit,
-            yesterday_limit=yesterday_limit,
-        )
-        memory_bridge_text = await self._build_memory_bridge_text(before_date=yesterday_str)
-        memory_bridge_text = self._dedupe_memory_bridge_text(memory_bridge_text, recent_trace_text)
-        relationship_block = await self._build_relationship_state_text()
-        latest_claims = await self.db.list_conversation_time_claims(status="closed", limit=1)
-        latest_claim_summary = "（最近没有对话占时改写记录）"
-        if latest_claims:
-            latest_claim_summary = (
-                str(latest_claims[0].context_summary or "").strip()[:220]
-                or latest_claim_summary
-            )
-        schedule_block = plan_summary.strip() or "（今日尚无计划）"
-        if latest_claim_summary.strip() and "没有对话占时改写记录" not in latest_claim_summary:
-            schedule_block = f"{schedule_block}\n最近一次对话占时改写：{latest_claim_summary}"
-        if plan_progress_awareness.strip():
-            schedule_block = f"{schedule_block}\n事项推进感知：\n{plan_progress_awareness}"
-        if str(relationship_state.plan_bias_hint or "").strip():
-            schedule_block = f"{schedule_block}\n关系倾向提示：{str(relationship_state.plan_bias_hint or '').strip()}"
-        return (
-            "【当前状态快照】\n"
-            f"{snapshot_text}\n\n"
-            "【短期关系感知】\n"
-            f"{relationship_block}\n\n"
-            "【近期生活主线】\n"
-            f"{recent_trace_text}\n\n"
-            "【近景碎片池】\n"
-            f"{recent_event_detail_text}\n\n"
-            "【近程记忆桥】\n"
-            f"{memory_bridge_text}\n\n"
-            "【当前日程与偏差】\n"
-            f"{schedule_block}\n\n"
-            "【L2 动态层】\n"
-            f"角色人格：{l2_char}\n\n"
-            f"关系模式：{l2_rel}\n\n"
-            f"生活状态：{l2_life}\n\n"
-            "【L1 稳定层】\n"
-            f"角色背景：{l1_char}\n\n"
-            f"用户背景：{l1_user}"
-        )
-
-    async def _build_recent_life_line_digest(self, today_str: str, yesterday_str: str) -> str:
+    async def _collect_recent_mainline_groups(self, today_str: str, yesterday_str: str) -> list[dict]:
         traces, events = await self._load_recent_injection_materials(
             today_str=today_str,
             yesterday_str=yesterday_str,
             today_limit=8,
             yesterday_limit=8,
         )
-        slowlines = await self.db.list_slowlines(status="active", limit=10)
-        if slowlines:
-            groups: list[dict] = []
-            for slowline in slowlines:
-                line_traces: list[LifeFlowTrace] = []
-                line_events: list[EventAnchor] = []
-                for trace in traces:
-                    details = self._parse_life_flow_details(trace.details_json)
-                    theme = str(
-                        details.get("life_theme")
-                        or self._infer_life_flow_theme(str(trace.summary or ""), details, source=str(trace.source or ""))
-                    )
-                    if self._theme_matches_slowline(theme, slowline):
-                        line_traces.append(trace)
-                for event in events:
-                    if self._theme_matches_slowline(self._infer_event_theme(event), slowline):
-                        line_events.append(event)
-                if not line_traces and not line_events:
-                    continue
-                groups.append(
-                    {
-                        "label": self._compact_structured_memory_text(str(slowline.theme or "").strip()) or "持续生活线",
-                        "scope": str(getattr(slowline, "scope", "shared") or "shared"),
-                        "progress_status": str(getattr(slowline, "progress_status", "open") or "open"),
-                        "summary": self._compact_structured_memory_text(
-                            str(slowline.stage_summary or slowline.recent_movement_summary or "").strip()
-                        ),
-                        "trajectory": self._compact_structured_memory_text(
-                            str(getattr(slowline, "trajectory_summary", "") or "").strip()
-                        ),
-                        "open_question": self._compact_structured_memory_text(
-                            ", ".join(self._parse_json_list(slowline.open_questions)[:1])
-                        ),
-                        "events": line_events[:5],
-                        "traces": line_traces[:3],
-                        "salience": float(slowline.salience or 0.0),
-                    }
-                )
-            if groups:
-                ordered_groups = sorted(
-                    groups,
-                    key=lambda item: (
-                        1 if item.get("scope") == "user_side" else 0,
-                        1 if item.get("progress_status") not in {"completed", "dropped"} else 0,
-                        float(item.get("salience") or 0.0),
-                    ),
-                    reverse=True,
-                )
-                lines: list[str] = []
-                for group in ordered_groups[:4]:
-                    summary = self._compact_structured_memory_text(str(group.get("summary") or "").strip())
-                    if not summary:
-                        continue
-                    status_hint = {
-                        "paused": "已被压住",
-                        "ready_to_close": "接近收束",
-                        "completed": "阶段完成",
-                        "dropped": "暂时放弃",
-                    }.get(str(group.get("progress_status") or ""), "持续推进")
-                    lines.append(f"【{group.get('label') or '生活线'}】{summary}（{status_hint}）")
-                    trajectory = self._compact_structured_memory_text(str(group.get("trajectory") or "").strip())
-                    if trajectory and self._keyword_overlap_score(trajectory.lower(), summary.lower()) < 0.72:
-                        lines.append(f"纵向概括：{trajectory}")
-                    detail_lines: list[str] = []
-                    for trace in group.get("traces") or []:
-                        trace_text = self._compact_structured_memory_text(str(trace.summary or "").strip())
-                        if trace_text and self._keyword_overlap_score(trace_text.lower(), summary.lower()) < 0.75:
-                            detail_lines.append(f"  - [{trace.trace_date}] {trace_text}")
-                    for event in group.get("events") or []:
-                        if not isinstance(event, EventAnchor):
-                            continue
-                        desc = self._compact_structured_memory_text(
-                            self._normalize_event_detail(event.description or event.title or "")
-                        )
-                        if not desc or self._keyword_overlap_score(desc.lower(), summary.lower()) >= 0.7:
-                            continue
-                        detail_lines.append(f"  - [{event.date}] {(event.title or '').strip() or '未命名事件'}：{desc}")
-                    if detail_lines:
-                        lines.append("关键细节：")
-                        lines.extend(detail_lines[:5])
-                    open_question = self._compact_structured_memory_text(str(group.get("open_question") or "").strip())
-                    if open_question:
-                        lines.append(f"待续：{open_question}")
-                    lines.append("")
-                compact = "\n".join(line for line in lines if line is not None).strip()
-                if compact:
-                    return compact
+        recent_key_records = await self.db.get_recent_key_records(limit=16, include_archived=False)
+        slowlines = await self.db.list_slowlines(status="active", limit=32)
         groups: list[dict] = []
-
         for slowline in slowlines:
+            memory_role = str(getattr(slowline, "memory_role", "active_thread_detail") or "active_thread_detail")
+            if memory_role in {"trigger_only", "archive_reference"}:
+                continue
+            existing_events, existing_records = await self._load_thread_all_materials(slowline)
+            if not existing_events and not existing_records:
+                if getattr(slowline, "id", None) is not None:
+                    await self.db.update_slowline(int(slowline.id), status="archived")
+                continue
+            if self._looks_like_archive_payload(
+                "\n".join(
+                    [
+                        str(slowline.theme or ""),
+                        str(slowline.stage_summary or ""),
+                        str(getattr(slowline, "trajectory_summary", "") or ""),
+                        str(slowline.current_tension or ""),
+                    ]
+                )
+            ) and memory_role != "bridge_core":
+                continue
             line_traces: list[LifeFlowTrace] = []
             line_events: list[EventAnchor] = []
+            line_records: list[KeyRecord] = []
+            thread_key = str(getattr(slowline, "thread_key", "") or "").strip()
             for trace in traces:
                 details = self._parse_life_flow_details(trace.details_json)
                 theme = str(
@@ -3358,91 +3779,152 @@ class StateMachine:
                 if self._theme_matches_slowline(theme, slowline):
                     line_traces.append(trace)
             for event in events:
+                payload = self._parse_json_object(getattr(event, "meta_json", None))
+                if thread_key and self._normalize_thread_key(str(payload.get("thread_id") or "").strip()) == thread_key:
+                    line_events.append(event)
+                    continue
                 if self._theme_matches_slowline(self._infer_event_theme(event), slowline):
                     line_events.append(event)
-            if not line_traces and not line_events:
+            for record in recent_key_records:
+                payload = self._parse_json_object(record.content_json)
+                if thread_key and self._normalize_thread_key(str(payload.get("thread_id") or "").strip()) == thread_key:
+                    line_records.append(record)
+                    continue
+                record_theme = self._build_slowline_theme(
+                    title=str(record.title or ""),
+                    source_family=self._slowline_family_from_record(record),
+                )
+                if self._theme_matches_slowline(record_theme, slowline):
+                    line_records.append(record)
+            if not line_traces and not line_events and not line_records:
                 continue
+            label = self._resolve_thread_label(slowline, events=existing_events, records=existing_records)
             groups.append(
                 {
-                    "label": self._display_label_for_theme(str(slowline.theme or "").strip()),
-                    "source_family": str(slowline.source_family or "autonomous"),
+                    "thread_key": self._normalize_thread_key(thread_key),
+                    "label": label,
+                    "scope": str(getattr(slowline, "scope", "shared") or "shared"),
+                    "source_family": str(getattr(slowline, "source_family", "daily_life") or "daily_life"),
+                    "memory_role": memory_role,
+                    "progress_status": str(getattr(slowline, "progress_status", "open") or "open"),
+                    "tension_level": str(getattr(slowline, "tension_level", "medium") or "medium"),
+                    "unresolved_level": str(getattr(slowline, "unresolved_level", "medium") or "medium"),
+                    "preload_priority": float(getattr(slowline, "preload_priority", 0.5) or 0.5),
                     "summary": self._compact_structured_memory_text(
                         str(slowline.stage_summary or slowline.recent_movement_summary or "").strip()
+                    ),
+                    "trajectory": self._compact_structured_memory_text(
+                        str(getattr(slowline, "trajectory_summary", "") or "").strip()
+                    ),
+                    "recent_shift": self._compact_structured_memory_text(
+                        str(getattr(slowline, "recent_shift_summary", "") or getattr(slowline, "recent_movement_summary", "") or "").strip()
                     ),
                     "open_question": self._compact_structured_memory_text(
                         ", ".join(self._parse_json_list(slowline.open_questions)[:1])
                     ),
-                    "events": line_events[:5],
-                    "traces": line_traces[:3],
+                    "events": line_events[:6],
+                    "traces": line_traces[:4],
+                    "records": line_records[:4],
                     "salience": float(slowline.salience or 0.0),
+                    "last_shift_at": str(getattr(slowline, "last_meaningful_shift_at", "") or getattr(slowline, "last_touched_at", "") or ""),
                 }
             )
+        return groups
 
+    async def _build_recent_life_line_digest(self, today_str: str, yesterday_str: str) -> str:
+        groups = await self._collect_recent_mainline_groups(today_str, yesterday_str)
         if not groups:
-            theme_groups: dict[str, dict] = {}
-            for trace in traces:
-                details = self._parse_life_flow_details(trace.details_json)
-                theme = str(
-                    details.get("life_theme")
-                    or self._infer_life_flow_theme(str(trace.summary or ""), details, source=str(trace.source or ""))
-                )
-                theme_groups.setdefault(
-                    theme,
-                    {
-                        "label": self._display_label_for_theme(theme),
-                        "source_family": self._source_family_for_trace(trace),
-                        "summary": self._compact_structured_memory_text(str(trace.summary or "").strip()),
-                        "open_question": "",
-                        "events": [],
-                        "traces": [],
-                        "salience": 0.5,
-                    },
-                )
-                theme_groups[theme]["traces"].append(trace)
-            for event in events:
-                theme = self._infer_event_theme(event)
-                if theme in theme_groups:
-                    theme_groups[theme]["events"].append(event)
-            groups = list(theme_groups.values())
-
-        conversation_groups = [group for group in groups if group.get("source_family") in {"conversation", "mixed"}]
-        autonomous_groups = [group for group in groups if group.get("source_family") == "autonomous"]
-        ordered_groups: list[dict] = []
-        if conversation_groups:
-            ordered_groups.append(max(conversation_groups, key=lambda item: float(item.get("salience") or 0.0)))
-        if autonomous_groups:
-            candidate = max(autonomous_groups, key=lambda item: float(item.get("salience") or 0.0))
-            if candidate not in ordered_groups:
-                ordered_groups.append(candidate)
-        for group in sorted(groups, key=lambda item: float(item.get("salience") or 0.0), reverse=True):
-            if group not in ordered_groups:
-                ordered_groups.append(group)
-
+            return "（近两日暂无可聚合的生活主线）"
+        now_dt = shanghai_now()
+        ordered_groups = sorted(groups, key=lambda item: self._compute_mainline_score(item, now=now_dt), reverse=True)
         lines: list[str] = []
+        used_detail_fingerprints: set[str] = set()
         for group in ordered_groups[:4]:
-            summary = self._compact_structured_memory_text(str(group.get("summary") or "").strip())
-            if not summary and group.get("traces"):
-                summary = self._compact_structured_memory_text(str(group["traces"][0].summary or "").strip())
+            label = str(group.get("label") or "生活线")
+            summary = self._strip_title_prefix(label, str(group.get("summary") or "").strip())
             if not summary:
                 continue
-            lines.append(f"【{group.get('label') or '生活线'}】")
-            detail_lines: list[str] = []
+            status_hint = {
+                "paused": "已被压住",
+                "ready_to_close": "接近收束",
+                "completed": "阶段完成",
+                "dropped": "暂时放弃",
+            }.get(str(group.get("progress_status") or ""), "持续推进")
+            lines.append(f"【{label}】{summary}（{status_hint}）")
+            trajectory = self._strip_title_prefix(label, str(group.get("trajectory") or "").strip())
+            if trajectory and self._keyword_overlap_score(trajectory.lower(), summary.lower()) < 0.72:
+                lines.append(f"纵向概括：{trajectory}")
+            detail_candidates: list[tuple[float, str]] = []
             for trace in group.get("traces") or []:
-                trace_text = self._compact_structured_memory_text(str(trace.summary or "").strip())
-                if trace_text and self._keyword_overlap_score(trace_text.lower(), summary.lower()) < 0.75:
-                    detail_lines.append(f"  - [{trace.trace_date}] {trace_text}")
+                trace_text = self._extract_display_core(str(trace.summary or "").strip(), max_len=160)
+                score = self._score_mainline_detail_candidate(
+                    text=trace_text,
+                    summary=summary,
+                    scope=str(group.get("scope") or "shared"),
+                    source_family=str(group.get("source_family") or "daily_life"),
+                    kind="trace",
+                )
+                if score > 0.18:
+                    if self._keyword_overlap_score(trace_text.lower(), summary.lower()) < 0.9:
+                        detail_candidates.append((score, f"  - [{trace.trace_date}] {trace_text}"))
             for event in group.get("events") or []:
                 if not isinstance(event, EventAnchor):
                     continue
-                desc = self._compact_structured_memory_text(
-                    self._normalize_event_detail(event.description or event.title or "")
+                title = (event.title or "").strip() or "未命名事件"
+                desc = self._extract_display_core(self._normalize_event_detail(event.description or event.title or ""), max_len=180)
+                score = self._score_mainline_detail_candidate(
+                    text=f"{title}\n{desc}",
+                    summary=summary,
+                    scope=str(group.get("scope") or "shared"),
+                    source_family=str(group.get("source_family") or "daily_life"),
+                    kind="event",
                 )
-                if not desc or self._keyword_overlap_score(desc.lower(), summary.lower()) >= 0.7:
+                if score > 0.18:
+                    if self._keyword_overlap_score(desc.lower(), summary.lower()) < 0.88:
+                        detail_candidates.append((score, f"  - [{event.date}] {title}：{desc}"))
+            for record in group.get("records") or []:
+                if not isinstance(record, KeyRecord):
                     continue
-                detail_lines.append(f"  - [{event.date}] {(event.title or '').strip() or '未命名事件'}：{desc}")
+                payload = self._parse_json_object(record.content_json)
+                if str(payload.get("memory_role") or "") in {"trigger_only", "archive_reference"}:
+                    continue
+                if self._looks_like_archive_payload(
+                    "\n".join(
+                        [
+                            str(record.title or ""),
+                            str(payload.get("latest_change") or ""),
+                            str(payload.get("next_watch_point") or ""),
+                            str(record.content_text or ""),
+                        ]
+                    )
+                ):
+                    continue
+                record_text = self._extract_display_core(
+                    str(payload.get("latest_change") or record.content_text or "").strip(),
+                    max_len=140,
+                )
+                score = self._score_mainline_detail_candidate(
+                    text=f"{record.title}\n{record_text}",
+                    summary=summary,
+                    scope=str(group.get("scope") or "shared"),
+                    source_family=str(group.get("source_family") or "daily_life"),
+                    kind="record",
+                )
+                if score > 0.22:
+                    if self._keyword_overlap_score(record_text.lower(), summary.lower()) < 0.88:
+                        detail_candidates.append((score, f"  - {record.title}：{record_text}"))
+            detail_lines: list[str] = []
+            for _, line in sorted(detail_candidates, key=lambda item: item[0], reverse=True):
+                fp = self._detail_fingerprint(line)
+                if not fp or fp in used_detail_fingerprints:
+                    continue
+                used_detail_fingerprints.add(fp)
+                detail_lines.append(line)
+                if len(detail_lines) >= 3:
+                    break
             if detail_lines:
                 lines.append("关键细节：")
-                lines.extend(detail_lines[:5])
+                lines.extend(detail_lines)
             open_question = self._compact_structured_memory_text(str(group.get("open_question") or "").strip())
             if open_question:
                 lines.append(f"待续：{open_question}")
@@ -3465,24 +3947,40 @@ class StateMachine:
         )
         slowline_text = await self._build_recent_life_line_digest(today_str, yesterday_str)
         reference = slowline_text.lower()
-        lines: list[str] = []
+        used_detail_fingerprints = self._collect_recent_life_detail_fingerprints(slowline_text)
+        fragment_candidates: list[tuple[float, str]] = []
         for trace in traces:
-            summary = self._compact_structured_memory_text(str(trace.summary or "").strip())
+            summary = self._extract_display_core(str(trace.summary or "").strip(), max_len=180)
             if not summary:
                 continue
             if self._keyword_overlap_score(summary.lower(), reference) >= 0.72:
                 continue
-            lines.append(f"- [{trace.trace_date}] {summary}")
+            if self._detail_fingerprint(summary) in used_detail_fingerprints:
+                continue
+            source_family = self._source_family_for_trace(trace)
+            scope = "user_side" if source_family in {"health", "study", "relationship"} else "character_side"
+            score = self._score_fragment_candidate(text=summary, scope=scope, source_family=source_family)
+            if score > 0.12:
+                fragment_candidates.append((score, f"- [{trace.trace_date}] {summary}"))
         for event in events:
             title = (event.title or "").strip() or "未命名事件"
-            desc = self._compact_structured_memory_text(self._normalize_event_detail(event.description or ""))
+            desc = self._extract_display_core(self._normalize_event_detail(event.description or ""), max_len=200)
             combined = f"{title}\n{desc}".lower()
             if self._keyword_overlap_score(combined, reference) >= 0.68:
                 continue
-            lines.append(f"- [{event.date}] {title}：{desc}")
+            if self._detail_fingerprint(desc) in used_detail_fingerprints:
+                continue
+            payload = self._parse_json_object(getattr(event, "meta_json", None))
+            if str(payload.get("memory_role") or "") in {"bridge_core", "trigger_only", "archive_reference"}:
+                continue
+            scope = str(payload.get("scope") or "shared")
+            source_family = self._source_family_for_event(event)
+            score = self._score_fragment_candidate(text=f"{title}\n{desc}", scope=scope, source_family=source_family)
+            if score > 0.12:
+                fragment_candidates.append((score, f"- [{event.date}] {title}：{desc}"))
         deduped: list[str] = []
         seen: set[str] = set()
-        for line in lines:
+        for _, line in sorted(fragment_candidates, key=lambda item: item[0], reverse=True):
             key = re.sub(r"\s+", " ", line.strip().lower())
             if not key or key in seen:
                 continue
@@ -3490,31 +3988,175 @@ class StateMachine:
             deduped.append(line)
         return "\n".join(deduped[:6]) if deduped else "（近景碎片已被上方主线充分覆盖）"
 
-    async def _build_memory_bridge_text(self, *, before_date: str, limit: int = 5) -> str:
-        slowlines = await self.db.list_slowlines(status="active", limit=max(6, limit + 2))
-        if slowlines:
-            lines: list[str] = []
-            for slowline in slowlines[:5]:
-                trajectory = self._compact_structured_memory_text(
-                    str(getattr(slowline, "trajectory_summary", "") or "").strip()
+    async def _load_thread_history_materials(
+        self,
+        slowline: SlowLine,
+        *,
+        before_date: str,
+    ) -> tuple[list[EventAnchor], list[KeyRecord]]:
+        events: list[EventAnchor] = []
+        records: list[KeyRecord] = []
+        for event_id in self._json_int_list(getattr(slowline, "linked_event_ids", "[]")):
+            event = await self.db.get_event_by_id(event_id)
+            if event is None or str(event.date or "") >= before_date:
+                continue
+            if getattr(event, "archived", 0):
+                continue
+            events.append(event)
+        for record_id in self._json_int_list(getattr(slowline, "linked_key_record_ids", "[]")):
+            record = await self.db.get_key_record_by_id(record_id)
+            if record is None:
+                continue
+            start_marker = str(record.start_date or record.updated_at or record.created_at or "")[:10]
+            if start_marker and start_marker >= before_date:
+                continue
+            if str(record.status or "") == "archived":
+                continue
+            records.append(record)
+        events.sort(key=lambda item: (str(item.date or ""), str(item.created_at or "")))
+        records.sort(key=lambda item: (str(item.start_date or item.updated_at or item.created_at or ""), int(item.id or 0)))
+        return events, records
+
+    async def _load_thread_all_materials(self, slowline: SlowLine) -> tuple[list[EventAnchor], list[KeyRecord]]:
+        events: list[EventAnchor] = []
+        records: list[KeyRecord] = []
+        for event_id in self._json_int_list(getattr(slowline, "linked_event_ids", "[]")):
+            event = await self.db.get_event_by_id(event_id)
+            if event is None or getattr(event, "archived", 0):
+                continue
+            events.append(event)
+        for record_id in self._json_int_list(getattr(slowline, "linked_key_record_ids", "[]")):
+            record = await self.db.get_key_record_by_id(record_id)
+            if record is None or str(record.status or "") == "archived":
+                continue
+            records.append(record)
+        events.sort(key=lambda item: (str(item.date or ""), str(item.created_at or ""), int(item.id or 0)))
+        records.sort(key=lambda item: (str(item.start_date or item.updated_at or item.created_at or ""), int(item.id or 0)))
+        return events, records
+
+    def _resolve_thread_label(
+        self,
+        slowline: SlowLine,
+        *,
+        events: list[EventAnchor] | None = None,
+        records: list[KeyRecord] | None = None,
+    ) -> str:
+        label = self._compact_structured_memory_text(str(slowline.theme or "").strip())
+        if label and label.lower() not in {"relationship", "study", "work", "health", "daily_life", "logistics"}:
+            return label
+        for record in records or []:
+            title = self._compact_structured_memory_text(str(record.title or "").strip())
+            if title and title.lower() not in {"relationship", "study", "work", "health", "daily_life", "logistics"}:
+                return title
+        for event in events or []:
+            title = self._compact_structured_memory_text(str(event.title or "").strip())
+            if title and title.lower() not in {"relationship", "study", "work", "health", "daily_life", "logistics"}:
+                return title
+        return label or "持续生活线"
+
+    def _build_bridge_line_from_thread(
+        self,
+        *,
+        slowline: SlowLine,
+        older_events: list[EventAnchor],
+        older_records: list[KeyRecord],
+        label_override: str | None = None,
+    ) -> str:
+        label = self._compact_structured_memory_text(str(label_override or slowline.theme or "").strip()) or "持续生活线"
+        start_text = ""
+        shift_text = ""
+        if older_records:
+            first_payload = self._parse_json_object(older_records[0].content_json)
+            start_text = self._extract_display_core(
+                str(first_payload.get("previous_baseline") or older_records[0].content_text or older_records[0].title or ""),
+                max_len=100,
+            )
+            last_record_payload = self._parse_json_object(older_records[-1].content_json)
+            shift_text = self._extract_display_core(
+                str(last_record_payload.get("latest_change") or older_records[-1].content_text or older_records[-1].title or ""),
+                max_len=110,
+            )
+        if older_events:
+            if not start_text:
+                start_text = self._extract_display_core(
+                    self._normalize_event_detail(older_events[0].description or older_events[0].title or ""),
+                    max_len=100,
                 )
-                if not trajectory:
-                    trajectory = self._compact_structured_memory_text(str(slowline.stage_summary or "").strip())
-                if not trajectory:
-                    continue
-                label = self._compact_structured_memory_text(str(slowline.theme or "").strip()) or "持续生活线"
-                tension = self._compact_structured_memory_text(str(slowline.current_tension or "").strip())
-                open_question = self._compact_structured_memory_text(
-                    ", ".join(self._parse_json_list(slowline.open_questions)[:1])
-                )
-                line = f"- {label}：{trajectory}"
-                if tension and self._keyword_overlap_score(tension.lower(), trajectory.lower()) < 0.75:
-                    line += f"；当前卡点：{tension}"
-                elif open_question and self._keyword_overlap_score(open_question.lower(), trajectory.lower()) < 0.75:
-                    line += f"；待观察：{open_question}"
-                lines.append(line)
-            if lines:
-                return "\n".join(lines[:5])
+            shift_text = self._extract_display_core(
+                self._normalize_event_detail(older_events[-1].description or older_events[-1].title or ""),
+                max_len=110,
+            ) or shift_text
+        if not start_text:
+            start_text = self._extract_display_core(str(getattr(slowline, "trajectory_summary", "") or ""), max_len=100)
+        if not shift_text:
+            shift_text = self._extract_display_core(
+                str(getattr(slowline, "recent_shift_summary", "") or getattr(slowline, "recent_movement_summary", "") or ""),
+                max_len=110,
+            )
+        tension = self._extract_display_core(
+            str(slowline.current_tension or "") or ", ".join(self._parse_json_list(getattr(slowline, "open_questions", "[]"))[:1]),
+            max_len=90,
+        )
+        parts = [f"- {label}：起点：{start_text}"] if start_text else [f"- {label}"]
+        if shift_text and self._keyword_overlap_score(shift_text.lower(), start_text.lower()) < 0.78:
+            parts.append(f"历史偏转：{shift_text}")
+        if tension:
+            parts.append(f"今日牵引：{tension}")
+        return "；".join(parts)
+
+    async def _build_memory_bridge_text(self, *, before_date: str, limit: int = 5, context_blob: str = "") -> str:
+        now_dt = shanghai_now()
+        yesterday_str = (now_dt.date() - timedelta(days=1)).isoformat()
+        recent_groups = await self._collect_recent_mainline_groups(now_dt.date().isoformat(), yesterday_str)
+        ordered_mainlines = sorted(recent_groups, key=lambda item: self._compute_mainline_score(item, now=now_dt), reverse=True)
+        excluded_thread_keys = {
+            str(group.get("thread_key") or "").strip()
+            for group in ordered_mainlines[:4]
+            if str(group.get("thread_key") or "").strip()
+        }
+        current_context_blob = "\n".join(
+            [
+                context_blob,
+                " ".join(str(group.get("summary") or "") for group in ordered_mainlines[:4]),
+                " ".join(str(group.get("recent_shift") or "") for group in ordered_mainlines[:4]),
+            ]
+        )
+        slowlines = await self.db.list_slowlines(status="active", limit=48)
+        candidates: list[tuple[float, SlowLine]] = []
+        for slowline in slowlines:
+            existing_events, existing_records = await self._load_thread_all_materials(slowline)
+            if not existing_events and not existing_records:
+                if getattr(slowline, "id", None) is not None:
+                    await self.db.update_slowline(int(slowline.id), status="archived")
+                continue
+            score = self._compute_bridge_score(
+                slowline,
+                context_blob=current_context_blob,
+                excluded_thread_keys=excluded_thread_keys,
+                now=now_dt,
+            )
+            if score <= 0.24:
+                continue
+            candidates.append((score, slowline))
+        lines: list[str] = []
+        for _, slowline in sorted(candidates, key=lambda item: item[0], reverse=True):
+            older_events, older_records = await self._load_thread_history_materials(slowline, before_date=before_date)
+            if not older_events and not older_records:
+                continue
+            label = self._resolve_thread_label(slowline, events=older_events, records=older_records)
+            line = self._build_bridge_line_from_thread(
+                slowline=slowline,
+                older_events=older_events,
+                older_records=older_records,
+                label_override=label,
+            )
+            if not line or self._looks_like_archive_payload(line):
+                continue
+            lines.append(line)
+            if len(lines) >= 4:
+                break
+        if lines:
+            return "\n".join(lines[:4])
         events = await self.db.get_recent_events_before_date(before_date, limit=limit, include_archived=False)
         older_events = [event for event in events if str(event.date or "") < before_date]
         traces = await self.db.get_recent_life_flow_traces(limit=limit + 2)
@@ -3535,65 +4177,87 @@ class StateMachine:
                     lines.append(f"- [{event.date}] {title}")
         return "\n".join(lines) if lines else "（更早的背景暂时已被近景主线充分吸收）"
 
+    async def _build_recent_key_records_context(self, limit: int = 5) -> str:
+        try:
+            character_records = await self.db.get_recent_key_records(
+                limit=2,
+                include_archived=False,
+                life_scope="character_life",
+            )
+            user_records = await self.db.get_recent_key_records(
+                limit=3,
+                include_archived=False,
+                life_scope="user_life",
+            )
+            records: list[KeyRecord] = []
+            seen_ids: set[int] = set()
+            for record in character_records[:2] + user_records[:3]:
+                rid = int(record.id or 0)
+                if rid > 0 and rid not in seen_ids:
+                    records.append(record)
+                    seen_ids.add(rid)
+            if len(records) < max(1, limit):
+                fill = await self.db.get_recent_key_records(
+                    limit=max(1, limit) * 2,
+                    include_archived=False,
+                )
+                for record in fill:
+                    rid = int(record.id or 0)
+                    if rid > 0 and rid not in seen_ids:
+                        records.append(record)
+                        seen_ids.add(rid)
+                    if len(records) >= max(1, limit):
+                        break
+        except Exception:
+            logger.exception("Failed to load recent key_records for injectable context.")
+            return "（关键记录暂时无法读取）"
+        if not records:
+            return "（暂无活跃关键记录）"
+
+        lines: list[str] = []
+        for record in records:
+            title = str(record.title or "").strip() or f"key_record#{record.id or '?'}"
+            record_type = str(getattr(record, "type", "") or "").strip() or "general"
+            life_scope = str(getattr(record, "life_scope", "") or "user_life").strip()
+            updated_at = str(getattr(record, "updated_at", "") or "").strip()
+            updated_label = updated_at[:16] if updated_at else "unknown"
+            content = self._compact_structured_memory_text(str(record.content_text or "").strip())
+            tags = self._parse_json_list(getattr(record, "tags", "[]"))
+            tag_text = f" tags={', '.join(tags[:4])}" if tags else ""
+            date_parts = [
+                value
+                for value in [
+                    str(getattr(record, "start_date", "") or "").strip(),
+                    str(getattr(record, "end_date", "") or "").strip(),
+                ]
+                if value
+            ]
+            date_text = f" date={'~'.join(date_parts)}" if date_parts else ""
+            suffix = f"（scope={life_scope} updated={updated_label}{date_text}{tag_text}）"
+            if content:
+                lines.append(f"- [{record_type}] {title}{suffix}: {content[:320]}")
+            else:
+                lines.append(f"- [{record_type}] {title}{suffix}")
+        return "\n".join(lines)
+
     async def _build_injectable_context(self, snapshot_text: str) -> str:
-        l1_char = await self.prompt_manager.get_layer_content(KEY_L1_CHARACTER_BACKGROUND)
-        l1_user = await self.prompt_manager.get_layer_content(KEY_L1_USER_BACKGROUND)
-        l2_char = await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY)
-        l2_rel = await self.prompt_manager.get_layer_content(KEY_L2_RELATIONSHIP_DYNAMICS)
-        l2_life = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
-        relationship_state = await self._refresh_relationship_state(latest_snapshot_text=snapshot_text)
-        today_limit = await self._get_inject_hot_events_limit()
-        yesterday_limit = await self._get_inject_yesterday_events_limit()
-        now_shanghai = shanghai_now()
-        today_str = now_shanghai.date().isoformat()
-        yesterday_str = (now_shanghai.date() - timedelta(days=1)).isoformat()
+        key_records_text = await self._build_recent_key_records_context(limit=5)
+        feel_text = await self._ob_feel_context_text(character_life_limit=1, other_limit=2)
         plan_summary = "（今日尚无计划）"
         if self.plan_engine is not None:
             try:
                 plan_summary = await self.plan_engine.get_plan_summary_text()
             except Exception:
                 logger.exception("Failed to load plan summary for injectable context.")
-        recent_trace_text = await self._build_recent_life_line_digest(today_str, yesterday_str)
-        recent_event_detail_text = await self._build_recent_turning_details_text(
-            today_str=today_str,
-            yesterday_str=yesterday_str,
-            today_limit=today_limit,
-            yesterday_limit=yesterday_limit,
-        )
-        memory_bridge_text = await self._build_memory_bridge_text(before_date=yesterday_str)
-        memory_bridge_text = self._dedupe_memory_bridge_text(memory_bridge_text, recent_trace_text)
-        relationship_block = await self._build_relationship_state_text()
-        latest_claims = await self.db.list_conversation_time_claims(status="closed", limit=1)
-        latest_claim_summary = "（最近没有对话占时改写记录）"
-        if latest_claims:
-            latest_claim_summary = self._compact_structured_memory_text(
-                str(latest_claims[0].context_summary or "").strip()[:220]
-            ) or latest_claim_summary
         schedule_block = plan_summary.strip() or "（今日尚无计划）"
-        if latest_claim_summary.strip() and "没有对话占时改写记录" not in latest_claim_summary:
-            schedule_block = f"{schedule_block}\n最近一次对话占时改写：{latest_claim_summary}"
-        if str(relationship_state.plan_bias_hint or "").strip():
-            schedule_block = f"{schedule_block}\n关系倾向提示：{str(relationship_state.plan_bias_hint or '').strip()}"
+        feel_block = feel_text.strip() or "（暂无可注入的 feel）"
         return (
-            "【L1 稳定层】\n"
-            f"角色背景：{l1_char}\n\n"
-            f"用户背景：{l1_user}\n\n"
-            "【L2 动态层】\n"
-            f"角色人格：{l2_char}\n\n"
-            f"关系模式：{l2_rel}\n\n"
-            f"生活状态：{l2_life}\n\n"
-            "【近程记忆桥】\n"
-            f"{memory_bridge_text}\n\n"
-            "【近期生活主线】\n"
-            f"{recent_trace_text}\n\n"
-            "【近景碎片池】\n"
-            f"{recent_event_detail_text}\n\n"
-            "【短期关系感知】\n"
-            f"{relationship_block}\n\n"
-            "【当前日程与偏差】\n"
+            "【近期关键记录】\n"
+            f"{key_records_text}\n\n"
+            "【当前日程主条目】\n"
             f"{schedule_block}\n\n"
-            "【当前状态快照】\n"
-            f"{snapshot_text}"
+            "【近期 feel】\n"
+            f"{feel_block}"
         )
 
     async def _build_recent_events_text(self, limit: int = 2) -> str:
@@ -3668,9 +4332,13 @@ class StateMachine:
         end_date: str | None = None,
         status: str = "active",
         source: str = "conversation",
+        life_scope: str = "user_life",
         linked_event_id: int | None = None,
         update_if_exists: bool = True,
+        record_id: int | None = None,
     ) -> dict:
+        if life_scope not in {"user_life", "character_life", "shared_life"}:
+            life_scope = "user_life"
         normalized_type = self._normalize_key_record_type(record_type)
         if not normalized_type:
             normalized_type = self._classify_key_record_type(
@@ -3682,6 +4350,40 @@ class StateMachine:
                 end_date=end_date,
             )
         tags = tags or []
+        if record_id and int(record_id) > 0:
+            existing_by_id = await self.db.get_key_record_by_id(int(record_id))
+            if existing_by_id is not None:
+                previous_record = existing_by_id.model_copy(deep=True)
+                fields = {
+                    "type": normalized_type,
+                    "title": title,
+                    "content_text": content_text,
+                    "content_json": json.dumps(content_json, ensure_ascii=False) if content_json is not None else None,
+                    "tags": json.dumps(tags, ensure_ascii=False),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "status": status,
+                    "source": source,
+                    "life_scope": life_scope,
+                    "linked_event_id": linked_event_id,
+                }
+                await self.db.update_key_record(int(record_id), **fields)
+                upsert_method = getattr(self.memory, "upsert_key_record_vector", None)
+                if callable(upsert_method):
+                    try:
+                        await upsert_method(int(record_id))
+                    except Exception:
+                        logger.exception("Failed to refresh key record vector: %s", record_id)
+                updated = await self.db.get_key_record_by_id(int(record_id))
+                if updated is not None:
+                    try:
+                        await self._refresh_related_slowline_from_key_record(updated, previous_record=previous_record)
+                    except Exception:
+                        logger.exception("Failed to refresh slowline after key record update: %s", record_id)
+                return {
+                    "action": "updated",
+                    "record": updated.model_dump() if updated else existing_by_id.model_dump(),
+                }
         existing = None
         if update_if_exists:
             existing = await self._find_key_record_upsert_candidate(
@@ -3692,6 +4394,7 @@ class StateMachine:
                 content_json=content_json,
                 start_date=start_date,
                 end_date=end_date,
+                life_scope=life_scope,
             )
         if existing and update_if_exists:
             previous_record = existing.model_copy(deep=True)
@@ -3704,6 +4407,7 @@ class StateMachine:
                 "end_date": end_date,
                 "status": status,
                 "source": source,
+                "life_scope": life_scope,
                 "linked_event_id": linked_event_id,
             }
             await self.db.update_key_record(existing.id, **fields)  # type: ignore[arg-type]
@@ -3735,6 +4439,7 @@ class StateMachine:
             end_date=end_date,
             status=status,  # type: ignore[arg-type]
             source=source,  # type: ignore[arg-type]
+            life_scope=life_scope,  # type: ignore[arg-type]
             linked_event_id=linked_event_id,
             created_at=now,
             updated_at=now,
@@ -3860,6 +4565,7 @@ class StateMachine:
         query: str,
         top_k: int = 5,
         record_type: str | None = None,
+        life_scope: str | None = None,
         include_archived: bool = False,
         include_world_books: bool = True,
     ) -> list[dict]:
@@ -3870,6 +4576,7 @@ class StateMachine:
             query=query,
             top_k=cap,
             record_type=record_type,
+            life_scope=life_scope,
             include_archived=include_archived,
         )
         if hinted_types and not record_type:
@@ -3880,6 +4587,7 @@ class StateMachine:
                         offset=0,
                         limit=min(cap, 40),
                         record_type=hinted_type,
+                        life_scope=life_scope,
                         include_archived=include_archived,
                     )
                 )
@@ -3955,23 +4663,29 @@ class StateMachine:
         for d in kr_list:
             d.pop("_sort_recency", None)
 
-        wb_max = min(2, max(0, tk // 2))
-        kr_slots = max(1 if kr_list else 0, tk - wb_max)
         out: list[dict] = []
         seen_kr: set[int] = set()
         for d in kr_list:
-            if len(out) >= kr_slots:
+            if len(out) >= tk:
                 break
             rid = int(d.get("id") or 0)
             if rid in seen_kr:
                 continue
             seen_kr.add(rid)
             out.append(d)
+        return out[:tk]
 
-        if not include_world_books or wb_max <= 0:
-            return out[:tk]
-
-        books = await self.db.get_active_world_books()
+    async def recall_world_books(
+        self,
+        query: str,
+        top_k: int = 5,
+        include_inactive: bool = False,
+    ) -> list[dict]:
+        tk = max(1, int(top_k))
+        if include_inactive:
+            books = await self.db.list_world_books(offset=0, limit=1000)
+        else:
+            books = await self.db.get_active_world_books()
         entries = [self._world_book_to_dict(b) for b in books]
         wb_scored: list[tuple[float, dict]] = []
         if entries:
@@ -4030,9 +4744,10 @@ class StateMachine:
             "【世界书】是静态设定与背景参考，只作为补充。"
             "不要把它当成用户本轮新说出的事实。"
         )
+        out: list[dict] = []
         seen_wb: set[int] = set()
         for _score, item in wb_scored:
-            if len(seen_wb) >= wb_max:
+            if len(out) >= tk:
                 break
             wid = int(item.get("id") or 0)
             if wid in seen_wb:
@@ -4219,16 +4934,37 @@ class StateMachine:
         end_date: str,
         include_archived: bool = False,
     ) -> dict:
-        events = await self.db.get_events_in_range(
-            start_date=start_date,
-            end_date=end_date,
-            include_archived=include_archived,
-        )
         snapshots = await self.db.get_snapshots_in_range(start_date, end_date)
 
-        events_timeline = self._format_periodic_events(events)
+        ob_lines: list[str] = []
+        if self.ob_client is not None:
+            try:
+                buckets = await self.ob_client.list_buckets(include_archive=include_archived)
+            except Exception:
+                logger.exception("Failed to load OB buckets for periodic review.")
+                buckets = []
+            for bucket in buckets:
+                if self._is_snapshot_generated_ob_bucket(bucket):
+                    continue
+                meta = getattr(bucket, "metadata", {}) or {}
+                created = str(meta.get("created") or meta.get("last_active") or "").strip()
+                created_date = created[:10]
+                if created_date and (created_date < start_date or created_date > end_date):
+                    continue
+                content = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
+                if not content:
+                    continue
+                name = str(meta.get("name") or getattr(bucket, "id", "") or "OB bucket").strip()
+                domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip())
+                domain_text = f" [{domains}]" if domains else ""
+                ob_lines.append(f"- [{created_date or 'unknown'}] {name}{domain_text}: {content[:240]}")
+        events_timeline = "\n".join(ob_lines[:80]) if ob_lines else "（该阶段暂无可用于回顾的 OB bucket；旧 event_anchors 不再作为周期回顾输入。）"
         snapshots_timeline = self._format_periodic_snapshots(snapshots)
-        stats_summary = self._build_periodic_stats(events, snapshots)
+        stats_summary = (
+            f"- OB bucket 片段数：{len(ob_lines)}\n"
+            f"- 状态快照数：{len(snapshots)}\n"
+            "- 旧 event_anchors 已退出周期回顾输入。"
+        )
 
         system_prompt = await self.prompt_manager.get_system_prompt()
         prompt_template = await self.prompt_manager.get_prompt(KEY_PROMPT_PERIODIC_REVIEW)
@@ -4314,20 +5050,7 @@ class StateMachine:
 
         start_date = baseline_time.date().isoformat()
         end_date = target_time.date().isoformat()
-        all_events = await self._trace_await(
-            diagnostic,
-            f"{trigger}.db.get_events_in_range",
-            self.db.get_events_in_range(start_date, end_date),
-            start_date=start_date,
-            end_date=end_date,
-        )
-        world_books = await self._trace_await(
-            diagnostic,
-            f"{trigger}.db.get_active_world_books",
-            self.db.get_active_world_books(),
-        )
-        world_book_payload: list[dict] = [self._world_book_to_dict(wb) for wb in world_books]
-
+        all_events: list[EventAnchor] = []
         recent_events_limit = await self._trace_await(
             diagnostic,
             f"{trigger}.load_snapshot_recent_events_limit",
@@ -4350,9 +5073,7 @@ class StateMachine:
                 character_personality = await self.prompt_manager.get_layer_content(
                     KEY_L2_CHARACTER_PERSONALITY
                 )
-                relationship_dynamics = await self.prompt_manager.get_layer_content(
-                    KEY_L2_RELATIONSHIP_DYNAMICS
-                )
+                relationship_dynamics = "（关系动态已迁入 OB 记忆主干；此处不再注入计算出的关系结论。）"
                 life_status = await self.prompt_manager.get_layer_content(
                     KEY_L2_LIFE_STATUS
                 )
@@ -4367,9 +5088,7 @@ class StateMachine:
             character_personality = await self.prompt_manager.get_layer_content(
                 KEY_L2_CHARACTER_PERSONALITY
             )
-            relationship_dynamics = await self.prompt_manager.get_layer_content(
-                KEY_L2_RELATIONSHIP_DYNAMICS
-            )
+            relationship_dynamics = "（关系动态已迁入 OB 记忆主干；此处不再注入计算出的关系结论。）"
             life_status = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
 
         for i, checkpoint_time in enumerate(due_checkpoints):
@@ -4380,16 +5099,6 @@ class StateMachine:
                 checkpoint_time,
                 recent_events_limit,
             )
-            world_book_entries = await self._trace_await(
-                diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.retrieve_world_books",
-                self._retrieve_world_book_entries(
-                    query=f"{current_content}\n{events_text}",
-                    entries=world_book_payload,
-                ),
-                checkpoint_time_cst=checkpoint_cst,
-                event_count=len(checkpoint_events),
-            )
             time_delta = checkpoint_time - prev_time
             time_delta_hours = max(0.0, time_delta.total_seconds() / 3600.0)
             prev_time = checkpoint_time
@@ -4399,6 +5108,40 @@ class StateMachine:
                 self._build_environment_context_details(checkpoint_time),
                 checkpoint_time_cst=checkpoint_cst,
             )
+            ob_life_context = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_feel_breath",
+                self._ob_feel_context_text(character_life_limit=1, other_limit=2),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            if ob_life_context:
+                environment_context_details["ob_life_context"] = ob_life_context
+            environment_recent_events = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_environment_event_breath",
+                self._ob_breath_event_dicts_for_environment(
+                    query="\n".join(
+                        [
+                            str(environment_context_details.get("current_plan_activity") or ""),
+                            str(environment_context_details.get("current_plan_summary") or ""),
+                            current_content,
+                        ]
+                    ),
+                    limit=5,
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            ob_relationship_context = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_relationship_breath",
+                self._ob_breath_text(
+                    domain="relationship",
+                    limit=3,
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            if ob_relationship_context:
+                environment_context_details["ob_relationship_context"] = ob_relationship_context
             recent_key_records = await self._trace_await(
                 diagnostic,
                 f"{trigger}.checkpoint_{checkpoint_index}.load_recent_key_records",
@@ -4415,7 +5158,6 @@ class StateMachine:
                     environment_context_details=environment_context_details,
                     recent_events=checkpoint_events,
                     recent_key_records=recent_key_records,
-                    world_book_entries=world_book_entries,
                 ),
                 checkpoint_time_cst=checkpoint_cst,
             )
@@ -4452,10 +5194,9 @@ class StateMachine:
                     time_point=checkpoint_time,
                     previous_env=previous_env,
                     context={
-                        "latest_snapshot": current_content,
+                        "latest_snapshot": "",
                         "time_delta_hours": time_delta_hours,
-                        "recent_events": [e.model_dump() for e in checkpoint_events],
-                        "world_book_entries": world_book_entries,
+                        "recent_events": environment_recent_events,
                         "current_plan_activity": environment_context_details.get("current_plan_activity", ""),
                         "current_plan_summary": environment_context_details.get("current_plan_summary", ""),
                         "current_conversation_state": environment_context_details.get("current_conversation_state", ""),
@@ -4463,13 +5204,13 @@ class StateMachine:
                         "recent_disturbances": environment_context_details.get("recent_disturbances", ""),
                         "schedule_alignment": environment_context_details.get("schedule_alignment", ""),
                         "plan_delta": environment_context_details.get("plan_delta", ""),
+                        "ob_life_context": environment_context_details.get("ob_life_context", ""),
                         "disturbance_context": environment_context_details.get("disturbance_context", ""),
                         "disturbance_schedule_effect": environment_context_details.get("disturbance_schedule_effect", "none"),
                     },
                 ),
                 checkpoint_time_cst=checkpoint_cst,
                 time_delta_hours=round(time_delta_hours, 4),
-                world_book_count=len(world_book_entries),
             )
             if disturbance_result.get("should_inject"):
                 env["disturbance_id"] = int(disturbance_result.get("disturbance_id") or 0)
@@ -4494,6 +5235,12 @@ class StateMachine:
                 top_k=self.DEFAULT_MEMORY_TOP_K,
             )
             memory_text, memory_meta = self._build_memory_context(memory_results)
+            if ob_life_context:
+                memory_text = (
+                    f"{memory_text}\n\n【OB feel 浮现】\n{ob_life_context}"
+                    if memory_text
+                    else f"【OB feel 浮现】\n{ob_life_context}"
+                )
             prior_snapshot_content = current_content
             prompt = prompt_template.format(
                 character_background=character_background,
@@ -4504,6 +5251,7 @@ class StateMachine:
                 previous_snapshot=prior_snapshot_content,
                 recent_events=events_text,
                 memory_context=memory_text,
+                ob_relationship_context=environment_context_details.get("ob_relationship_context", ""),
             )
             self._log_checkpoint_prompt_stats(
                 checkpoint_time=checkpoint_time,
@@ -4559,6 +5307,59 @@ class StateMachine:
                 snapshot_type=snap.type,
                 snapshot_chars=len(current_content or ""),
             )
+            ob_life_bucket_id = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_snapshot_feel",
+                self._ob_hold_snapshot_feel(
+                    title=f"{checkpoint_cst} 生活快照",
+                    content=current_content,
+                    tags=["snapshot", "feel", trigger],
+                    importance=4,
+                    valence=0.5,
+                    arousal=0.38,
+                    created=snap.created_at,
+                    extra_metadata={
+                        "snapshot_id": int(snap_id or 0),
+                        "checkpoint_cst": checkpoint_cst,
+                        "source": "snapshot_scheduler",
+                        "source_kind": "state_snapshot",
+                    },
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            environment_trace_body = self._build_environment_trace_content(env)
+            environment_trace_bucket_id = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_environment_trace",
+                self._ob_hold_environment_trace(
+                    title=f"{checkpoint_cst} 环境推进",
+                    content=environment_trace_body,
+                    tags=["environment_trace", "character_life", trigger],
+                    importance=5,
+                    valence=0.5,
+                    arousal=0.36,
+                    created=snap.created_at,
+                    extra_metadata={
+                        "snapshot_id": int(snap_id or 0),
+                        "checkpoint_cst": checkpoint_cst,
+                        "source": "snapshot_scheduler",
+                        "source_kind": "environment_trace",
+                    },
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+                trace_chars=len(environment_trace_body or ""),
+            )
+            await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.append_relationship_thought",
+                self._append_relationship_thought_from_context(
+                    source_snapshot_id=int(snap_id or 0),
+                    source_env_id=f"{trigger}:{checkpoint_index}:{snap.type}",
+                    snapshot_text=current_content,
+                    environment_text=environment_text,
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
             if disturbance_result.get("should_inject") and int(disturbance_result.get("disturbance_id") or 0) > 0:
                 await self.db.update_disturbance_pulse(
                     int(disturbance_result.get("disturbance_id") or 0),
@@ -4572,25 +5373,16 @@ class StateMachine:
                     "type": snap.type,
                     "content": current_content,
                     "referenced_event_count": len(checkpoint_events),
+                    "ob_life_bucket_id": ob_life_bucket_id,
+                    "environment_trace_bucket_id": environment_trace_bucket_id,
                 }
             )
 
-            generated_event_id: int | None = None
-            if not env.get("stale"):
-                self._schedule_deferred_event_generation(
-                    snapshot_id=snap_id,
-                    snapshot_content=current_content,
-                    environment=env,
-                    memory_text=memory_text,
-                    checkpoint_time=checkpoint_time,
-                    defer_vectorization=bool(defer_maintenance),
-                )
-            generated_snapshots[-1]["generated_event_id"] = generated_event_id
             if env.get("stale"):
                 generated_snapshots[-1]["environment_stale"] = True
                 self._schedule_deferred_env_retry(
                     snapshot_id=snap_id,
-                    event_id=generated_event_id,
+                    event_id=None,
                     checkpoint_time=checkpoint_time,
                     previous_snapshot_content=prior_snapshot_content,
                     previous_env=previous_env,
@@ -4972,26 +5764,8 @@ class StateMachine:
         *,
         defer_vectorization: bool = False,
     ) -> int | None:
-        system_prompt = await self.prompt_manager.get_system_prompt()
-        prompt_template = await self.prompt_manager.get_prompt(KEY_PROMPT_EVENT_ANCHOR)
-        prompt = prompt_template.format(
-            current_snapshot=snapshot_content,
-            environment=environment_text_for_prompt(env),
-            memory_context=memory_text,
-            system_layers=await self.prompt_manager.get_system_layers_text(),
-        )
-
-        response = await self.snapshot_llm.chat([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ])
-
-        return await self._parse_and_save_event(
-            response,
-            source="generated",
-            date_override=time_point.date().isoformat(),
-            defer_vectorization=defer_vectorization,
-        )
+        logger.info("Automatic event anchor generation disabled; checkpoint=%s ignored.", time_point.isoformat())
+        return None
 
     async def _parse_and_save_event(
         self,
@@ -5206,9 +5980,6 @@ class StateMachine:
             trigger = str(item.get("trigger") or "deferred")
             llm_usage = item.get("llm_usage")
             try:
-                event_task = self._deferred_event_task
-                if event_task and not event_task.done():
-                    await event_task
                 env_retry_task = self._deferred_env_retry_task
                 if env_retry_task and not env_retry_task.done():
                     await env_retry_task
@@ -5232,65 +6003,18 @@ class StateMachine:
         conversation_summary: str = "",
         conversation_started_at: str = "",
     ) -> None:
-        if snapshot_id <= 0:
-            return
-        item = {
-            "snapshot_id": snapshot_id,
-            "snapshot_content": snapshot_content,
-            "environment": environment or {},
-            "memory_text": memory_text,
-            "checkpoint_time": checkpoint_time,
-            "defer_vectorization": defer_vectorization,
-            "conversation_summary": conversation_summary,
-            "conversation_started_at": conversation_started_at,
-            "status": "queued",
-        }
-        replaced = False
-        for idx, existing in enumerate(self._deferred_event_queue):
-            if int(existing.get("snapshot_id") or 0) == snapshot_id:
-                self._deferred_event_queue[idx] = item
-                replaced = True
-                break
-        if not replaced:
-            self._deferred_event_queue.append(item)
-        self._deferred_event_snapshot_ids.add(snapshot_id)
-        logger.info(
-            "Deferred event job queued snapshot=%d status=queued replaced=%s",
-            snapshot_id,
-            replaced,
-        )
-        if self._deferred_event_task and not self._deferred_event_task.done():
-            return
-        self._deferred_event_task = asyncio.create_task(
-            self._drain_deferred_event_queue()
-        )
+        logger.info("Deferred event generation disabled; snapshot=%d ignored.", snapshot_id)
+        return
 
     async def _drain_deferred_event_queue(self) -> None:
-        while self._deferred_event_queue:
-            item = self._deferred_event_queue.pop(0)
-            snapshot_id = int(item.get("snapshot_id") or 0)
-            try:
-                logger.info(
-                    "Deferred event job processing snapshot=%d status=processing",
-                    snapshot_id,
-                )
-                result = await self._process_deferred_event_job(item)
-                logger.info(
-                    "Deferred event job completed snapshot=%d status=%s route=%s event_id=%s",
-                    snapshot_id,
-                    str(result.get("status") or ""),
-                    str(result.get("route") or ""),
-                    result.get("event_id"),
-                )
-            except Exception:
-                logger.exception(
-                    "Deferred event job failed for snapshot=%s status=failed",
-                    snapshot_id,
-                )
-            finally:
-                self._deferred_event_snapshot_ids.discard(snapshot_id)
+        logger.info("Deferred event queue disabled; no jobs will be drained.")
+        return
 
     async def _process_deferred_event_job(self, item: dict) -> dict:
+        logger.info("Deferred event processing disabled; snapshot=%s ignored.", item.get("snapshot_id"))
+        return {"status": "suppressed", "route": "disabled"}
+
+    async def _process_deferred_event_job_legacy(self, item: dict) -> dict:
         if not await self._get_snapshot_event_candidate_enabled():
             return {"status": "suppressed", "route": "disabled"}
         snapshot_id = int(item.get("snapshot_id") or 0)
@@ -5858,6 +6582,25 @@ class StateMachine:
         judgment: dict,
         defer_vectorization: bool,
     ) -> int | None:
+        logger.info(
+            "Deferred event materialization disabled; snapshot=%s ignored.",
+            getattr(snapshot, "id", None),
+        )
+        return None
+
+    async def _materialize_deferred_event_legacy(
+        self,
+        *,
+        snapshot: StateSnapshot,
+        snapshot_delta: str,
+        environment_summary: str,
+        environment_body: str,
+        detail_hooks_text: str,
+        recent_disturbances: str,
+        environment_delta: str,
+        judgment: dict,
+        defer_vectorization: bool,
+    ) -> int | None:
         system_prompt = await self.prompt_manager.get_system_prompt()
         prompt_template = await self.prompt_manager.get_prompt(KEY_PROMPT_EVENT_MATERIALIZE)
         if prompt_template.strip():
@@ -6086,14 +6829,21 @@ class StateMachine:
             checkpoint_events = item.get("checkpoint_events") or []
             if not isinstance(checkpoint_events, list):
                 checkpoint_events = []
-
-            events_text = self._format_checkpoint_event_dicts(checkpoint_events)
-            world_books = await self.db.get_active_world_books()
-            world_book_payload: list[dict] = [self._world_book_to_dict(wb) for wb in world_books]
-            world_book_entries = await self._retrieve_world_book_entries(
-                query=f"{previous_snapshot_content}\n{events_text}",
-                entries=world_book_payload,
+            current_plan_activity = (
+                await self.plan_engine.get_plan_activity_for_time(checkpoint_time)
+                if self.plan_engine is not None
+                else ""
             )
+            environment_recent_events = await self._ob_breath_event_dicts_for_environment(
+                query="\n".join(
+                    [
+                        str(current_plan_activity or ""),
+                        previous_snapshot_content,
+                    ]
+                ),
+                limit=5,
+            )
+            events_text = self._format_checkpoint_event_dicts(environment_recent_events)
 
             env = await self.env_gen.generate(
                 time_point=checkpoint_time,
@@ -6101,13 +6851,8 @@ class StateMachine:
                 context={
                     "latest_snapshot": previous_snapshot_content,
                     "time_delta_hours": 0.0,
-                    "recent_events": checkpoint_events,
-                    "world_book_entries": world_book_entries,
-                    "current_plan_activity": (
-                        await self.plan_engine.get_plan_activity_for_time(checkpoint_time)
-                        if self.plan_engine is not None
-                        else ""
-                    ),
+                    "recent_events": environment_recent_events,
+                    "current_plan_activity": current_plan_activity,
                 },
                 allow_retry_fallback=False,
             )
@@ -6125,7 +6870,7 @@ class StateMachine:
             )
             character_background = await self.prompt_manager.get_layer_content(KEY_L1_CHARACTER_BACKGROUND)
             character_personality = await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY)
-            relationship_dynamics = await self.prompt_manager.get_layer_content(KEY_L2_RELATIONSHIP_DYNAMICS)
+            relationship_dynamics = "（关系动态已迁入 OB 记忆主干；后台快照重试不再读取 L2 关系结论。）"
             life_status = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
             prompt = prompt_template.format(
                 character_background=character_background,
@@ -6136,6 +6881,7 @@ class StateMachine:
                 previous_snapshot=previous_snapshot_content,
                 recent_events=events_text,
                 memory_context=memory_text,
+                ob_relationship_context="",
             )
             new_content = await self.snapshot_llm.chat(
                 [
@@ -6155,15 +6901,6 @@ class StateMachine:
                 snapshot_id,
                 content=new_content,
                 environment=json.dumps(env, ensure_ascii=False),
-            )
-
-            self._schedule_deferred_event_generation(
-                snapshot_id=snapshot_id,
-                snapshot_content=new_content,
-                environment=env,
-                memory_text=memory_text,
-                checkpoint_time=checkpoint_time,
-                defer_vectorization=True,
             )
 
             logger.info("Deferred environment retry refreshed snapshot=%d", snapshot_id)
@@ -6434,42 +7171,6 @@ class StateMachine:
                 re.findall(r"[a-z0-9_\u4e00-\u9fff]{2,}", text)
             )
         )[:80]
-
-    async def _retrieve_world_book_entries(self, query: str, entries: list[dict]) -> list[dict]:
-        if not entries:
-            return []
-        keyword_scores = self._world_book_keyword_scores(query, entries)
-        ranked_keywords = sorted(keyword_scores.items(), key=lambda x: x[1], reverse=True)[:6]
-        selected_ids = [item_id for item_id, _ in ranked_keywords]
-
-        search_world_books = getattr(self.memory, "search_world_books", None)
-        if callable(search_world_books):
-            try:
-                vector_hits = await search_world_books(
-                    query=query,
-                    top_k=4,
-                    candidate_ids=[int(e.get("id") or 0) for e in entries],
-                )
-                for hit in vector_hits:
-                    hit_id = int(hit.get("id") or 0)
-                    if hit_id > 0 and hit_id not in selected_ids:
-                        selected_ids.append(hit_id)
-            except Exception:
-                pass
-
-        if not selected_ids:
-            selected_ids = [int(e.get("id") or 0) for e in entries[:3]]
-
-        by_id = {int(e.get("id") or 0): e for e in entries}
-        result: list[dict] = []
-        for item_id in selected_ids:
-            item = by_id.get(item_id)
-            if not item:
-                continue
-            result.append(item)
-            if len(result) >= 8:
-                break
-        return result
 
     @staticmethod
     def _parse_iso_datetime(value: str) -> datetime:

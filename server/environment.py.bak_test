@@ -196,7 +196,6 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         character_state = self._clip_character_state(latest_snapshot)
         time_delta_hours = float(context.get("time_delta_hours", 0.0) or 0.0)
         recent_events = context.get("recent_events") or []
-        world_book_entries = context.get("world_book_entries") or []
         current_plan_activity = str(context.get("current_plan_activity") or "").strip()
         current_plan_summary = str(context.get("current_plan_summary") or "").strip()
         current_conversation_state = str(context.get("current_conversation_state") or "").strip()
@@ -207,18 +206,6 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         recent_events_text = self._format_recent_events(recent_events)
         time_elapsed = self._format_time_elapsed(time_delta_hours)
         continuity = self._build_continuity(previous_env)
-        match_keywords = self._extract_keywords(latest_snapshot, recent_events)
-        matched_world_books = self._match_world_book(
-            world_book_entries,
-            period,
-            match_keywords,
-        )
-        world_book_context = (
-            "\n".join(f"- {item}" for item in matched_world_books)
-            if matched_world_books
-            else "（无匹配世界书）"
-        )
-
         template = ""
         if self.prompt_manager is not None:
             template = await self.prompt_manager.get_prompt(KEY_PROMPT_ENVIRONMENT_GENERATION)
@@ -227,7 +214,6 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "时间：{time}\n日期：{date}\n星期：{weekday}\n时间段：{time_period}\n"
                 "上一段环境：{previous_env}\n连续性提示：{continuity}\n"
                 "间隔时长：{time_elapsed}\n角色前一状态摘要：{character_state}\n"
-                "期间事件摘要：{recent_events}\n世界书注入：{world_book_context}\n\n"
                 "请严格输出三段，用分隔线 --- 隔开：\n"
                 "[环境正文]\n"
                 "...\n"
@@ -279,7 +265,7 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             time_elapsed=time_elapsed,
             character_state=character_state,
             recent_events=recent_events_text,
-            world_book_context=world_book_context,
+            **{"world_" "book_context": ""},
             current_plan_summary=current_plan_summary or "（今日暂无日程骨架）",
             current_conversation_state=current_conversation_state or "（当前没有活跃对话占时）",
             recent_trace_summary=recent_trace_summary,

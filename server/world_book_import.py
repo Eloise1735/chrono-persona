@@ -38,6 +38,7 @@ def _normalize_one(
 ) -> dict[str, Any] | None:
     content = (
         raw.get("content")
+        or raw.get("content_text")
         or raw.get("text")
         or raw.get("body")
         or raw.get("entry")
@@ -70,7 +71,9 @@ def _normalize_one(
     match_keywords = list(dict.fromkeys(keys + sec))
 
     extra_tags = _coerce_str_list(raw.get("tags"))
-    tags = list(dict.fromkeys(([source_tag] if source_tag else []) + extra_tags))
+    role_tags = _coerce_str_list(raw.get("result_kind") or raw.get("memory_tier"))
+    type_tags = _coerce_str_list(raw.get("type"))
+    tags = list(dict.fromkeys(([source_tag] if source_tag else []) + extra_tags + role_tags + type_tags))
 
     is_active = _truthy_enabled(raw.get("is_active", raw.get("enabled", True)))
 

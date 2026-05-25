@@ -29,6 +29,9 @@ from server.automation_engine import AutomationEngine
 from server.npc_engine import NPCEngine
 from server.plan_engine import PlanEngine
 from server.mcp_tools import mcp, set_state_machine, set_evolution_engine
+from server.ob_client import OBClient
+from server.ob_decay import OBDecayEngine, ob_decay_settings_from_config
+from server.ob_embedding import OBEmbeddingStore
 from server.api_routes import router as api_router, set_dependencies
 
 # Keep logs in UTC+8 to match application-facing time displays.
@@ -174,6 +177,19 @@ async def lifespan(app: FastAPI):
     else:
         memory = KeywordMemoryStore(db)
         logger.info("Memory store initialized with keyword mode.")
+    ob_embedding_store = OBEmbeddingStore(db, config.ob.buckets_dir) if config.ob.enabled else None
+    ob_client = (
+        OBClient(config.ob.buckets_dir, embedding_store=ob_embedding_store)
+        if config.ob.enabled
+        else None
+    )
+    ob_decay_engine = (
+        OBDecayEngine(ob_client, ob_decay_settings_from_config(config))
+        if ob_client is not None
+        else None
+    )
+    if ob_client is not None:
+        logger.info("OB bucket store initialized at %s.", config.ob.buckets_dir)
 
     evolution_engine = EvolutionEngine(db, llm, prompt_manager, snapshot_llm=snapshot_llm)
     automation_engine = AutomationEngine(
@@ -195,9 +211,14 @@ async def lifespan(app: FastAPI):
     npc_engine = NPCEngine(db, llm, prompt_manager)
     plan_engine = PlanEngine(db, llm, prompt_manager, sm, npc_engine)
     sm.set_plan_engine(plan_engine)
+    sm.set_ob_client(ob_client)
 
     set_state_machine(sm)
     set_evolution_engine(evolution_engine)
+    from server.mcp_tools import set_ob_client
+    set_ob_client(ob_client)
+    from server.mcp_tools import set_ob_decay_engine
+    set_ob_decay_engine(ob_decay_engine)
     set_dependencies(
         db,
         sm,
@@ -209,16 +230,23 @@ async def lifespan(app: FastAPI):
         snapshot_llm_client=snapshot_llm,
         plan_engine=plan_engine,
         npc_engine=npc_engine,
+        ob_client=ob_client,
+        ob_embedding_store=ob_embedding_store,
+        ob_decay_engine=ob_decay_engine,
     )
 
     # streamable_http_app() is mounted below; its Starlette lifespan is not run when nested
     # under FastAPI, so we must start the session manager here or Streamable HTTP returns 500.
     async with mcp.session_manager.run():
         scheduler_task = asyncio.create_task(_life_scheduler_loop(sm, plan_engine))
+        if ob_decay_engine is not None:
+            await ob_decay_engine.start()
         logger.info("State machine ready. MCP tools registered.")
         try:
             yield
         finally:
+            if ob_decay_engine is not None:
+                await ob_decay_engine.stop()
             scheduler_task.cancel()
             try:
                 await scheduler_task
@@ -331,6 +359,14 @@ async def serve_key_records():
     return {"message": "Key records page not found."}
 
 
+@app.get("/world-books")
+async def serve_world_books():
+    page = Path(__file__).parent.parent / "web" / "world-books.html"
+    if page.exists():
+        return FileResponse(str(page))
+    return {"message": "World books page not found."}
+
+
 @app.get("/settings")
 async def serve_settings():
     page = Path(__file__).parent.parent / "web" / "settings.html"
@@ -356,6 +392,28 @@ async def serve_vectors():
     if page.exists():
         return FileResponse(str(page))
     return {"message": "Vector management page not found."}
+
+
+@app.get("/ob")
+async def serve_ob():
+    page = Path(__file__).parent.parent / "web" / "ob-dashboard.html"
+    if page.exists():
+        return FileResponse(
+            str(page),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return {"message": "OB dashboard page not found."}
+
+
+@app.get("/ob/dashboard")
+async def serve_ob_dashboard():
+    page = Path(__file__).parent.parent / "web" / "ob-dashboard.html"
+    if page.exists():
+        return FileResponse(
+            str(page),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return {"message": "OB dashboard page not found."}
 
 
 @app.get("/environment-manage")

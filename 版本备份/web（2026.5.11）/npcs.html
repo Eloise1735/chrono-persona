@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
+  <title>凯尔希状态机 - NPC 管理</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260408a">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs" class="active">NPC 管理</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="action-bar">
+      <button class="btn btn-primary" onclick="openCreateNpcPrompt()">新增 NPC</button>
+      <button class="btn" onclick="loadNPCsPage()">刷新</button>
+    </div>
+
+    <div class="card">
+      <h2>NPC 列表</h2>
+      <div id="npc-list"><div class="loading">加载中...</div></div>
+    </div>
+
+    <div class="card">
+      <h2>NPC 详情 / 编辑</h2>
+      <div id="npc-editor"><div class="empty">点击某个 NPC 后可在此查看详情并编辑。</div></div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+  <script src="/static/app.js?v=20260408a"></script>
+  <script>initNPCsPage();</script>
+</body>
+</html>

@@ -132,9 +132,6 @@ SNAPSHOT_GENERATION_PROMPT = """基于时间推进和环境变化，以凯尔希
 【当前人格状态】
 {character_personality}
 
-【当前关系模式】
-{relationship_dynamics}
-
 【当前生活状态】
 {life_status}
 
@@ -347,7 +344,7 @@ CONVERSATION_SUMMARY_PROMPT = """请将本次对话整理为"对话摘要"，供
 PERIODIC_REVIEW_PROMPT = """基于以下阶段记录生成阶段回顾：
 【时间范围】{time_range}
 【状态快照时间线】{snapshots_timeline}
-【事件时间线】{events_timeline}
+【OB 记忆片段】{events_timeline}
 【统计】{stats_summary}
 【角色分层设定参考】{system_layers}
 要求：450-800字，包含变化轨迹与下一步关注点。"""
@@ -513,9 +510,9 @@ ENVIRONMENT_GENERATION_PROMPT = """你是环境信息生成器，为明日方舟
 - 距上次推进间隔：{time_elapsed}
 - 上一段环境（JSON）：{previous_env}
 - 连贯提示：{continuity}
-- 角色前一状态摘要：{character_state}
-- 期间事件摘要：{recent_events}
-- 世界书参考：{world_book_context}
+- 状态快照注入：{character_state}
+- 近期 OB feel：{ob_life_context}
+- OB breath 近期事件（已排除自动快照 bucket）：{recent_events}
 
 【生成原则】
 你的任务是以第三人称视角，客观呈现凯尔希当前所处的环境场景。遵循以下原则：
@@ -532,9 +529,7 @@ ENVIRONMENT_GENERATION_PROMPT = """你是环境信息生成器，为明日方舟
 
 4. 日程合理性：以当前时间点为锚，环境描写须符合该时段的作息逻辑（凌晨/清晨/上午/中午/下午/傍晚/深夜各有不同的场景基调）。即使有偶然事件，也要符合时间段的常识（深夜不太可能有大型会议，清晨不太可能突然要求加班审批文件等）。
 
-5. 世界书一致性：当世界书参考中包含设定信息时，优先保持与之一致，自然融入而非机械拼接。
-
-6. 偶然性的分寸：
+5. 偶然性的分寸：
    - 当 {time_elapsed} 较长（超过12小时）时，更可能出现新的偶然事件
    - 当 {continuity} 中存在未完成线索时，优先延续既有线索而非引入新偶然
    - 偶然事件应保持克制，避免每次生成都出现意外——大部分时段应呈现日常的平稳推进
@@ -561,33 +556,20 @@ DAILY_PLAN_GENERATION_PROMPT = """你现在要为凯尔希生成某一天的生�
 【角色背景】
 {character_background}
 
-【当前人格状态】
-{character_personality}
+【近期 feel】
+{character_life_context}
 
-【当前关系模式】
-{relationship_dynamics}
+【状态快照】
+（状态快照只服务前端当下状态展示，不作为后台生活流注入。）
 
-【当前生活状态】
-{life_status}
-
-【最新状态快照】
-{latest_snapshot}
-
-【近期事件】
-{recent_events}
+【角色侧连续主线 key_records】
+{character_key_records}
 
 【NPC 列表】
 {npc_list}
 
 【昨日计划回顾】
 {previous_plan_summary}
-
-【对话间隔】
-距离上次与用户的对话结束已经过去 {days_since_last_chat} 天。
-【短期关系感知】
-{relationship_feeling_summary}
-【日程倾向提示】
-{plan_bias_hint}
 
 【计划约束】
 - 计划日期：{plan_date}
@@ -627,7 +609,8 @@ DAILY_PLAN_GENERATION_PROMPT = """你现在要为凯尔希生成某一天的生�
 - `trigger_to_shift` 必须尽量写成“若发生 X，则改为 Y”的具体偏移条件，不要只写“顺延或转入缓冲”
 - action_payload 中不得出现 content、message、message_text、draft 等消息正文或草稿字段
 - 若某项明确承接昨日未完成事项，请附带 "source_kind": "carried_over" 与对应 "source_ref_id"
-- 若某项来自稳定生活线/长期任务，可写 "source_kind": "thread" 并尽量给出 "source_ref_id"
+- 若某项承接上方角色侧 key_record 主线，必须写 "source_kind": "thread" 与对应 key_record 的 "source_ref_id"，并从既有 step 继续，不得重新从 1 开始
+- 只有上方 key_record 没有可承接主线时，才允许生成新的普通事项；不要用相似标题平行替换旧主线
 - 若是普通新生成事项，可省略 source_kind/source_ref_id，后端会默认记为 generated
 - 时间段不能重叠，按小时递增
 - 必须留下 1-2 个机动缓冲块、低负载块、被动等待块或恢复块，允许世界插入变化
@@ -649,9 +632,7 @@ PLAN_REPLAN_PROMPT = """你现在要判断凯尔希今天剩余时段的计划�
 {context}
 
 【角色动态层】
-角色人格：{character_personality}
-关系模式：{relationship_dynamics}
-生活状态：{life_status}
+角色人格：{character_background}
 
 【最新状态快照】
 {latest_snapshot}
@@ -728,9 +709,8 @@ PLAN_ITEM_EXECUTE_PROMPT = """你现在要推演凯尔希完成一个计划项�
 {plan_item}
 
 【角色动态层】
-角色人格：{character_personality}
-关系模式：{relationship_dynamics}
-生活状态：{life_status}
+角色人格：{character_background}
+
 
 【最新状态快照】
 {latest_snapshot}
@@ -959,18 +939,20 @@ Previous environment: {previous_env}
 [连续性提示]
 Continuity hint: {continuity}
 
-[角色当前状态摘要]
-Previous state summary: {character_state}
+[状态快照注入]
+Snapshot state injection: {character_state}
 
 [当前计划与偏移]
 Current schedule skeleton: {current_plan_summary}
 Current conversation state: {current_conversation_state}
 Recent life-flow trace: {recent_trace_summary}
+Recent OB feel:
+{ob_life_context}
 Schedule alignment: {schedule_alignment}
 Plan delta: {plan_delta}
 
 [近期事件]
-Recent events:
+Recent OB breath events (snapshot buckets excluded):
 {recent_events}
 
 [扰动上下文]
@@ -980,10 +962,6 @@ Disturbance context:
 [近期扰动]
 Recent disturbances:
 {recent_disturbances}
-
-[世界书补充]
-World book context:
-{world_book_context}
 
 生成原则：
 1. 采用“叙事切片型”写法。像镜头切进角色当下的一小段生活，优先写正在发生的事情，而不是概括性回顾。
@@ -1097,6 +1075,9 @@ SNAPSHOT_GENERATION_PROMPT_V2 = """你要生成的不是环境叙事，也不是
 
 【历史记忆参考】
 {memory_context}
+
+【近期自然浮现的关系记忆（仅供感受，不要据此编造新互动）】
+{ob_relationship_context}
 
 【生成原则】
 1. 这是“内在沉淀层”，不是环境层的重写。环境层负责写外部场景中的推进，这里只写那些已经真正进入内里的东西：判断、余波、警觉、放松、迟疑、牵挂、压下、重新排列的优先级。
@@ -1377,21 +1358,6 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "category": "prompt",
         "description": "快照生成模板",
     },
-    KEY_PROMPT_EVENT_ANCHOR: {
-        "value": EVENT_ANCHOR_PROMPT,
-        "category": "prompt",
-        "description": "事件锚点生成模板",
-    },
-    KEY_PROMPT_EVENT_TRIGGER_JUDGE: {
-        "value": EVENT_TRIGGER_JUDGE_PROMPT_V2,
-        "category": "prompt",
-        "description": "后台事件触发判定模板",
-    },
-    KEY_PROMPT_EVENT_MATERIALIZE: {
-        "value": EVENT_MATERIALIZE_PROMPT_V2,
-        "category": "prompt",
-        "description": "后台事件成文模板",
-    },
     KEY_PROMPT_DISTURBANCE_JUDGE: {
         "value": DISTURBANCE_JUDGE_PROMPT_V2,
         "category": "prompt",
@@ -1412,11 +1378,6 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "category": "prompt",
         "description": "对话结束快照模板",
     },
-    KEY_PROMPT_REFLECT_EVENT: {
-        "value": REFLECT_EVENT_PROMPT,
-        "category": "prompt",
-        "description": "对话结束事件提取模板",
-    },
     KEY_PROMPT_CONVERSATION_SUMMARY: {
         "value": CONVERSATION_SUMMARY_PROMPT,
         "category": "prompt",
@@ -1431,11 +1392,6 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "value": EVOLUTION_SUMMARY_PROMPT,
         "category": "prompt",
         "description": "人格演化模板",
-    },
-    KEY_PROMPT_EVENT_SCORING: {
-        "value": EVENT_SCORING_PROMPT,
-        "category": "prompt",
-        "description": "事件评分模板",
     },
     KEY_PROMPT_ENVIRONMENT_GENERATION: {
         "value": ENVIRONMENT_GENERATION_PROMPT_V2,
@@ -1477,25 +1433,10 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "category": "prompt",
         "description": "主动消息生成模板",
     },
-    KEY_EVOLUTION_EVENT_THRESHOLD: {
-        "value": "10",
-        "category": "config",
-        "description": "触发人格演化建议的事件阈值",
-    },
     KEY_LAST_EVOLUTION_TIME: {
         "value": "",
         "category": "config",
         "description": "上次人格演化时间",
-    },
-    KEY_ARCHIVE_IMPORTANCE_THRESHOLD: {
-        "value": "3.0",
-        "category": "config",
-        "description": "低于该重要性阈值的事件可归档（需同时低于印象深度阈值）",
-    },
-    KEY_ARCHIVE_DEPTH_THRESHOLD: {
-        "value": "5.0",
-        "category": "config",
-        "description": "归档保护：印象深度高于此值的事件即使重要性低也不归档",
     },
     KEY_PENDING_EVOLUTION_PREVIEW_JSON: {
         "value": "",
@@ -1507,50 +1448,10 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "category": "automation",
         "description": "待确认的人格演化预览生成时间",
     },
-    KEY_EVOLUTION_PROMPT_IMPORTANCE_MIN: {
-        "value": "5.0",
-        "category": "config",
-        "description": "演化候选：重要性（认知变化幅度）达到该阈值的事件作为核心事件",
-    },
-    KEY_EVOLUTION_PROMPT_DEPTH_MIN: {
-        "value": "6.0",
-        "category": "config",
-        "description": "演化候选：印象深度（记忆质感）达到该阈值的事件作为背景事件保留",
-    },
-    KEY_EVOLUTION_PROMPT_DROP_IMPORTANCE_BELOW: {
-        "value": "2.0",
-        "category": "config",
-        "description": "演化候选：重要性低于该值且深度也偏低时直接剔除",
-    },
-    KEY_EVOLUTION_PROMPT_DROP_DEPTH_BELOW: {
-        "value": "3.0",
-        "category": "config",
-        "description": "演化候选：印象深度低于该值且重要性也偏低时直接剔除",
-    },
-    KEY_EVOLUTION_PROMPT_MAX_EVENTS: {
-        "value": "12",
-        "category": "config",
-        "description": "注入人格演化 prompt 的候选事件上限",
-    },
     KEY_MIN_TIME_UNIT_HOURS: {
         "value": "24",
         "category": "config",
         "description": "状态推进最小时间单位（小时，可为小数，如 0.5）",
-    },
-    KEY_INJECT_HOT_EVENTS_LIMIT: {
-        "value": "5",
-        "category": "config",
-        "description": "注入上下文的今日事件条数上限（按时间顺序）",
-    },
-    KEY_INJECT_YESTERDAY_EVENTS_LIMIT: {
-        "value": "5",
-        "category": "config",
-        "description": "注入上下文的昨日事件条数上限（按 importance_score 降序取最重要的）",
-    },
-    KEY_SNAPSHOT_RECENT_EVENTS_LIMIT: {
-        "value": "5",
-        "category": "config",
-        "description": "每个 checkpoint 注入的 recent_events 条数上限",
     },
     KEY_SNAPSHOT_SCHEDULER_ENABLED: {
         "value": "true",
@@ -1566,11 +1467,6 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "value": "3",
         "category": "automation",
         "description": "前台兜底 catch-up 单次最多推进的 checkpoint 数",
-    },
-    KEY_SNAPSHOT_EVENT_CANDIDATE_ENABLED: {
-        "value": "true",
-        "category": "automation",
-        "description": "pending event candidate 机制预留开关",
     },
     KEY_PLAN_ENABLED: {
         "value": "true",

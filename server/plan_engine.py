@@ -16,6 +16,7 @@ from server.llm_client import LLMClient
 from server.models import (
     CharacterNotification,
     DailyPlan,
+    KeyRecord,
     PlanItem,
     format_utc_instant_z,
 )
@@ -24,7 +25,6 @@ from server.prompts import (
     KEY_L1_CHARACTER_BACKGROUND,
     KEY_L2_CHARACTER_PERSONALITY,
     KEY_L2_LIFE_STATUS,
-    KEY_L2_RELATIONSHIP_DYNAMICS,
     KEY_PLAN_ENABLED,
     KEY_PLAN_GENERATION_HOUR,
     KEY_PLAN_HOUR_END,
@@ -42,7 +42,7 @@ from server.prompts import (
     PromptManager,
 )
 from server.state_machine import StateMachine
-from server.time_display import DISPLAY_TZ, parse_db_instant_to_shanghai, shanghai_now
+from server.time_display import DISPLAY_TZ, shanghai_now
 from server.web_search import WebSearchClient
 
 logger = logging.getLogger(__name__)
@@ -73,17 +73,6 @@ _PLAN_MESSAGE_PAYLOAD_KEYS = {
     "user_message",
     "sync_request",
 }
-_DIRECT_USER_CONTACT_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"(向|给).{0,6}(用户|eloise|泳琳).{0,10}(发|发送|同步|联系|分享|汇报|询问)",
-        r"(发|发送|同步|联系|回复|询问).{0,8}(用户|eloise|泳琳)",
-        r"(问候|晚安|早安).{0,8}(用户|eloise|泳琳)",
-        r"(通过终端|经由终端).{0,12}(陪伴|联系|同步)",
-    )
-]
-
-
 def _extract_json_object(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
     if not raw:
@@ -176,18 +165,9 @@ def _parse_action_payload_dict(raw: Any) -> dict[str, Any]:
         return {}
 
 
-def _looks_like_user_contact(text: str) -> bool:
-    sample = str(text or "").strip()
-    if not sample:
-        return False
-    return any(pattern.search(sample) for pattern in _DIRECT_USER_CONTACT_PATTERNS)
-
-
 def _neutralize_plan_text(text: Any, *, fallback: str) -> str:
     sample = str(text or "").strip()
     if not sample:
-        return fallback
-    if _looks_like_user_contact(sample):
         return fallback
     return sample
 
@@ -466,9 +446,10 @@ def _render_plan_item_focus(item: PlanItem) -> str:
 
 
 def _normalize_plan_structure_fields_v2(raw: dict[str, Any], *, fallback_activity: str) -> dict[str, Any]:
+    raw_activity_text = str(raw.get("activity") or fallback_activity or "").strip()
     activity = _neutralize_plan_text(
-        raw.get("activity") or fallback_activity or "",
-        fallback=fallback_activity or "整理与用户相关的话题材料并评估后续推进条件",
+        raw_activity_text,
+        fallback=fallback_activity or "整理独立事务并预留机动空间",
     )
     payload = _parse_action_payload_dict(raw.get("action_payload"))
     for key in list(payload.keys()):
@@ -486,9 +467,10 @@ def _normalize_plan_structure_fields_v2(raw: dict[str, Any], *, fallback_activit
         or payload.get("objective")
         or activity
     ).strip()
+    raw_objective_text = intended_objective
     intended_objective = _neutralize_plan_text(
         intended_objective,
-        fallback="整理与用户相关的话题材料并评估后续推进条件",
+        fallback="整理相关材料并评估后续推进条件",
     )
     constraint_source = str(
         raw.get("constraint_source")
@@ -508,7 +490,7 @@ def _normalize_plan_structure_fields_v2(raw: dict[str, Any], *, fallback_activit
         or payload.get("failure_cost")
         or ""
     ).strip()
-    if _looks_like_user_contact(failure_cost) or _is_generic_failure_cost(failure_cost):
+    if _is_generic_failure_cost(failure_cost):
         failure_cost = _default_failure_cost(dominant_mode, flexibility, constraint_source, intended_objective or activity)
     outline = _normalize_progress_outline(
         raw.get("progress_outline") or payload.get("progress_outline")
@@ -516,24 +498,21 @@ def _normalize_plan_structure_fields_v2(raw: dict[str, Any], *, fallback_activit
     if not any(outline.values()):
         outline = _default_progress_outline(intended_objective, activity=activity)
     else:
-        if _looks_like_user_contact(" ".join(outline.values())):
-            outline = _default_progress_outline(intended_objective, activity=activity)
-        else:
-            if not outline["goal"]:
-                outline["goal"] = intended_objective or activity
-            if not outline["done_so_far"]:
-                outline["done_so_far"] = "已具备基本上下文与执行条件"
-            if not outline["remaining"]:
-                outline["remaining"] = f"推进并完成与“{intended_objective or activity}”直接相关的关键部分"
-            if _is_generic_watch_points(outline["watch_points"]):
-                outline["watch_points"] = _default_watch_points(dominant_mode, constraint_source, intended_objective or activity)
-            if _is_generic_trigger_to_shift(outline["trigger_to_shift"]):
-                outline["trigger_to_shift"] = _default_trigger_to_shift(
-                    dominant_mode,
-                    flexibility,
-                    constraint_source,
-                    intended_objective or activity,
-                )
+        if not outline["goal"]:
+            outline["goal"] = intended_objective or activity
+        if not outline["done_so_far"]:
+            outline["done_so_far"] = "已具备基本上下文与执行条件"
+        if not outline["remaining"]:
+            outline["remaining"] = f"推进并完成与“{intended_objective or activity}”直接相关的关键部分"
+        if _is_generic_watch_points(outline["watch_points"]):
+            outline["watch_points"] = _default_watch_points(dominant_mode, constraint_source, intended_objective or activity)
+        if _is_generic_trigger_to_shift(outline["trigger_to_shift"]):
+            outline["trigger_to_shift"] = _default_trigger_to_shift(
+                dominant_mode,
+                flexibility,
+                constraint_source,
+                intended_objective or activity,
+            )
     if _is_generic_watch_points(outline["watch_points"]):
         outline["watch_points"] = _default_watch_points(dominant_mode, constraint_source, intended_objective or activity)
     if _is_generic_trigger_to_shift(outline["trigger_to_shift"]):
@@ -588,10 +567,6 @@ def _normalize_plan_structure_fields_v2(raw: dict[str, Any], *, fallback_activit
 def _render_plan_item_focus_v2(item: PlanItem) -> str:
     payload = _parse_action_payload_dict(item.action_payload)
     objective = str(payload.get("intended_objective") or "").strip()
-    outline = _normalize_progress_outline(payload.get("progress_outline"))
-    dominant_mode = str(payload.get("dominant_mode") or "").strip()
-    flexibility = str(payload.get("flexibility") or "").strip()
-    constraint_source = str(payload.get("constraint_source") or "").strip()
     expected_steps = max(1, int(payload.get("expected_steps") or 1))
     current_step = max(1, int(payload.get("current_step") or 1))
     progress_status = str(payload.get("progress_status") or "").strip()
@@ -601,46 +576,23 @@ def _render_plan_item_focus_v2(item: PlanItem) -> str:
         parts.append(objective)
     elif activity:
         parts.append(activity)
-    parts.append(f"step={current_step}/{expected_steps}")
-    if progress_status:
-        parts.append(f"progress={progress_status}")
-    if outline.get("remaining"):
-        parts.append(f"remaining={outline['remaining']}")
-    if outline.get("watch_points"):
-        parts.append(f"watch={outline['watch_points']}")
-    if dominant_mode:
-        parts.append(f"mode={dominant_mode}")
-    if flexibility:
-        parts.append(f"flex={flexibility}")
-    if constraint_source:
-        parts.append(f"constraint={constraint_source}")
+    if progress_status in {"paused", "ready_to_close", "completed", "dropped"}:
+        parts.append(progress_status)
+    elif current_step >= expected_steps and expected_steps > 1:
+        parts.append("ready_to_close")
     return " | ".join(parts)
 
 
 def _render_previous_plan_reference(item: PlanItem, *, schema_version: str) -> str:
     payload = _parse_action_payload_dict(item.action_payload)
     objective = str(payload.get("intended_objective") or "").strip()
-    outline = _normalize_progress_outline(payload.get("progress_outline"))
-    flexibility = str(payload.get("flexibility") or "").strip()
-    dominant_mode = str(payload.get("dominant_mode") or "").strip()
-    expected_steps = max(1, int(payload.get("expected_steps") or 1))
-    current_step = max(1, int(payload.get("current_step") or 1))
     progress_status = str(payload.get("progress_status") or "").strip()
     focus = objective or (item.activity if schema_version == PLAN_SCHEMA_VERSION else "")
     parts = [f"- {item.hour_start:02d}:00-{item.hour_end:02d}:00"]
     if focus:
         parts.append(focus)
-    parts.append(f"step={current_step}/{expected_steps}")
     if progress_status:
         parts.append(f"progress={progress_status}")
-    if outline.get("remaining"):
-        parts.append(f"remaining={outline['remaining']}")
-    if outline.get("watch_points"):
-        parts.append(f"watch={outline['watch_points']}")
-    if dominant_mode:
-        parts.append(f"mode={dominant_mode}")
-    if flexibility:
-        parts.append(f"flex={flexibility}")
     parts.append(f"[{item.status}]")
     return " | ".join(parts)
 
@@ -836,12 +788,8 @@ class PlanEngine:
         lines: list[str] = [f"Date {plan.plan_date}"]
         for it in items:
             st = it.status
-            payload = _parse_action_payload_dict(it.action_payload)
             focus = _render_plan_item_focus_v2(it)
-            failure_cost = str(payload.get("failure_cost") or "").strip()
             line = f"- {it.hour_start:02d}:00-{it.hour_end:02d}:00 [{st}] {focus}"
-            if failure_cost:
-                line += f" | cost={failure_cost}"
             lines.append(line)
         return "\n".join(lines)
 
@@ -890,6 +838,61 @@ class PlanEngine:
             )
         return "\n".join(lines[:4]) if lines else "（今日事项推进总体平稳，暂无强烈滞涩线）"
 
+    @staticmethod
+    def _format_character_key_records_for_plan(records: list[KeyRecord]) -> str:
+        if not records:
+            return "(no active character-side key records)"
+        lines: list[str] = []
+        for record in records[:5]:
+            payload = _parse_action_payload_dict(record.content_json)
+            progress = payload.get("progress_state") if isinstance(payload.get("progress_state"), dict) else payload
+            step = str(progress.get("current_step") or "").strip()
+            expected = str(progress.get("expected_steps") or "").strip()
+            status = str(progress.get("progress_status") or record.status or "").strip()
+            next_watch = str(payload.get("next_watch_point") or progress.get("next_watch_point") or "").strip()
+            content = re.sub(r"\s+", " ", str(record.content_text or "").strip())[:260]
+            progress_text = f" step={step}/{expected}" if step or expected else ""
+            watch_text = f" next={next_watch[:120]}" if next_watch else ""
+            lines.append(
+                f"- id={int(record.id or 0)} [{record.type}] {record.title}{progress_text} status={status}: {content}{watch_text}"
+            )
+        return "\n".join(lines)
+
+    async def _apply_character_thread_progress(
+        self,
+        *,
+        source_kind: str,
+        source_ref_id: int | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if source_kind != "thread" or not source_ref_id:
+            return payload
+        record = await self.db.get_key_record_by_id(int(source_ref_id))
+        if record is None or str(getattr(record, "life_scope", "") or "") != "character_life":
+            return payload
+        record_json = _parse_action_payload_dict(record.content_json)
+        progress = record_json.get("progress_state") if isinstance(record_json.get("progress_state"), dict) else record_json
+        try:
+            previous_step = max(0, int(progress.get("current_step") or 0))
+        except Exception:
+            previous_step = 0
+        try:
+            expected_steps = max(1, int(progress.get("expected_steps") or payload.get("expected_steps") or 1))
+        except Exception:
+            expected_steps = max(1, int(payload.get("expected_steps") or 1))
+        next_step = min(expected_steps, max(1, previous_step + 1))
+        payload["thread_id"] = str(progress.get("thread_id") or f"key_record_{int(source_ref_id)}")
+        payload["expected_steps"] = expected_steps
+        payload["current_step"] = next_step
+        payload["progress_status"] = "ready_to_close" if next_step >= expected_steps else "advancing"
+        if not str(payload.get("closure_condition") or "").strip():
+            payload["closure_condition"] = str(
+                progress.get("closure_condition")
+                or record_json.get("closure_condition")
+                or "完成这条角色生活主线的当前阶段后收束或重写 key_record"
+            )
+        return payload
+
     async def ensure_today_plan(self) -> None:
         if not await self.is_enabled():
             return
@@ -936,10 +939,9 @@ class PlanEngine:
         web_base = (await self.prompt_manager.get_config_value(KEY_PLAN_WEB_SEARCH_API_BASE)).strip()
         web_key = (await self.prompt_manager.get_config_value(KEY_PLAN_WEB_SEARCH_API_KEY)).strip()
 
-        latest = await self.db.get_latest_snapshot()
-        latest_snapshot = latest.content if latest else "(no snapshot)"
-        recent = await self.db.get_recent_events_by_event_time(limit=8, include_archived=False)
-        recent_events = "\n".join(f"- [{e.date}] {e.title or e.description[:120]}" for e in recent) or "(none)"
+        latest_snapshot = "（状态快照只服务前端当下状态展示，不作为后台计划生成注入。）"
+        recent_events = await self.state_machine._ob_feel_context_text(character_life_limit=1, other_limit=2)
+        recent_events = recent_events.strip() or "(none)"
 
         extra_ctx = ""
         action_type = _normalize_action_type(item.action_type)
@@ -980,7 +982,7 @@ class PlanEngine:
             template,
             plan_item=plan_item_text,
             character_personality=await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY),
-            relationship_dynamics=await self.prompt_manager.get_layer_content(KEY_L2_RELATIONSHIP_DYNAMICS),
+            relationship_dynamics="关系动态已迁入 OB 记忆主干；计划执行不得生成与用户互动的后台事项。",
             life_status=await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS),
             latest_snapshot=latest_snapshot,
             recent_events=recent_events,
@@ -1025,8 +1027,12 @@ class PlanEngine:
             return
         latest = await self.db.get_latest_snapshot()
         snap_text = latest.content if latest else ""
-        recent = await self.db.get_recent_events_by_event_time(limit=6, include_archived=False)
-        recent_txt = "\n".join(f"- [{e.date}] {e.description[:200]}" for e in recent) or "(none)"
+        recent_txt = await self.state_machine._ob_breath_text(
+            domain="character_life",
+            query=snap_text,
+            limit=5,
+        )
+        recent_txt = recent_txt.strip() or "(none)"
         remaining = "\n".join(
             json.dumps(
                 {
@@ -1091,7 +1097,7 @@ class PlanEngine:
             trigger=trigger,
             context=context or "(none)",
             character_personality=await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY),
-            relationship_dynamics=await self.prompt_manager.get_layer_content(KEY_L2_RELATIONSHIP_DYNAMICS),
+            relationship_dynamics="关系动态已迁入 OB 记忆主干；重排只处理角色自身生活与任务。",
             life_status=await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS),
             latest_snapshot=snap_text[:6000],
         )
@@ -1132,14 +1138,28 @@ class PlanEngine:
         )
 
     async def generate_daily_plan(self, plan_date: str) -> DailyPlan:
+        leak_key = "ob_" "relationship_context"
+        assert leak_key not in locals(), (
+            "OB relationship context is snapshot feeling-layer only; it must not enter the action layer"
+        )
         char_bg = await self.prompt_manager.get_layer_content(KEY_L1_CHARACTER_BACKGROUND)
         personality = await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY)
-        rel = await self.prompt_manager.get_layer_content(KEY_L2_RELATIONSHIP_DYNAMICS)
         life = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
-        latest = await self.db.get_latest_snapshot()
-        latest_snapshot = latest.content if latest else "(no snapshot)"
-        recent = await self.db.get_recent_events_by_event_time(limit=12, include_archived=False)
-        recent_events = "\n".join(f"- [{e.date}] {e.title or e.description[:160]}" for e in recent) or "(none)"
+        latest_snapshot = "（状态快照只服务前端当下状态展示，不作为后台计划生成注入。）"
+        character_life_context = ""
+        try:
+            character_life_context = await self.state_machine._ob_feel_context_text(
+                character_life_limit=1,
+                other_limit=2,
+            )
+        except Exception:
+            logger.exception("Failed to load OB feel context for daily plan.")
+        character_key_records = await self.db.get_recent_key_records(
+            limit=5,
+            include_archived=False,
+            life_scope="character_life",
+        )
+        character_key_record_context = self._format_character_key_records_for_plan(character_key_records)
         npcs = await self.npc_engine.list_active_npcs()
         npc_list = json.dumps([n.model_dump() for n in npcs], ensure_ascii=False)
 
@@ -1159,43 +1179,41 @@ class PlanEngine:
                 if baseline_plan_id and int(prev_plan.id) == int(baseline_plan_id):
                     previous_plan_summary = f"[manual baseline plan #{int(prev_plan.id)}]\n{previous_plan_summary}"
 
-        conv = await self.db.get_latest_snapshot_by_type("conversation_end")
-        days_since = "0"
-        if conv and conv.created_at:
-            try:
-                t = parse_db_instant_to_shanghai(conv.created_at)
-                delta = shanghai_now().date() - t.date()
-                days_since = str(max(0, delta.days))
-            except Exception:
-                days_since = "0"
-
         h0 = await self._int_setting(KEY_PLAN_HOUR_START, 7)
         h1 = await self._int_setting(KEY_PLAN_HOUR_END, 23)
-        relationship_feeling_summary = ""
-        plan_bias_hint = ""
-        try:
-            relationship_state = await self.db.get_latest_relationship_state()
-            if relationship_state is not None:
-                relationship_feeling_summary = str(relationship_state.relationship_feeling_summary or "").strip()
-                plan_bias_hint = str(relationship_state.plan_bias_hint or "").strip()
-        except Exception:
-            relationship_feeling_summary = ""
-            plan_bias_hint = ""
 
         template = await self.prompt_manager.get_prompt(KEY_PROMPT_DAILY_PLAN_GENERATION)
+        template = re.sub(
+            r"\n?【当前关系模式】\s*\n\{relationship_dynamics\}\s*\n",
+            "\n",
+            template,
+        )
+        template = re.sub(
+            r"\n?【对话间隔】\s*\n.*?\{days_since_last_chat\}.*?\n"
+            r"【短期关系感知】\s*\n\{relationship_feeling_summary\}\s*\n"
+            r"【日程倾向提示】\s*\n\{plan_bias_hint\}\s*\n",
+            "\n",
+            template,
+            flags=re.DOTALL,
+        )
+        if "{character_life_context}" not in template:
+            template += (
+                "\n\n【近期 feel】\n{character_life_context}\n"
+                "\n【角色侧连续主线 key_records】\n{character_key_records}\n"
+                "\n要求：承接角色侧 key_record 主线时必须写 source_kind=\"thread\" 和 source_ref_id，"
+                "并延续既有推进步数，不得同题重开 step 1。"
+            )
         prompt = _safe_prompt_format(
             template,
             character_background=char_bg,
             character_personality=personality,
-            relationship_dynamics=rel,
             life_status=life,
             latest_snapshot=latest_snapshot,
-            recent_events=recent_events,
+            character_life_context=character_life_context or "(none)",
+            character_key_records=character_key_record_context,
+            recent_events=character_life_context or "(none)",
             npc_list=npc_list,
             previous_plan_summary=previous_plan_summary,
-            days_since_last_chat=days_since,
-            relationship_feeling_summary=relationship_feeling_summary,
-            plan_bias_hint=plan_bias_hint,
             plan_date=plan_date,
             hour_start=h0,
             hour_end=h1,
@@ -1257,6 +1275,13 @@ class PlanEngine:
             action_payload = json.dumps(normalized_payload, ensure_ascii=False)
             sk = _normalize_source_kind(str(raw.get("source_kind") or "generated"), default="generated")
             source_ref_id = _normalize_source_ref_id(raw.get("source_ref_id"))
+            if sk == "thread" and source_ref_id:
+                normalized_payload = await self._apply_character_thread_progress(
+                    source_kind=sk,
+                    source_ref_id=source_ref_id,
+                    payload=normalized_payload,
+                )
+                action_payload = json.dumps(normalized_payload, ensure_ascii=False)
             item = PlanItem(
                 plan_id=int(plan.id),
                 hour_start=hs,

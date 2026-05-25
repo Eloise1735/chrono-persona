@@ -11,11 +11,15 @@ from server.models import (
     CharacterNotification,
     ConversationTimeClaim,
     DailyPlan,
+    DisturbancePulse,
     EventAnchor,
     KeyRecord,
     LifeFlowTrace,
     NPCEntity,
     PlanItem,
+    RelationshipThought,
+    RelationshipState,
+    SlowLine,
     StateSnapshot,
     WorldBook,
     format_utc_instant_z,
@@ -43,6 +47,7 @@ CREATE TABLE IF NOT EXISTS event_anchors (
     embedding_vector_id TEXT,
     trigger_keywords TEXT NOT NULL DEFAULT '[]',
     categories TEXT NOT NULL DEFAULT '[]',
+    meta_json TEXT,
     archived INTEGER NOT NULL DEFAULT 0,
     importance_score REAL,
     impression_depth REAL
@@ -70,11 +75,13 @@ CREATE TABLE IF NOT EXISTS key_records (
     content_text TEXT NOT NULL DEFAULT '',
     content_json TEXT,
     tags TEXT NOT NULL DEFAULT '[]',
+    match_keywords TEXT NOT NULL DEFAULT '[]',
     start_date TEXT,
     end_date TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     source TEXT NOT NULL DEFAULT 'manual',
     linked_event_id INTEGER,
+    embedding_vector_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -157,6 +164,30 @@ CREATE TABLE IF NOT EXISTS life_flow_traces (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS disturbance_pulses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occur_at TEXT NOT NULL,
+    reveal_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    channel_type TEXT NOT NULL DEFAULT 'endogenous_reveal',
+    source_family TEXT NOT NULL DEFAULT 'task',
+    seed_kind TEXT NOT NULL DEFAULT 'event',
+    seed_ref_id INTEGER,
+    blind_spot_reason TEXT NOT NULL DEFAULT '',
+    reveal_channel TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    factual_payload_json TEXT NOT NULL DEFAULT '{}',
+    impact_hint TEXT NOT NULL DEFAULT '',
+    salience REAL NOT NULL DEFAULT 0.5,
+    novelty_score REAL NOT NULL DEFAULT 0.5,
+    cooldown_until TEXT,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    linked_snapshot_id INTEGER,
+    linked_event_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS conversation_time_claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status TEXT NOT NULL DEFAULT 'active',
@@ -166,6 +197,70 @@ CREATE TABLE IF NOT EXISTS conversation_time_claims (
     context_summary TEXT NOT NULL DEFAULT '',
     latest_snapshot_id INTEGER,
     closing_snapshot_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relationship_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    last_meaningful_contact_at TEXT,
+    hours_since_meaningful_contact REAL NOT NULL DEFAULT 0,
+    days_since_meaningful_contact INTEGER NOT NULL DEFAULT 0,
+    contact_recency_bucket TEXT NOT NULL DEFAULT 'active',
+    connection_need REAL NOT NULL DEFAULT 0.5,
+    pride_or_distance REAL NOT NULL DEFAULT 0.5,
+    valence REAL NOT NULL DEFAULT 0.5,
+    arousal REAL NOT NULL DEFAULT 0.5,
+    life_immersion REAL NOT NULL DEFAULT 0.5,
+    relationship_feeling_summary TEXT NOT NULL DEFAULT '',
+    space_need_level REAL NOT NULL DEFAULT 0.5,
+    concern_level REAL NOT NULL DEFAULT 0.5,
+    proactive_topics TEXT NOT NULL DEFAULT '[]',
+    plan_bias_hint TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relationship_thoughts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thought_date TEXT NOT NULL,
+    source_snapshot_id INTEGER,
+    source_env_id TEXT,
+    topic_line TEXT NOT NULL DEFAULT '',
+    thought_type TEXT NOT NULL DEFAULT 'reconsider',
+    content TEXT NOT NULL DEFAULT '',
+    salience REAL NOT NULL DEFAULT 0.5,
+    dedupe_fingerprint TEXT NOT NULL DEFAULT '',
+    resolution_status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS slowlines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_key TEXT NOT NULL DEFAULT '',
+    theme TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT 'shared',
+    source_family TEXT NOT NULL DEFAULT 'autonomous',
+    memory_role TEXT NOT NULL DEFAULT 'active_thread_detail',
+    progress_status TEXT NOT NULL DEFAULT 'open',
+    tension_level TEXT NOT NULL DEFAULT 'medium',
+    unresolved_level TEXT NOT NULL DEFAULT 'medium',
+    preload_priority REAL NOT NULL DEFAULT 0.5,
+    stage_summary TEXT NOT NULL DEFAULT '',
+    trajectory_summary TEXT NOT NULL DEFAULT '',
+    current_tension TEXT NOT NULL DEFAULT '',
+    recent_shift_summary TEXT NOT NULL DEFAULT '',
+    recent_movement_summary TEXT NOT NULL DEFAULT '',
+    last_meaningful_shift_at TEXT,
+    emotional_tension TEXT NOT NULL DEFAULT 'stable',
+    affective_direction TEXT NOT NULL DEFAULT 'endurance',
+    open_questions TEXT NOT NULL DEFAULT '[]',
+    salience REAL NOT NULL DEFAULT 0.5,
+    last_touched_at TEXT,
+    linked_key_record_ids TEXT NOT NULL DEFAULT '[]',
+    linked_event_ids TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -229,10 +324,32 @@ class Database:
         await self._ensure_column("event_anchors", "impression_depth", "REAL")
         await self._ensure_column("event_anchors", "title", "TEXT NOT NULL DEFAULT ''")
         await self._ensure_column("event_anchors", "categories", "TEXT NOT NULL DEFAULT '[]'")
+        await self._ensure_column("event_anchors", "meta_json", "TEXT")
+        await self._ensure_column("key_records", "match_keywords", "TEXT NOT NULL DEFAULT '[]'")
+        await self._ensure_column("key_records", "embedding_vector_id", "TEXT")
         await self._ensure_column("world_books", "embedding_vector_id", "TEXT")
         await self._ensure_column("state_snapshots", "inserted_at", "TEXT")
         await self._ensure_column("plan_items", "source_kind", "TEXT NOT NULL DEFAULT 'generated'")
         await self._ensure_column("plan_items", "source_ref_id", "INTEGER")
+        await self._ensure_column("relationship_states", "hours_since_meaningful_contact", "REAL NOT NULL DEFAULT 0")
+        await self._ensure_column("slowlines", "thread_key", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("slowlines", "scope", "TEXT NOT NULL DEFAULT 'shared'")
+        await self._ensure_column("slowlines", "memory_role", "TEXT NOT NULL DEFAULT 'active_thread_detail'")
+        await self._ensure_column("slowlines", "progress_status", "TEXT NOT NULL DEFAULT 'open'")
+        await self._ensure_column("slowlines", "tension_level", "TEXT NOT NULL DEFAULT 'medium'")
+        await self._ensure_column("slowlines", "unresolved_level", "TEXT NOT NULL DEFAULT 'medium'")
+        await self._ensure_column("slowlines", "preload_priority", "REAL NOT NULL DEFAULT 0.5")
+        await self._ensure_column("slowlines", "trajectory_summary", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("slowlines", "recent_shift_summary", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("slowlines", "last_meaningful_shift_at", "TEXT")
+        await self._ensure_column("slowlines", "emotional_tension", "TEXT NOT NULL DEFAULT 'stable'")
+        await self._ensure_column("slowlines", "affective_direction", "TEXT NOT NULL DEFAULT 'endurance'")
+        await self.conn.execute(
+            "UPDATE slowlines SET source_family = 'relationship' WHERE source_family = 'conversation'"
+        )
+        await self.conn.execute(
+            "UPDATE slowlines SET source_family = 'daily_life' WHERE source_family IN ('autonomous', 'mixed', '')"
+        )
         await self.conn.execute(
             """CREATE TABLE IF NOT EXISTS memory_recall_stats (
                 entry_id TEXT PRIMARY KEY,
@@ -249,11 +366,13 @@ class Database:
                 content_text TEXT NOT NULL DEFAULT '',
                 content_json TEXT,
                 tags TEXT NOT NULL DEFAULT '[]',
+                match_keywords TEXT NOT NULL DEFAULT '[]',
                 start_date TEXT,
                 end_date TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 source TEXT NOT NULL DEFAULT 'manual',
                 linked_event_id INTEGER,
+                embedding_vector_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"""
@@ -329,6 +448,9 @@ class Database:
             )"""
         )
         await self.conn.execute(
+            "UPDATE plan_items SET action_type = 'internal' WHERE action_type = 'message_user'"
+        )
+        await self.conn.execute(
             """CREATE TABLE IF NOT EXISTS life_flow_traces (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trace_date TEXT NOT NULL,
@@ -343,6 +465,31 @@ class Database:
             )"""
         )
         await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS disturbance_pulses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occur_at TEXT NOT NULL,
+                reveal_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                channel_type TEXT NOT NULL DEFAULT 'endogenous_reveal',
+                source_family TEXT NOT NULL DEFAULT 'task',
+                seed_kind TEXT NOT NULL DEFAULT 'event',
+                seed_ref_id INTEGER,
+                blind_spot_reason TEXT NOT NULL DEFAULT '',
+                reveal_channel TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                factual_payload_json TEXT NOT NULL DEFAULT '{}',
+                impact_hint TEXT NOT NULL DEFAULT '',
+                salience REAL NOT NULL DEFAULT 0.5,
+                novelty_score REAL NOT NULL DEFAULT 0.5,
+                cooldown_until TEXT,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                linked_snapshot_id INTEGER,
+                linked_event_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute(
             """CREATE TABLE IF NOT EXISTS conversation_time_claims (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 status TEXT NOT NULL DEFAULT 'active',
@@ -352,6 +499,73 @@ class Database:
                 context_summary TEXT NOT NULL DEFAULT '',
                 latest_snapshot_id INTEGER,
                 closing_snapshot_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS relationship_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_meaningful_contact_at TEXT,
+                hours_since_meaningful_contact REAL NOT NULL DEFAULT 0,
+                days_since_meaningful_contact INTEGER NOT NULL DEFAULT 0,
+                contact_recency_bucket TEXT NOT NULL DEFAULT 'active',
+                connection_need REAL NOT NULL DEFAULT 0.5,
+                pride_or_distance REAL NOT NULL DEFAULT 0.5,
+                valence REAL NOT NULL DEFAULT 0.5,
+                arousal REAL NOT NULL DEFAULT 0.5,
+                life_immersion REAL NOT NULL DEFAULT 0.5,
+                relationship_feeling_summary TEXT NOT NULL DEFAULT '',
+                space_need_level REAL NOT NULL DEFAULT 0.5,
+                concern_level REAL NOT NULL DEFAULT 0.5,
+                proactive_topics TEXT NOT NULL DEFAULT '[]',
+                plan_bias_hint TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS relationship_thoughts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thought_date TEXT NOT NULL,
+                source_snapshot_id INTEGER,
+                source_env_id TEXT,
+                topic_line TEXT NOT NULL DEFAULT '',
+                thought_type TEXT NOT NULL DEFAULT 'reconsider',
+                content TEXT NOT NULL DEFAULT '',
+                salience REAL NOT NULL DEFAULT 0.5,
+                dedupe_fingerprint TEXT NOT NULL DEFAULT '',
+                resolution_status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS slowlines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_key TEXT NOT NULL DEFAULT '',
+                theme TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT 'shared',
+                source_family TEXT NOT NULL DEFAULT 'autonomous',
+                memory_role TEXT NOT NULL DEFAULT 'active_thread_detail',
+                progress_status TEXT NOT NULL DEFAULT 'open',
+                tension_level TEXT NOT NULL DEFAULT 'medium',
+                unresolved_level TEXT NOT NULL DEFAULT 'medium',
+                preload_priority REAL NOT NULL DEFAULT 0.5,
+                stage_summary TEXT NOT NULL DEFAULT '',
+                trajectory_summary TEXT NOT NULL DEFAULT '',
+                current_tension TEXT NOT NULL DEFAULT '',
+                recent_shift_summary TEXT NOT NULL DEFAULT '',
+                recent_movement_summary TEXT NOT NULL DEFAULT '',
+                last_meaningful_shift_at TEXT,
+                emotional_tension TEXT NOT NULL DEFAULT 'stable',
+                affective_direction TEXT NOT NULL DEFAULT 'endurance',
+                open_questions TEXT NOT NULL DEFAULT '[]',
+                salience REAL NOT NULL DEFAULT 0.5,
+                last_touched_at TEXT,
+                linked_key_record_ids TEXT NOT NULL DEFAULT '[]',
+                linked_event_ids TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"""
@@ -620,10 +834,11 @@ class Database:
     async def insert_event(self, event: EventAnchor) -> int:
         cursor = await self.conn.execute(
             """INSERT INTO event_anchors
-               (date, title, description, source, created_at, embedding_vector_id, trigger_keywords, categories, archived, importance_score, impression_depth)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (date, title, description, source, created_at, embedding_vector_id, trigger_keywords, categories, meta_json, archived, importance_score, impression_depth)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (event.date, getattr(event, "title", ""), event.description, event.source,
              event.created_at, event.embedding_vector_id, event.trigger_keywords, getattr(event, "categories", "[]"),
+             getattr(event, "meta_json", None),
              getattr(event, "archived", 0),
              getattr(event, "importance_score", None),
              getattr(event, "impression_depth", None)),
@@ -650,6 +865,12 @@ class Database:
         limit: int = 50,
         include_archived: bool = False,
         categories: list[str] | None = None,
+        sources: list[str] | None = None,
+        scored_only: bool = False,
+        min_importance_score: float | None = None,
+        max_importance_score: float | None = None,
+        min_impression_depth: float | None = None,
+        max_impression_depth: float | None = None,
     ) -> list[EventAnchor]:
         sql = "SELECT * FROM event_anchors WHERE 1=1"
         params: list = []
@@ -663,11 +884,127 @@ class Database:
                     clauses.append("categories LIKE ?")
                     params.append(f"%{c}%")
                 sql += " AND (" + " OR ".join(clauses) + ")"
+        if sources:
+            valid_sources = [s for s in sources if s]
+            if valid_sources:
+                placeholders = ",".join("?" for _ in valid_sources)
+                sql += f" AND source IN ({placeholders})"
+                params.extend(valid_sources)
+        if scored_only:
+            sql += " AND importance_score IS NOT NULL AND impression_depth IS NOT NULL"
+        if min_importance_score is not None:
+            sql += " AND COALESCE(importance_score, -999999) >= ?"
+            params.append(min_importance_score)
+        if max_importance_score is not None:
+            sql += " AND COALESCE(importance_score, 999999) <= ?"
+            params.append(max_importance_score)
+        if min_impression_depth is not None:
+            sql += " AND COALESCE(impression_depth, -999999) >= ?"
+            params.append(min_impression_depth)
+        if max_impression_depth is not None:
+            sql += " AND COALESCE(impression_depth, 999999) <= ?"
+            params.append(max_impression_depth)
         sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
             return [EventAnchor(**dict(r)) for r in rows]
+
+    async def count_events(
+        self,
+        *,
+        include_archived: bool = False,
+        categories: list[str] | None = None,
+        sources: list[str] | None = None,
+        scored_only: bool = False,
+        min_importance_score: float | None = None,
+        max_importance_score: float | None = None,
+        min_impression_depth: float | None = None,
+        max_impression_depth: float | None = None,
+    ) -> int:
+        sql = "SELECT COUNT(*) FROM event_anchors WHERE 1=1"
+        params: list = []
+        if not include_archived:
+            sql += " AND archived = 0"
+        if categories:
+            valid = [c for c in categories if c]
+            if valid:
+                clauses = []
+                for c in valid:
+                    clauses.append("categories LIKE ?")
+                    params.append(f"%{c}%")
+                sql += " AND (" + " OR ".join(clauses) + ")"
+        if sources:
+            valid_sources = [s for s in sources if s]
+            if valid_sources:
+                placeholders = ",".join("?" for _ in valid_sources)
+                sql += f" AND source IN ({placeholders})"
+                params.extend(valid_sources)
+        if scored_only:
+            sql += " AND importance_score IS NOT NULL AND impression_depth IS NOT NULL"
+        if min_importance_score is not None:
+            sql += " AND COALESCE(importance_score, -999999) >= ?"
+            params.append(min_importance_score)
+        if max_importance_score is not None:
+            sql += " AND COALESCE(importance_score, 999999) <= ?"
+            params.append(max_importance_score)
+        if min_impression_depth is not None:
+            sql += " AND COALESCE(impression_depth, -999999) >= ?"
+            params.append(min_impression_depth)
+        if max_impression_depth is not None:
+            sql += " AND COALESCE(impression_depth, 999999) <= ?"
+            params.append(max_impression_depth)
+        async with self.conn.execute(sql, params) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    async def delete_events_by_filters(
+        self,
+        *,
+        include_archived: bool = False,
+        categories: list[str] | None = None,
+        sources: list[str] | None = None,
+        scored_only: bool = False,
+        min_importance_score: float | None = None,
+        max_importance_score: float | None = None,
+        min_impression_depth: float | None = None,
+        max_impression_depth: float | None = None,
+    ) -> int:
+        sql = "DELETE FROM event_anchors WHERE 1=1"
+        params: list = []
+        if not include_archived:
+            sql += " AND archived = 0"
+        if categories:
+            valid = [c for c in categories if c]
+            if valid:
+                clauses = []
+                for c in valid:
+                    clauses.append("categories LIKE ?")
+                    params.append(f"%{c}%")
+                sql += " AND (" + " OR ".join(clauses) + ")"
+        if sources:
+            valid_sources = [s for s in sources if s]
+            if valid_sources:
+                placeholders = ",".join("?" for _ in valid_sources)
+                sql += f" AND source IN ({placeholders})"
+                params.extend(valid_sources)
+        if scored_only:
+            sql += " AND importance_score IS NOT NULL AND impression_depth IS NOT NULL"
+        if min_importance_score is not None:
+            sql += " AND COALESCE(importance_score, -999999) >= ?"
+            params.append(min_importance_score)
+        if max_importance_score is not None:
+            sql += " AND COALESCE(importance_score, 999999) <= ?"
+            params.append(max_importance_score)
+        if min_impression_depth is not None:
+            sql += " AND COALESCE(impression_depth, -999999) >= ?"
+            params.append(min_impression_depth)
+        if max_impression_depth is not None:
+            sql += " AND COALESCE(impression_depth, 999999) <= ?"
+            params.append(max_impression_depth)
+        cursor = await self.conn.execute(sql, params)
+        await self.conn.commit()
+        return int(getattr(cursor, "rowcount", 0) or 0)
 
     async def get_recent_events_by_event_time(
         self,
@@ -1026,19 +1363,21 @@ class Database:
     async def insert_key_record(self, record: KeyRecord) -> int:
         cursor = await self.conn.execute(
             """INSERT INTO key_records
-               (type, title, content_text, content_json, tags, start_date, end_date, status, source, linked_event_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (type, title, content_text, content_json, tags, match_keywords, start_date, end_date, status, source, linked_event_id, embedding_vector_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record.type,
                 record.title,
                 record.content_text,
                 record.content_json,
                 record.tags,
+                record.match_keywords,
                 record.start_date,
                 record.end_date,
                 record.status,
                 record.source,
                 record.linked_event_id,
+                record.embedding_vector_id,
                 record.created_at,
                 record.updated_at,
             ),
@@ -1067,6 +1406,17 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
             return KeyRecord(**dict(row)) if row else None
+
+    async def get_key_records_by_ids(self, record_ids: list[int]) -> list[KeyRecord]:
+        if not record_ids:
+            return []
+        placeholders = ",".join(["?"] * len(record_ids))
+        async with self.conn.execute(
+            f"SELECT * FROM key_records WHERE id IN ({placeholders}) ORDER BY id DESC",
+            record_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+            return [KeyRecord(**dict(r)) for r in rows]
 
     async def get_all_key_records(
         self,
@@ -1146,8 +1496,8 @@ class Database:
         params: list = []
         for kw in keywords:
             pattern = f"%{kw}%"
-            conditions.append("(title LIKE ? OR content_text LIKE ? OR tags LIKE ? OR content_json LIKE ?)")
-            params.extend([pattern, pattern, pattern, pattern])
+            conditions.append("(title LIKE ? OR content_text LIKE ? OR tags LIKE ? OR match_keywords LIKE ? OR content_json LIKE ?)")
+            params.extend([pattern, pattern, pattern, pattern, pattern])
         where = " OR ".join(conditions)
         sql = f"""SELECT * FROM key_records
                  WHERE ({where})"""
@@ -1161,6 +1511,36 @@ class Database:
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
             return [KeyRecord(**dict(r)) for r in rows]
+
+    async def get_key_records_without_vector(
+        self,
+        limit: int = 200,
+        include_archived: bool = True,
+    ) -> list[KeyRecord]:
+        sql = """SELECT * FROM key_records
+                 WHERE embedding_vector_id IS NULL"""
+        params: list = []
+        if not include_archived:
+            sql += " AND status != 'archived'"
+        sql += " ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [KeyRecord(**dict(r)) for r in rows]
+
+    async def mark_key_record_vectorized(self, record_id: int, vector_id: str):
+        await self.conn.execute(
+            "UPDATE key_records SET embedding_vector_id = ? WHERE id = ?",
+            (vector_id, record_id),
+        )
+        await self.conn.commit()
+
+    async def clear_key_record_vectorized(self, record_id: int):
+        await self.conn.execute(
+            "UPDATE key_records SET embedding_vector_id = NULL WHERE id = ?",
+            (record_id,),
+        )
+        await self.conn.commit()
 
     async def update_key_record(self, record_id: int, **fields):
         if not fields:
@@ -1796,6 +2176,124 @@ class Database:
         )
         await self.conn.commit()
 
+    # ── Disturbance Pulses ──
+
+    async def insert_disturbance_pulse(self, pulse: DisturbancePulse) -> int:
+        cursor = await self.conn.execute(
+            """INSERT INTO disturbance_pulses
+               (occur_at, reveal_at, status, channel_type, source_family, seed_kind, seed_ref_id,
+                blind_spot_reason, reveal_channel, title, factual_payload_json, impact_hint,
+                salience, novelty_score, cooldown_until, fingerprint, linked_snapshot_id,
+                linked_event_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                pulse.occur_at,
+                pulse.reveal_at,
+                pulse.status,
+                pulse.channel_type,
+                pulse.source_family,
+                pulse.seed_kind,
+                pulse.seed_ref_id,
+                pulse.blind_spot_reason,
+                pulse.reveal_channel,
+                pulse.title,
+                pulse.factual_payload_json,
+                pulse.impact_hint,
+                pulse.salience,
+                pulse.novelty_score,
+                pulse.cooldown_until,
+                pulse.fingerprint,
+                pulse.linked_snapshot_id,
+                pulse.linked_event_id,
+                pulse.created_at,
+                pulse.updated_at,
+            ),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    async def get_disturbance_pulse_by_id(self, pulse_id: int) -> DisturbancePulse | None:
+        async with self.conn.execute(
+            "SELECT * FROM disturbance_pulses WHERE id = ?",
+            (pulse_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return DisturbancePulse(**dict(row)) if row else None
+
+    async def list_disturbance_pulses(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[DisturbancePulse]:
+        sql = "SELECT * FROM disturbance_pulses WHERE 1=1"
+        params: list = []
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY reveal_at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [DisturbancePulse(**dict(r)) for r in rows]
+
+    async def get_recent_disturbance_pulses(
+        self,
+        *,
+        limit: int = 6,
+        statuses: list[str] | None = None,
+    ) -> list[DisturbancePulse]:
+        sql = "SELECT * FROM disturbance_pulses WHERE 1=1"
+        params: list = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        sql += " ORDER BY reveal_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [DisturbancePulse(**dict(r)) for r in rows]
+
+    async def update_disturbance_pulse(self, pulse_id: int, **fields) -> None:
+        if not fields:
+            return
+        allowed = {
+            "occur_at",
+            "reveal_at",
+            "status",
+            "channel_type",
+            "source_family",
+            "seed_kind",
+            "seed_ref_id",
+            "blind_spot_reason",
+            "reveal_channel",
+            "title",
+            "factual_payload_json",
+            "impact_hint",
+            "salience",
+            "novelty_score",
+            "cooldown_until",
+            "fingerprint",
+            "linked_snapshot_id",
+            "linked_event_id",
+            "created_at",
+            "updated_at",
+        }
+        payload = {k: v for k, v in fields.items() if k in allowed}
+        if not payload:
+            return
+        if "updated_at" not in payload:
+            payload["updated_at"] = format_utc_instant_z(datetime.utcnow())
+        sets = ", ".join(f"{key} = ?" for key in payload)
+        values = list(payload.values()) + [pulse_id]
+        await self.conn.execute(
+            f"UPDATE disturbance_pulses SET {sets} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
+
     # ── Conversation Time Claims ──
 
     async def insert_conversation_time_claim(self, claim: ConversationTimeClaim) -> int:
@@ -1866,6 +2364,253 @@ class Database:
             return [ConversationTimeClaim(**dict(r)) for r in rows]
 
     # ── NPC Entities ──
+
+    async def insert_relationship_state(self, state: RelationshipState) -> int:
+        cursor = await self.conn.execute(
+            """INSERT INTO relationship_states
+               (last_meaningful_contact_at, hours_since_meaningful_contact, days_since_meaningful_contact,
+                contact_recency_bucket, connection_need, pride_or_distance, valence, arousal, life_immersion,
+                relationship_feeling_summary, space_need_level, concern_level, proactive_topics,
+                plan_bias_hint, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                state.last_meaningful_contact_at,
+                state.hours_since_meaningful_contact,
+                state.days_since_meaningful_contact,
+                state.contact_recency_bucket,
+                state.connection_need,
+                state.pride_or_distance,
+                state.valence,
+                state.arousal,
+                state.life_immersion,
+                state.relationship_feeling_summary,
+                state.space_need_level,
+                state.concern_level,
+                state.proactive_topics,
+                state.plan_bias_hint,
+                state.created_at,
+                state.updated_at,
+            ),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    async def get_latest_relationship_state(self) -> RelationshipState | None:
+        async with self.conn.execute(
+            "SELECT * FROM relationship_states ORDER BY updated_at DESC, id DESC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+            return RelationshipState(**dict(row)) if row else None
+
+    async def update_relationship_state(self, state_id: int, **fields) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = format_utc_instant_z(datetime.utcnow())
+        set_clause = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [state_id]
+        await self.conn.execute(
+            f"UPDATE relationship_states SET {set_clause} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
+
+    async def insert_relationship_thought(self, thought: RelationshipThought) -> int:
+        cursor = await self.conn.execute(
+            """INSERT INTO relationship_thoughts
+               (thought_date, source_snapshot_id, source_env_id, topic_line, thought_type, content,
+                salience, dedupe_fingerprint, resolution_status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                thought.thought_date,
+                thought.source_snapshot_id,
+                thought.source_env_id,
+                thought.topic_line,
+                thought.thought_type,
+                thought.content,
+                thought.salience,
+                thought.dedupe_fingerprint,
+                thought.resolution_status,
+                thought.created_at,
+                thought.updated_at,
+            ),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    async def list_relationship_thoughts(
+        self,
+        *,
+        thought_date: str | None = None,
+        resolution_status: str | None = None,
+        limit: int = 20,
+    ) -> list[RelationshipThought]:
+        sql = "SELECT * FROM relationship_thoughts WHERE 1=1"
+        params: list = []
+        if thought_date:
+            sql += " AND thought_date = ?"
+            params.append(thought_date)
+        if resolution_status:
+            sql += " AND resolution_status = ?"
+            params.append(resolution_status)
+        sql += " ORDER BY salience DESC, updated_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [RelationshipThought(**dict(r)) for r in rows]
+
+    async def get_relationship_thought_by_fingerprint(
+        self,
+        *,
+        thought_date: str,
+        dedupe_fingerprint: str,
+        resolution_status: str | None = None,
+    ) -> RelationshipThought | None:
+        sql = """SELECT * FROM relationship_thoughts
+                 WHERE thought_date = ? AND dedupe_fingerprint = ?"""
+        params: list = [thought_date, dedupe_fingerprint]
+        if resolution_status:
+            sql += " AND resolution_status = ?"
+            params.append(resolution_status)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
+        async with self.conn.execute(sql, params) as cur:
+            row = await cur.fetchone()
+            return RelationshipThought(**dict(row)) if row else None
+
+    async def update_relationship_thought(self, thought_id: int, **fields) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = format_utc_instant_z(datetime.utcnow())
+        set_clause = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [thought_id]
+        await self.conn.execute(
+            f"UPDATE relationship_thoughts SET {set_clause} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
+
+    async def insert_slowline(self, line: SlowLine) -> int:
+        cursor = await self.conn.execute(
+            """INSERT INTO slowlines
+               (thread_key, theme, scope, source_family, memory_role, progress_status, tension_level, unresolved_level, preload_priority,
+                stage_summary, trajectory_summary, current_tension, recent_shift_summary, recent_movement_summary, last_meaningful_shift_at,
+                emotional_tension, affective_direction, open_questions, salience, last_touched_at, linked_key_record_ids, linked_event_ids,
+                status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                line.thread_key,
+                line.theme,
+                line.scope,
+                line.source_family,
+                line.memory_role,
+                line.progress_status,
+                line.tension_level,
+                line.unresolved_level,
+                line.preload_priority,
+                line.stage_summary,
+                line.trajectory_summary,
+                line.current_tension,
+                line.recent_shift_summary,
+                line.recent_movement_summary,
+                line.last_meaningful_shift_at,
+                line.emotional_tension,
+                line.affective_direction,
+                line.open_questions,
+                line.salience,
+                line.last_touched_at,
+                line.linked_key_record_ids,
+                line.linked_event_ids,
+                line.status,
+                line.created_at,
+                line.updated_at,
+            ),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    @staticmethod
+    def _normalize_slowline_row(payload: dict) -> dict:
+        source_family = str(payload.get("source_family") or "").strip()
+        payload["source_family"] = {
+            "conversation": "relationship",
+            "autonomous": "daily_life",
+            "mixed": "daily_life",
+            "": "daily_life",
+        }.get(source_family, source_family)
+        scope = str(payload.get("scope") or "").strip()
+        if scope not in {"user_side", "character_side", "shared"}:
+            payload["scope"] = "shared"
+        progress_status = str(payload.get("progress_status") or "").strip()
+        if progress_status not in {"open", "advancing", "paused", "ready_to_close", "completed", "dropped"}:
+            payload["progress_status"] = "open"
+        memory_role = str(payload.get("memory_role") or "").strip()
+        if memory_role not in {"bridge_core", "active_thread_detail", "trigger_only", "archive_reference"}:
+            payload["memory_role"] = "active_thread_detail"
+        tension_level = str(payload.get("tension_level") or "").strip()
+        if tension_level not in {"low", "medium", "high"}:
+            payload["tension_level"] = "medium"
+        unresolved_level = str(payload.get("unresolved_level") or "").strip()
+        if unresolved_level not in {"low", "medium", "high"}:
+            payload["unresolved_level"] = "medium"
+        try:
+            payload["preload_priority"] = float(payload.get("preload_priority") or 0.5)
+        except Exception:
+            payload["preload_priority"] = 0.5
+        emotional_tension = str(payload.get("emotional_tension") or "").strip()
+        if emotional_tension not in {"stable", "strained", "brittle", "tender", "suspended", "unresolved"}:
+            payload["emotional_tension"] = "stable"
+        affective_direction = str(payload.get("affective_direction") or "").strip()
+        if affective_direction not in {"approach", "avoidance", "ambivalence", "endurance", "repair"}:
+            payload["affective_direction"] = "endurance"
+        if not str(payload.get("recent_shift_summary") or "").strip():
+            payload["recent_shift_summary"] = str(payload.get("recent_movement_summary") or "").strip()
+        return payload
+
+    async def get_slowline_by_thread_key(self, thread_key: str) -> SlowLine | None:
+        async with self.conn.execute(
+            """SELECT * FROM slowlines
+               WHERE thread_key = ? AND status = 'active'
+               ORDER BY updated_at DESC, id DESC LIMIT 1""",
+            (thread_key,),
+        ) as cur:
+            row = await cur.fetchone()
+            return SlowLine(**self._normalize_slowline_row(dict(row))) if row else None
+
+    async def get_slowline_by_theme(self, theme: str) -> SlowLine | None:
+        async with self.conn.execute(
+            """SELECT * FROM slowlines
+               WHERE theme = ? AND status = 'active'
+               ORDER BY updated_at DESC, id DESC LIMIT 1""",
+            (theme,),
+        ) as cur:
+            row = await cur.fetchone()
+            return SlowLine(**self._normalize_slowline_row(dict(row))) if row else None
+
+    async def list_slowlines(
+        self,
+        *,
+        status: str = "active",
+        limit: int = 12,
+    ) -> list[SlowLine]:
+        async with self.conn.execute(
+            """SELECT * FROM slowlines
+               WHERE status = ?
+               ORDER BY salience DESC, updated_at DESC, id DESC LIMIT ?""",
+            (status, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [SlowLine(**self._normalize_slowline_row(dict(r))) for r in rows]
+
+    async def update_slowline(self, slowline_id: int, **fields) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = format_utc_instant_z(datetime.utcnow())
+        set_clause = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [slowline_id]
+        await self.conn.execute(
+            f"UPDATE slowlines SET {set_clause} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
 
     async def insert_npc_entity(self, npc: NPCEntity) -> int:
         cursor = await self.conn.execute(

@@ -19,6 +19,10 @@ KEY_RECORD_TYPES = (
     "commitment_agreement",
     "emotional_anchor",
     "life_pattern",
+    "medical_tracking",
+    "appointment",
+    "project",
+    "academic",
 )
 
 LEGACY_KEY_RECORD_TYPE_MAP = {
@@ -90,6 +94,10 @@ class KeyRecord(BaseModel):
         "commitment_agreement",
         "emotional_anchor",
         "life_pattern",
+        "medical_tracking",
+        "appointment",
+        "project",
+        "academic",
         "important_date",
         "important_item",
         "medical_advice",
@@ -103,6 +111,7 @@ class KeyRecord(BaseModel):
     end_date: str | None = None
     status: Literal["active", "archived"] = "active"
     source: Literal["manual", "conversation", "generated"] = "manual"
+    life_scope: Literal["user_life", "character_life", "shared_life"] = "user_life"
     linked_event_id: int | None = None
     embedding_vector_id: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -243,17 +252,49 @@ class RelationshipState(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
+class RelationshipThought(BaseModel):
+    id: int | None = None
+    thought_date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
+    source_snapshot_id: int | None = None
+    source_env_id: str | None = None
+    topic_line: str = ""
+    thought_type: Literal[
+        "say",
+        "ask",
+        "do_if_present",
+        "wait",
+        "doubt",
+        "reconsider",
+        "timing_sensitive",
+        "mood_dependent",
+    ] = "reconsider"
+    content: str = ""
+    salience: float = 0.5
+    dedupe_fingerprint: str = ""
+    resolution_status: Literal["open", "cooled", "superseded"] = "open"
+    created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+    updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
+
+
 class SlowLine(BaseModel):
     id: int | None = None
     thread_key: str = ""
     theme: str = ""
     scope: Literal["user_side", "character_side", "shared"] = "shared"
     source_family: Literal["health", "study", "work", "relationship", "logistics", "daily_life"] = "daily_life"
+    memory_role: Literal["bridge_core", "active_thread_detail", "trigger_only", "archive_reference"] = "active_thread_detail"
     progress_status: Literal["open", "advancing", "paused", "ready_to_close", "completed", "dropped"] = "open"
+    tension_level: Literal["low", "medium", "high"] = "medium"
+    unresolved_level: Literal["low", "medium", "high"] = "medium"
+    preload_priority: float = 0.5
     stage_summary: str = ""
     trajectory_summary: str = ""
     current_tension: str = ""
+    recent_shift_summary: str = ""
     recent_movement_summary: str = ""
+    last_meaningful_shift_at: str | None = None
+    emotional_tension: Literal["stable", "strained", "brittle", "tender", "suspended", "unresolved"] = "stable"
+    affective_direction: Literal["approach", "avoidance", "ambivalence", "endurance", "repair"] = "endurance"
     open_questions: str = "[]"
     salience: float = 0.5
     last_touched_at: str | None = None
@@ -345,6 +386,10 @@ class CreateKeyRecordRequest(BaseModel):
         "commitment_agreement",
         "emotional_anchor",
         "life_pattern",
+        "medical_tracking",
+        "appointment",
+        "project",
+        "academic",
     ] | None = None
     title: str
     content_text: str
@@ -355,6 +400,7 @@ class CreateKeyRecordRequest(BaseModel):
     end_date: str | None = None
     status: Literal["active", "archived"] = "active"
     source: Literal["manual", "conversation", "generated"] = "manual"
+    life_scope: Literal["user_life", "character_life", "shared_life"] = "user_life"
     linked_event_id: int | None = None
 
 
@@ -370,6 +416,10 @@ class UpdateKeyRecordRequest(BaseModel):
         "commitment_agreement",
         "emotional_anchor",
         "life_pattern",
+        "medical_tracking",
+        "appointment",
+        "project",
+        "academic",
     ] | None = None
     title: str | None = None
     content_text: str | None = None
@@ -380,6 +430,7 @@ class UpdateKeyRecordRequest(BaseModel):
     end_date: str | None = None
     status: Literal["active", "archived"] | None = None
     source: Literal["manual", "conversation", "generated"] | None = None
+    life_scope: Literal["user_life", "character_life", "shared_life"] | None = None
     linked_event_id: int | None = None
 
 
@@ -403,6 +454,12 @@ class WorldBookAutoMetaRequest(BaseModel):
     item_ids: list[int] = Field(default_factory=list)
     overwrite_title: bool = False
     overwrite_keywords: bool = False
+
+
+class WorldBookSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    include_inactive: bool = False
 
 
 class KeyRecordBatchVectorizeRequest(BaseModel):
@@ -519,12 +576,17 @@ class KeyRecordSearchRequest(BaseModel):
         "commitment_agreement",
         "emotional_anchor",
         "life_pattern",
+        "medical_tracking",
+        "appointment",
+        "project",
+        "academic",
     ] | None = None
     top_k: int = 5
     include_archived: bool = False
+    life_scope: Literal["user_life", "character_life", "shared_life"] | None = None
     include_world_books: bool = Field(
-        default=True,
-        description="为 True 时合并检索启用中的世界书（关键词 + 已向量化时的语义向量）",
+        default=False,
+        description="兼容旧前端字段；key_records 搜索不再混入 world_books，请改用 /world-books/search。",
     )
 
 
@@ -540,6 +602,10 @@ class UpsertKeyRecordToolRequest(BaseModel):
         "commitment_agreement",
         "emotional_anchor",
         "life_pattern",
+        "medical_tracking",
+        "appointment",
+        "project",
+        "academic",
     ] | None = None
     title: str
     content_text: str
@@ -550,6 +616,7 @@ class UpsertKeyRecordToolRequest(BaseModel):
     end_date: str | None = None
     status: Literal["active", "archived"] = "active"
     source: Literal["manual", "conversation", "generated"] = "conversation"
+    life_scope: Literal["user_life", "character_life", "shared_life"] = "user_life"
     linked_event_id: int | None = None
     update_if_exists: bool = True
 

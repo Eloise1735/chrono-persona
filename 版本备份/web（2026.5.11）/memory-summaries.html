@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
+  <title>凯尔希状态机 - 日周月年摘要</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260326">
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/memory-summaries" class="active">摘要调试台</a>
+    <a href="/vectors">向量管理</a>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h2>摘要调试台</h2>
+      <div class="list-meta">日摘要同时读取关系线与角色生活线；周摘要优先汇总日摘要；月摘要优先汇总周摘要；年摘要继续汇总月摘要。</div>
+    </div>
+
+    <div class="grid-3" id="memory-summary-columns"></div>
+  </div>
+
+  <div class="status-bar" id="status-bar">就绪</div>
+  <script src="/static/app.js?v=20260331d"></script>
+  <script src="/static/memory-summaries.js?v=20260509b"></script>
+  <script>initMemorySummariesPage();</script>
+</body>
+</html>

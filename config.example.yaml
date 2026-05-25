@@ -23,6 +23,17 @@ memory_store:
   type: "vector"
   max_snapshots: 7
 
+ob:
+  enabled: true
+  buckets_dir: "./data/ob_buckets"
+  decay:
+    lambda: 0.05
+    threshold: 0.3
+    check_interval_hours: 24
+    emotion_weights:
+      base: 1.0
+      arousal_boost: 0.8
+
 wechat:
   enabled: true
   # openclaw_state_dir: "C:/Users/yourname/.openclaw"
