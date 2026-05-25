@@ -41,16 +41,13 @@ a:hover { color: var(--accent-hover); }
 nav {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  padding: 6px 18px 0;
+  padding: 0 24px;
   display: flex;
   align-items: center;
-  align-content: center;
-  flex-wrap: wrap;
-  gap: 0 2px;
+  gap: 2px;
   position: sticky;
   top: 0;
   z-index: 40;
-  overflow-x: visible;
 }
 nav .logo {
   font-size: 15px;
@@ -65,79 +62,15 @@ nav .logo {
 }
 nav a {
   color: var(--text-dim);
-  font-size: 12px;
-  line-height: 1.2;
-  padding: 10px 9px 11px;
+  font-size: 13px;
+  padding: 14px 12px;
   border-radius: 0;
   white-space: nowrap;
-  flex: 0 0 auto;
   border-bottom: 2px solid transparent;
   transition: color 0.15s, border-color 0.15s;
 }
 nav a:hover { color: var(--text); background: none; }
 nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
-
-@media (min-width: 1100px) {
-  body {
-    padding-left: 220px;
-  }
-  nav {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 220px;
-    height: 100vh;
-    padding: 14px 10px;
-    border-bottom: 0;
-    border-right: 1px solid var(--border);
-    flex-direction: column;
-    flex-wrap: nowrap;
-    align-items: stretch;
-    align-content: stretch;
-    gap: 2px;
-    overflow-y: auto;
-    overflow-x: hidden;
-  }
-  nav .logo {
-    padding: 8px 10px 14px;
-    margin: 0 0 8px;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-    white-space: normal;
-  }
-  nav a {
-    border-bottom: 0;
-    border-left: 2px solid transparent;
-    border-radius: var(--radius-sm);
-    padding: 10px 12px;
-    font-size: 13px;
-  }
-  nav a:hover {
-    background: var(--surface2);
-  }
-  nav a.active {
-    border-left-color: var(--accent);
-    background: var(--surface2);
-  }
-}
-
-@media (max-width: 760px) {
-  body {
-    padding-left: 0;
-  }
-  nav {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    overflow-y: hidden;
-    padding: 4px 12px 0;
-    scrollbar-width: thin;
-  }
-  nav a {
-    font-size: 12px;
-    padding: 10px 8px 11px;
-  }
-}
 
 /* ── Page header ── */
 .page-header {

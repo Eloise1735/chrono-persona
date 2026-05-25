@@ -38,6 +38,7 @@ class EvolutionEngine:
     EVOLUTION_SUMMARY_MAX_TOKENS = 9000
     EVENT_SCORING_TIMEOUT_SEC = 600.0
     EVOLUTION_SUMMARY_TIMEOUT_SEC = 600.0
+    EVENT_ANCHOR_EVOLUTION_DISABLED = True
 
     def __init__(
         self,
@@ -51,7 +52,45 @@ class EvolutionEngine:
         self.snapshot_llm = snapshot_llm or llm
         self.prompt_manager = prompt_manager
 
+    async def _disabled_status(self) -> dict:
+        last_time = await self._get_setting(KEY_LAST_EVOLUTION_TIME, "")
+        return {
+            "should_evolve": False,
+            "event_count": 0,
+            "threshold": 0,
+            "last_time": last_time,
+            "disabled": True,
+            "reason": "event_anchor_evolution_disabled",
+            "message": "event_anchors 驱动的人格演化已停用；后续演化应改由 OB bucket / key_record 驱动。",
+        }
+
+    async def _disabled_preview(self, *, store_pending: bool = False) -> dict:
+        status = await self._disabled_status()
+        current_character, current_relationship, current_life_status = (
+            await self._get_current_l2_layers()
+        )
+        result = {
+            **status,
+            "scored_events": [],
+            "evolution_candidates": [],
+            "evolution_prompt_event_count": 0,
+            "evolution_prompt_event_ids": [],
+            "evolution_filter_meta": {"disabled": True, "reason": status["reason"]},
+            "current_character_personality": current_character,
+            "current_relationship_dynamics": current_relationship,
+            "current_life_status": current_life_status,
+            "new_character_personality": current_character,
+            "new_relationship_dynamics": current_relationship,
+            "new_life_status": current_life_status,
+            "change_summary": status["message"],
+        }
+        if store_pending:
+            await self.clear_pending_preview()
+        return result
+
     async def check_status(self) -> dict:
+        if self.EVENT_ANCHOR_EVOLUTION_DISABLED:
+            return await self._disabled_status()
         last_time = await self._get_setting(KEY_LAST_EVOLUTION_TIME, "")
         threshold = await self._get_int_setting(
             KEY_EVOLUTION_EVENT_THRESHOLD,
@@ -73,6 +112,8 @@ class EvolutionEngine:
         store_pending: bool = False,
         source: str = "manual",
     ) -> dict:
+        if self.EVENT_ANCHOR_EVOLUTION_DISABLED:
+            return await self._disabled_preview(store_pending=store_pending)
         status = await self.check_status()
         since = status["last_time"] or "1970-01-01T00:00:00"
         events = await self.db.get_events_since(since, limit=200, include_archived=False)
@@ -161,6 +202,8 @@ class EvolutionEngine:
         store_pending: bool = False,
         source: str = "manual_regenerate",
     ) -> dict:
+        if self.EVENT_ANCHOR_EVOLUTION_DISABLED:
+            return await self._disabled_preview(store_pending=store_pending)
         status = await self.check_status()
         events = await self.db.get_events_for_archive_recalc()
         scored_events = [
@@ -250,6 +293,25 @@ class EvolutionEngine:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict:
+        if self.EVENT_ANCHOR_EVOLUTION_DISABLED:
+            return {
+                "disabled": True,
+                "reason": "event_anchor_evolution_disabled",
+                "message": "event_anchors 评分/归档维护已停用；事件历史保留为只读回溯材料。",
+                "threshold": None,
+                "depth_threshold": None,
+                "scanned_count": 0,
+                "changed_count": 0,
+                "archived_count": 0,
+                "unarchived_count": 0,
+                "skipped_unscored_count": 0,
+                "scope": {
+                    "start_id": start_id,
+                    "end_id": end_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            }
         archive_threshold = await self._get_float_setting(
             KEY_ARCHIVE_IMPORTANCE_THRESHOLD,
             3.0,
@@ -315,6 +377,32 @@ class EvolutionEngine:
         *,
         scored_only: bool = True,
     ) -> dict:
+        if self.EVENT_ANCHOR_EVOLUTION_DISABLED:
+            return {
+                "disabled": True,
+                "reason": "event_anchor_evolution_disabled",
+                "message": "event_anchors 事件评分已停用；请改用 OB/key_record 路径维护长期变化。",
+                "scanned_count": 0,
+                "rescored_count": 0,
+                "skipped_unscored_count": 0,
+                "scored_only": scored_only,
+                "top_events": [],
+                "selected_count": 0,
+                "selected_ids": [],
+                "filter_meta": {"disabled": True},
+                "archive_recalc": {
+                    "disabled": True,
+                    "changed_count": 0,
+                    "archived_count": 0,
+                    "unarchived_count": 0,
+                },
+                "scope": {
+                    "start_id": start_id,
+                    "end_id": end_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            }
         events = await self.db.get_events_for_archive_recalc(
             start_id=start_id,
             end_id=end_id,

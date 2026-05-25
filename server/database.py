@@ -17,6 +17,7 @@ from server.models import (
     LifeFlowTrace,
     NPCEntity,
     PlanItem,
+    RelationshipThought,
     RelationshipState,
     SlowLine,
     StateSnapshot,
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS key_records (
     end_date TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     source TEXT NOT NULL DEFAULT 'manual',
+    life_scope TEXT NOT NULL DEFAULT 'user_life',
     linked_event_id INTEGER,
     embedding_vector_id TEXT,
     created_at TEXT NOT NULL,
@@ -220,17 +222,40 @@ CREATE TABLE IF NOT EXISTS relationship_states (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS relationship_thoughts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thought_date TEXT NOT NULL,
+    source_snapshot_id INTEGER,
+    source_env_id TEXT,
+    topic_line TEXT NOT NULL DEFAULT '',
+    thought_type TEXT NOT NULL DEFAULT 'reconsider',
+    content TEXT NOT NULL DEFAULT '',
+    salience REAL NOT NULL DEFAULT 0.5,
+    dedupe_fingerprint TEXT NOT NULL DEFAULT '',
+    resolution_status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS slowlines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_key TEXT NOT NULL DEFAULT '',
     theme TEXT NOT NULL DEFAULT '',
     scope TEXT NOT NULL DEFAULT 'shared',
     source_family TEXT NOT NULL DEFAULT 'autonomous',
+    memory_role TEXT NOT NULL DEFAULT 'active_thread_detail',
     progress_status TEXT NOT NULL DEFAULT 'open',
+    tension_level TEXT NOT NULL DEFAULT 'medium',
+    unresolved_level TEXT NOT NULL DEFAULT 'medium',
+    preload_priority REAL NOT NULL DEFAULT 0.5,
     stage_summary TEXT NOT NULL DEFAULT '',
     trajectory_summary TEXT NOT NULL DEFAULT '',
     current_tension TEXT NOT NULL DEFAULT '',
+    recent_shift_summary TEXT NOT NULL DEFAULT '',
     recent_movement_summary TEXT NOT NULL DEFAULT '',
+    last_meaningful_shift_at TEXT,
+    emotional_tension TEXT NOT NULL DEFAULT 'stable',
+    affective_direction TEXT NOT NULL DEFAULT 'endurance',
     open_questions TEXT NOT NULL DEFAULT '[]',
     salience REAL NOT NULL DEFAULT 0.5,
     last_touched_at TEXT,
@@ -303,6 +328,7 @@ class Database:
         await self._ensure_column("event_anchors", "meta_json", "TEXT")
         await self._ensure_column("key_records", "match_keywords", "TEXT NOT NULL DEFAULT '[]'")
         await self._ensure_column("key_records", "embedding_vector_id", "TEXT")
+        await self._ensure_column("key_records", "life_scope", "TEXT NOT NULL DEFAULT 'user_life'")
         await self._ensure_column("world_books", "embedding_vector_id", "TEXT")
         await self._ensure_column("state_snapshots", "inserted_at", "TEXT")
         await self._ensure_column("plan_items", "source_kind", "TEXT NOT NULL DEFAULT 'generated'")
@@ -310,8 +336,16 @@ class Database:
         await self._ensure_column("relationship_states", "hours_since_meaningful_contact", "REAL NOT NULL DEFAULT 0")
         await self._ensure_column("slowlines", "thread_key", "TEXT NOT NULL DEFAULT ''")
         await self._ensure_column("slowlines", "scope", "TEXT NOT NULL DEFAULT 'shared'")
+        await self._ensure_column("slowlines", "memory_role", "TEXT NOT NULL DEFAULT 'active_thread_detail'")
         await self._ensure_column("slowlines", "progress_status", "TEXT NOT NULL DEFAULT 'open'")
+        await self._ensure_column("slowlines", "tension_level", "TEXT NOT NULL DEFAULT 'medium'")
+        await self._ensure_column("slowlines", "unresolved_level", "TEXT NOT NULL DEFAULT 'medium'")
+        await self._ensure_column("slowlines", "preload_priority", "REAL NOT NULL DEFAULT 0.5")
         await self._ensure_column("slowlines", "trajectory_summary", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("slowlines", "recent_shift_summary", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("slowlines", "last_meaningful_shift_at", "TEXT")
+        await self._ensure_column("slowlines", "emotional_tension", "TEXT NOT NULL DEFAULT 'stable'")
+        await self._ensure_column("slowlines", "affective_direction", "TEXT NOT NULL DEFAULT 'endurance'")
         await self.conn.execute(
             "UPDATE slowlines SET source_family = 'relationship' WHERE source_family = 'conversation'"
         )
@@ -339,6 +373,7 @@ class Database:
                 end_date TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 source TEXT NOT NULL DEFAULT 'manual',
+                life_scope TEXT NOT NULL DEFAULT 'user_life',
                 linked_event_id INTEGER,
                 embedding_vector_id TEXT,
                 created_at TEXT NOT NULL,
@@ -493,17 +528,41 @@ class Database:
             )"""
         )
         await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS relationship_thoughts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thought_date TEXT NOT NULL,
+                source_snapshot_id INTEGER,
+                source_env_id TEXT,
+                topic_line TEXT NOT NULL DEFAULT '',
+                thought_type TEXT NOT NULL DEFAULT 'reconsider',
+                content TEXT NOT NULL DEFAULT '',
+                salience REAL NOT NULL DEFAULT 0.5,
+                dedupe_fingerprint TEXT NOT NULL DEFAULT '',
+                resolution_status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute(
             """CREATE TABLE IF NOT EXISTS slowlines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_key TEXT NOT NULL DEFAULT '',
                 theme TEXT NOT NULL DEFAULT '',
                 scope TEXT NOT NULL DEFAULT 'shared',
                 source_family TEXT NOT NULL DEFAULT 'autonomous',
+                memory_role TEXT NOT NULL DEFAULT 'active_thread_detail',
                 progress_status TEXT NOT NULL DEFAULT 'open',
+                tension_level TEXT NOT NULL DEFAULT 'medium',
+                unresolved_level TEXT NOT NULL DEFAULT 'medium',
+                preload_priority REAL NOT NULL DEFAULT 0.5,
                 stage_summary TEXT NOT NULL DEFAULT '',
                 trajectory_summary TEXT NOT NULL DEFAULT '',
                 current_tension TEXT NOT NULL DEFAULT '',
+                recent_shift_summary TEXT NOT NULL DEFAULT '',
                 recent_movement_summary TEXT NOT NULL DEFAULT '',
+                last_meaningful_shift_at TEXT,
+                emotional_tension TEXT NOT NULL DEFAULT 'stable',
+                affective_direction TEXT NOT NULL DEFAULT 'endurance',
                 open_questions TEXT NOT NULL DEFAULT '[]',
                 salience REAL NOT NULL DEFAULT 0.5,
                 last_touched_at TEXT,
@@ -1307,8 +1366,8 @@ class Database:
     async def insert_key_record(self, record: KeyRecord) -> int:
         cursor = await self.conn.execute(
             """INSERT INTO key_records
-               (type, title, content_text, content_json, tags, match_keywords, start_date, end_date, status, source, linked_event_id, embedding_vector_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (type, title, content_text, content_json, tags, match_keywords, start_date, end_date, status, source, life_scope, linked_event_id, embedding_vector_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record.type,
                 record.title,
@@ -1320,6 +1379,7 @@ class Database:
                 record.end_date,
                 record.status,
                 record.source,
+                record.life_scope,
                 record.linked_event_id,
                 record.embedding_vector_id,
                 record.created_at,
@@ -1341,12 +1401,18 @@ class Database:
         self,
         record_type: str,
         title: str,
+        life_scope: str | None = None,
     ) -> KeyRecord | None:
+        sql = """SELECT * FROM key_records
+               WHERE type = ? AND title = ?"""
+        params: list = [record_type, title]
+        if life_scope:
+            sql += " AND life_scope = ?"
+            params.append(life_scope)
+        sql += " ORDER BY id DESC LIMIT 1"
         async with self.conn.execute(
-            """SELECT * FROM key_records
-               WHERE type = ? AND title = ?
-               ORDER BY id DESC LIMIT 1""",
-            (record_type, title),
+            sql,
+            params,
         ) as cur:
             row = await cur.fetchone()
             return KeyRecord(**dict(row)) if row else None
@@ -1368,6 +1434,7 @@ class Database:
         limit: int = 50,
         record_type: str | None = None,
         status: str | None = None,
+        life_scope: str | None = None,
         include_archived: bool = False,
     ) -> list[KeyRecord]:
         sql = "SELECT * FROM key_records WHERE 1=1"
@@ -1380,6 +1447,9 @@ class Database:
             params.append(status)
         elif not include_archived:
             sql += " AND status != 'archived'"
+        if life_scope:
+            sql += " AND life_scope = ?"
+            params.append(life_scope)
         sql += " ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         async with self.conn.execute(sql, params) as cur:
@@ -1390,11 +1460,15 @@ class Database:
         self,
         limit: int = 5,
         include_archived: bool = False,
+        life_scope: str | None = None,
     ) -> list[KeyRecord]:
         sql = "SELECT * FROM key_records WHERE 1=1"
         params: list = []
         if not include_archived:
             sql += " AND status != 'archived'"
+        if life_scope:
+            sql += " AND life_scope = ?"
+            params.append(life_scope)
         sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
         params.append(limit)
         async with self.conn.execute(sql, params) as cur:
@@ -1408,6 +1482,7 @@ class Database:
         limit: int = 20,
         include_archived: bool = False,
         sources: list[str] | None = None,
+        life_scope: str | None = None,
     ) -> list[KeyRecord]:
         sql = "SELECT * FROM key_records WHERE updated_at >= ?"
         params: list = [since_timestamp]
@@ -1417,6 +1492,9 @@ class Database:
             placeholders = ", ".join("?" for _ in sources)
             sql += f" AND source IN ({placeholders})"
             params.extend(sources)
+        if life_scope:
+            sql += " AND life_scope = ?"
+            params.append(life_scope)
         sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
         params.append(limit)
         async with self.conn.execute(sql, params) as cur:
@@ -1428,6 +1506,7 @@ class Database:
         query: str,
         top_k: int = 10,
         record_type: str | None = None,
+        life_scope: str | None = None,
         include_archived: bool = False,
     ) -> list[KeyRecord]:
         raw_query = (query or "").strip()
@@ -1448,6 +1527,9 @@ class Database:
         if record_type:
             sql += " AND type = ?"
             params.append(record_type)
+        if life_scope:
+            sql += " AND life_scope = ?"
+            params.append(life_scope)
         if not include_archived:
             sql += " AND status != 'archived'"
         sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
@@ -2358,23 +2440,106 @@ class Database:
         )
         await self.conn.commit()
 
+    async def insert_relationship_thought(self, thought: RelationshipThought) -> int:
+        cursor = await self.conn.execute(
+            """INSERT INTO relationship_thoughts
+               (thought_date, source_snapshot_id, source_env_id, topic_line, thought_type, content,
+                salience, dedupe_fingerprint, resolution_status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                thought.thought_date,
+                thought.source_snapshot_id,
+                thought.source_env_id,
+                thought.topic_line,
+                thought.thought_type,
+                thought.content,
+                thought.salience,
+                thought.dedupe_fingerprint,
+                thought.resolution_status,
+                thought.created_at,
+                thought.updated_at,
+            ),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    async def list_relationship_thoughts(
+        self,
+        *,
+        thought_date: str | None = None,
+        resolution_status: str | None = None,
+        limit: int = 20,
+    ) -> list[RelationshipThought]:
+        sql = "SELECT * FROM relationship_thoughts WHERE 1=1"
+        params: list = []
+        if thought_date:
+            sql += " AND thought_date = ?"
+            params.append(thought_date)
+        if resolution_status:
+            sql += " AND resolution_status = ?"
+            params.append(resolution_status)
+        sql += " ORDER BY salience DESC, updated_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [RelationshipThought(**dict(r)) for r in rows]
+
+    async def get_relationship_thought_by_fingerprint(
+        self,
+        *,
+        thought_date: str,
+        dedupe_fingerprint: str,
+        resolution_status: str | None = None,
+    ) -> RelationshipThought | None:
+        sql = """SELECT * FROM relationship_thoughts
+                 WHERE thought_date = ? AND dedupe_fingerprint = ?"""
+        params: list = [thought_date, dedupe_fingerprint]
+        if resolution_status:
+            sql += " AND resolution_status = ?"
+            params.append(resolution_status)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
+        async with self.conn.execute(sql, params) as cur:
+            row = await cur.fetchone()
+            return RelationshipThought(**dict(row)) if row else None
+
+    async def update_relationship_thought(self, thought_id: int, **fields) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = format_utc_instant_z(datetime.utcnow())
+        set_clause = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [thought_id]
+        await self.conn.execute(
+            f"UPDATE relationship_thoughts SET {set_clause} WHERE id = ?",
+            values,
+        )
+        await self.conn.commit()
+
     async def insert_slowline(self, line: SlowLine) -> int:
         cursor = await self.conn.execute(
             """INSERT INTO slowlines
-               (thread_key, theme, scope, source_family, progress_status, stage_summary, trajectory_summary, current_tension, recent_movement_summary,
-                open_questions, salience, last_touched_at, linked_key_record_ids, linked_event_ids,
+               (thread_key, theme, scope, source_family, memory_role, progress_status, tension_level, unresolved_level, preload_priority,
+                stage_summary, trajectory_summary, current_tension, recent_shift_summary, recent_movement_summary, last_meaningful_shift_at,
+                emotional_tension, affective_direction, open_questions, salience, last_touched_at, linked_key_record_ids, linked_event_ids,
                 status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 line.thread_key,
                 line.theme,
                 line.scope,
                 line.source_family,
+                line.memory_role,
                 line.progress_status,
+                line.tension_level,
+                line.unresolved_level,
+                line.preload_priority,
                 line.stage_summary,
                 line.trajectory_summary,
                 line.current_tension,
+                line.recent_shift_summary,
                 line.recent_movement_summary,
+                line.last_meaningful_shift_at,
+                line.emotional_tension,
+                line.affective_direction,
                 line.open_questions,
                 line.salience,
                 line.last_touched_at,
@@ -2403,6 +2568,27 @@ class Database:
         progress_status = str(payload.get("progress_status") or "").strip()
         if progress_status not in {"open", "advancing", "paused", "ready_to_close", "completed", "dropped"}:
             payload["progress_status"] = "open"
+        memory_role = str(payload.get("memory_role") or "").strip()
+        if memory_role not in {"bridge_core", "active_thread_detail", "trigger_only", "archive_reference"}:
+            payload["memory_role"] = "active_thread_detail"
+        tension_level = str(payload.get("tension_level") or "").strip()
+        if tension_level not in {"low", "medium", "high"}:
+            payload["tension_level"] = "medium"
+        unresolved_level = str(payload.get("unresolved_level") or "").strip()
+        if unresolved_level not in {"low", "medium", "high"}:
+            payload["unresolved_level"] = "medium"
+        try:
+            payload["preload_priority"] = float(payload.get("preload_priority") or 0.5)
+        except Exception:
+            payload["preload_priority"] = 0.5
+        emotional_tension = str(payload.get("emotional_tension") or "").strip()
+        if emotional_tension not in {"stable", "strained", "brittle", "tender", "suspended", "unresolved"}:
+            payload["emotional_tension"] = "stable"
+        affective_direction = str(payload.get("affective_direction") or "").strip()
+        if affective_direction not in {"approach", "avoidance", "ambivalence", "endurance", "repair"}:
+            payload["affective_direction"] = "endurance"
+        if not str(payload.get("recent_shift_summary") or "").strip():
+            payload["recent_shift_summary"] = str(payload.get("recent_movement_summary") or "").strip()
         return payload
 
     async def get_slowline_by_thread_key(self, thread_key: str) -> SlowLine | None:

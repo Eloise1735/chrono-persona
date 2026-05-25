@@ -6,7 +6,7 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
   <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
   <title>凯尔希状态机 - 关键记录</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260425">
+  <link rel="stylesheet" href="/static/style.css?v=20260512-nav">
 </head>
 <body>
   <nav>
@@ -16,9 +16,13 @@
     <a href="/snapshots-history">状态历史</a>
     <a href="/events-history">事件历史</a>
     <a href="/key-records" class="active">关键记录</a>
+    <a href="/world-books">&#19990;&#30028;&#20070;</a>
+    <a href="/schedule">&#26085;&#31243;&#34920;</a>
+    <a href="/npcs">NPC &#31649;&#29702;</a>
     <a href="/settings">设定管理</a>
     <a href="/environment-manage">环境管理</a>
     <a href="/evolution">人格演化</a>
+    <a href="/ob">OB &#35760;&#24518;</a>
     <a href="/vectors">向量管理</a>
   </nav>
 
@@ -38,14 +42,22 @@
         <option value="emotional_anchor">情感锚点</option>
         <option value="life_pattern">生活模式</option>
       </select>
+      <select id="key-record-life-scope-filter" style="max-width:150px;" onchange="loadKeyRecords()">
+        <option value="">全部生活线</option>
+        <option value="user_life">用户侧</option>
+        <option value="character_life">角色侧</option>
+        <option value="shared_life">共享线</option>
+      </select>
       <button class="btn btn-primary" onclick="searchKeyRecords()">搜索</button>
       <button class="btn" onclick="openAddKeyRecordModal()">添加记录</button>
       <button class="btn" onclick="batchVectorizeKeyRecords()">批量向量化</button>
       <button class="btn" onclick="openKeyRecordRelabelModal()">迁移/重标</button>
-      <label class="checkbox-label">
-        <input type="checkbox" id="key-record-include-world-books" checked onchange="loadKeyRecords()">
-        检索含世界书
-      </label>
+      <button class="btn" onclick="document.getElementById('key-record-json-import-input')?.click()">&#25209;&#37327;&#23548;&#20837; JSON</button>
+      <input type="file" id="key-record-json-import-input" accept=".json,application/json" style="display:none" aria-hidden="true" onchange="importKeyRecordsJson(this)">
+      <button class="btn" onclick="toggleSelectAllVisibleKeyRecords()">&#20840;&#36873;/&#21462;&#28040;&#20840;&#36873;</button>
+      <button class="btn" onclick="clearKeyRecordSelection()">&#28165;&#31354;&#36873;&#25321;</button>
+      <button class="btn btn-danger" onclick="batchDeleteKeyRecords()">&#21024;&#38500;&#36873;&#20013;</button>
+      <span class="list-meta" id="key-record-bulk-status">&#24050;&#36873;&#25321; 0 &#26465;</span>
       <label class="checkbox-label">
         <input type="checkbox" id="key-record-include-archived" onchange="loadKeyRecords()">
         显示归档
@@ -63,7 +75,7 @@
   </div>
 
   <div class="status-bar" id="status-bar">就绪</div>
-  <script src="/static/app.js?v=20260429"></script>
+  <script src="/static/app.js?v=20260513-key-record-import"></script>
   <script>initKeyRecordsPage();</script>
 </body>
 </html>

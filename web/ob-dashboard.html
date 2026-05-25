@@ -1,0 +1,1172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OB 记忆管理</title>
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="apple-touch-icon" href="/static/favicon.jpg?v=950ceae3">
+  <link rel="stylesheet" href="/static/style.css?v=20260512-nav" />
+  <style>
+    :root {
+      --ob-ink: #262017;
+      --ob-muted: #746653;
+      --ob-paper: #fff9ec;
+      --ob-paper-strong: #fffdf7;
+      --ob-green: #2f4d3d;
+      --ob-moss: #758660;
+      --ob-amber: #bd7b32;
+      --ob-line: rgba(58, 43, 25, .16);
+      --ob-shadow: 0 24px 90px rgba(45, 34, 18, .13);
+    }
+    body {
+      color: var(--ob-ink);
+      background:
+        radial-gradient(circle at 12% 10%, rgba(189,123,50,.18), transparent 32%),
+        radial-gradient(circle at 86% 8%, rgba(117,134,96,.22), transparent 30%),
+        linear-gradient(135deg, #f6efe4 0%, #ecf0df 48%, #fbf4e6 100%);
+    }
+    .ob-shell { max-width: 1360px; margin: 28px auto 56px; padding: 0 18px; }
+    .ob-hero {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--ob-line);
+      border-radius: 30px;
+      padding: 30px;
+      background: linear-gradient(135deg, rgba(255,249,236,.95), rgba(230,237,214,.88));
+      box-shadow: var(--ob-shadow);
+    }
+    .ob-hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -80px -140px auto;
+      width: 360px;
+      height: 360px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(47,77,61,.18), transparent 68%);
+      pointer-events: none;
+    }
+    .ob-kicker { margin: 0 0 8px; color: var(--ob-amber); font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .ob-title { margin: 0; font-size: clamp(36px, 7vw, 86px); line-height: .86; letter-spacing: -.06em; }
+    .ob-sub { max-width: 820px; margin: 16px 0 0; color: var(--ob-muted); font-size: 16px; line-height: 1.75; }
+    .ob-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+    .ob-btn {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      background: var(--ob-green);
+      color: #fff9ec;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ob-btn.secondary { background: rgba(47,77,61,.1); color: var(--ob-green); border: 1px solid rgba(47,77,61,.22); }
+    .ob-btn.warn { background: #8a5b2e; }
+    .ob-btn.ghost { background: transparent; color: var(--ob-green); border: 1px solid rgba(47,77,61,.24); }
+    .ob-btn:disabled { opacity: .45; cursor: not-allowed; }
+    .ob-layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 18px; margin-top: 18px; }
+    .ob-layout > aside { display: flex; flex-direction: column; gap: 18px; }
+    .ob-layout > aside .ob-panel { margin-top: 0 !important; }
+    #dream-panel { order: 1; }
+    #grow-panel { order: 2; }
+    .ob-panel {
+      border: 1px solid var(--ob-line);
+      border-radius: 24px;
+      padding: 18px;
+      background: rgba(255,253,247,.82);
+      box-shadow: 0 14px 46px rgba(45,34,18,.08);
+      backdrop-filter: blur(10px);
+    }
+    .ob-panel h2 { margin: 0 0 12px; font-size: 19px; }
+    .ob-stats { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; margin-top: 18px; }
+    .ob-stat { padding: 14px; border-radius: 18px; background: rgba(255,253,247,.76); border: 1px solid var(--ob-line); }
+    .ob-stat b { display: block; font-size: 24px; margin-bottom: 4px; }
+    .ob-stat span { color: var(--ob-muted); font-size: 12px; }
+    .ob-form { display: grid; gap: 10px; }
+    .ob-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .ob-row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .ob-field label { display: block; margin-bottom: 5px; color: var(--ob-muted); font-size: 12px; font-weight: 700; }
+    .ob-input, .ob-select, .ob-textarea {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid rgba(58,43,25,.2);
+      border-radius: 14px;
+      padding: 11px 12px;
+      background: var(--ob-paper-strong);
+      color: var(--ob-ink);
+      outline: none;
+    }
+    .ob-textarea { min-height: 126px; resize: vertical; line-height: 1.55; }
+    .ob-checks { display: flex; flex-wrap: wrap; gap: 12px; color: var(--ob-muted); font-size: 13px; }
+    .ob-checks label { display: inline-flex; align-items: center; gap: 6px; }
+    .ob-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .ob-filter { display: flex; flex-wrap: wrap; gap: 8px; }
+    .ob-filter button {
+      border: 1px solid rgba(47,77,61,.18);
+      background: rgba(255,253,247,.72);
+      color: var(--ob-green);
+      border-radius: 999px;
+      padding: 8px 11px;
+      cursor: pointer;
+    }
+    .ob-filter button.active { background: var(--ob-green); color: #fff9ec; }
+    .ob-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+    .ob-card {
+      border: 1px solid var(--ob-line);
+      border-radius: 20px;
+      padding: 15px;
+      background: linear-gradient(180deg, rgba(255,253,247,.94), rgba(255,249,236,.74));
+      cursor: pointer;
+      min-height: 190px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+    .ob-card:hover { border-color: rgba(47,77,61,.36); transform: translateY(-1px); }
+    .ob-card.active { box-shadow: inset 0 0 0 2px rgba(47,77,61,.45); }
+    .ob-card.selected { box-shadow: inset 0 0 0 2px rgba(189,123,50,.62); }
+    .ob-card-head { display: flex; gap: 10px; align-items: flex-start; }
+    .ob-card-head h3 { flex: 1; }
+    .ob-select-check { margin-top: 2px; width: 17px; height: 17px; accent-color: var(--ob-amber); }
+    .ob-card h3 { margin: 0; font-size: 16px; line-height: 1.35; }
+    .ob-meta { display: flex; flex-wrap: wrap; gap: 6px; color: var(--ob-muted); font-size: 12px; }
+    .ob-pill { display: inline-flex; border-radius: 999px; padding: 3px 8px; background: rgba(47,77,61,.09); color: var(--ob-green); }
+    .ob-pill.archive { background: rgba(138,91,46,.12); color: #8a5b2e; }
+    .ob-content { white-space: pre-wrap; line-height: 1.6; font-size: 13px; color: #443a2d; max-height: 140px; overflow: hidden; }
+    .ob-card.dream-card .ob-content { max-height: 280px; overflow: auto; }
+    .ob-detail-content { white-space: pre-wrap; max-height: 360px; overflow: auto; padding: 12px; border-radius: 16px; background: rgba(255,249,236,.78); border: 1px solid var(--ob-line); line-height: 1.65; }
+    .ob-muted { color: var(--ob-muted); font-size: 13px; line-height: 1.6; }
+    .ob-status { min-height: 20px; color: var(--ob-amber); font-size: 13px; margin-top: 8px; }
+    .ob-breath-flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+    .ob-step { border-radius: 14px; padding: 10px; background: rgba(47,77,61,.08); color: var(--ob-green); font-size: 12px; text-align: center; }
+    .ob-step.active { background: var(--ob-green); color: #fff9ec; }
+    .ob-empty { padding: 28px; text-align: center; color: var(--ob-muted); border: 1px dashed rgba(58,43,25,.22); border-radius: 20px; }
+    .ob-bulk-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0;
+      padding: 12px;
+      border: 1px solid rgba(189,123,50,.2);
+      border-radius: 18px;
+      background: rgba(189,123,50,.08);
+    }
+    .ob-bulk-bar .ob-select { width: auto; min-width: 150px; }
+    .ob-back-top {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      z-index: 30;
+      box-shadow: 0 12px 34px rgba(45,34,18,.18);
+    }
+    .ob-card.prioritized {
+      order: -1;
+    }
+    .ob-modal[hidden] { display: none; }
+    .ob-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+    }
+    .ob-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(38,32,23,.46);
+      backdrop-filter: blur(5px);
+    }
+    .ob-modal-card {
+      position: relative;
+      z-index: 1;
+      width: min(760px, calc(100vw - 28px));
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      border-radius: 24px;
+      box-shadow: 0 28px 90px rgba(30,24,16,.28);
+    }
+    .ob-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .ob-modal-head h2 { margin: 0; }
+    @media (max-width: 960px) {
+      .ob-layout { grid-template-columns: 1fr; }
+      .ob-stats { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+      .ob-row, .ob-row.three { grid-template-columns: 1fr; }
+      .ob-breath-flow { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/world-books">世界书</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs">NPC 管理</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/vectors">向量管理</a>
+    <a href="/ob" class="active">OB 记忆</a>
+  </nav>
+
+  <main class="ob-shell">
+    <section class="ob-hero">
+      <p class="ob-kicker">OmbreBrain Memory Spine</p>
+      <h1 class="ob-title">OB 记忆管理</h1>
+      <p class="ob-sub">这里管理凯尔希状态机的 OB bucket 主干：观察自然浮现、检索关系与生活记忆、手动沉淀新内容，并用归档/恢复维护记忆流动。</p>
+      <div class="ob-actions">
+        <button class="ob-btn" id="refresh-all">刷新</button>
+        <button class="ob-btn secondary" id="new-bucket" type="button">新建 Bucket</button>
+        <button class="ob-btn secondary" id="natural-breath">自然浮现</button>
+        <a class="ob-btn secondary" href="#dream-panel">Dream 自省</a>
+        <a class="ob-btn ghost" href="/vectors">向量管理</a>
+      </div>
+      <div class="ob-stats" id="stats-cards"></div>
+    </section>
+
+    <section class="ob-layout">
+      <div>
+        <section class="ob-panel" id="diagnostics-panel" style="margin-bottom:18px">
+          <h2>OB 诊断</h2>
+          <div class="ob-actions">
+            <button class="ob-btn secondary" id="run-diagnostics" type="button">诊断</button>
+            <button class="ob-btn secondary" id="run-breath-debug" type="button">Breath Debug</button>
+            <button class="ob-btn secondary" id="run-decay-dry" type="button">Decay Dry-run</button>
+            <button class="ob-btn warn" id="run-decay-apply" type="button">执行 Decay</button>
+            <button class="ob-btn secondary" id="run-embedding-dry" type="button">Embedding Dry-run</button>
+            <button class="ob-btn" id="run-embedding-backfill" type="button">补齐 Embedding</button>
+          </div>
+          <div class="ob-status" id="diagnostics-status"></div>
+          <pre class="ob-detail-content" id="diagnostics-output" style="white-space:pre-wrap;max-height:360px;overflow:auto"></pre>
+        </section>
+
+        <section class="ob-panel">
+          <div class="ob-toolbar">
+            <h2>Bucket 浏览</h2>
+            <div class="ob-filter" id="type-filters"></div>
+          </div>
+          <div class="ob-row">
+            <div class="ob-field">
+              <label>本地过滤</label>
+              <input class="ob-input" id="local-filter" placeholder="按名称 / domain / 正文过滤" />
+            </div>
+            <div class="ob-field">
+              <label>列表选项</label>
+              <select class="ob-select" id="include-archive">
+                <option value="false">隐藏归档</option>
+                <option value="true">包含归档</option>
+              </select>
+            </div>
+          </div>
+          <div class="ob-bulk-bar">
+            <button class="ob-btn secondary" id="select-visible" type="button">选择当前显示</button>
+            <button class="ob-btn secondary" id="select-visible-permanent" type="button">选择显示中的 permanent</button>
+            <input id="json-title-select-file" type="file" accept=".json,application/json" style="display:none" />
+            <button class="ob-btn secondary" id="select-from-json-title" type="button">按 JSON 标题选择</button>
+            <button class="ob-btn ghost" id="clear-selection" type="button">清空选择</button>
+            <select class="ob-select" id="bulk-type">
+              <option value="dynamic">改为 dynamic</option>
+              <option value="permanent">改为 permanent</option>
+              <option value="feel">改为 feel</option>
+              <option value="archive">改为 archive</option>
+            </select>
+            <button class="ob-btn warn" id="apply-bulk-type" type="button">批量修改 type</button>
+            <span class="ob-muted" id="bulk-status">已选择 0 个 bucket</span>
+          </div>
+          <div class="ob-status" id="list-status"></div>
+          <div class="ob-grid" id="bucket-grid"></div>
+        </section>
+
+        <section class="ob-panel" style="margin-top:18px">
+          <h2>Breath 模拟</h2>
+          <div class="ob-breath-flow">
+            <div class="ob-step active">1. domain 过滤</div>
+            <div class="ob-step">2. 向量预筛</div>
+            <div class="ob-step">3. 本地共振评分</div>
+            <div class="ob-step">4. touch 激活</div>
+          </div>
+          <div class="ob-form">
+            <div class="ob-row">
+              <div class="ob-field">
+                <label>Query（留空为自然浮现）</label>
+                <input class="ob-input" id="breath-query" placeholder="生日 / 关系 / 药物 / 博士" />
+              </div>
+              <div class="ob-field">
+                <label>Domain / Type</label>
+                <input class="ob-input" id="breath-domain" placeholder="relationship / character_life / anchor / feel" />
+              </div>
+            </div>
+            <div class="ob-row three">
+              <div class="ob-field">
+                <label>Valence 0-1</label>
+                <input class="ob-input" id="breath-valence" type="number" min="0" max="1" step="0.1" />
+              </div>
+              <div class="ob-field">
+                <label>Arousal 0-1</label>
+                <input class="ob-input" id="breath-arousal" type="number" min="0" max="1" step="0.1" />
+              </div>
+              <div class="ob-field">
+                <label>Limit</label>
+                <input class="ob-input" id="breath-limit" type="number" min="1" max="50" value="12" />
+              </div>
+            </div>
+            <div class="ob-checks">
+              <label><input type="checkbox" id="breath-archive" /> 包含归档</label>
+            </div>
+            <button class="ob-btn" id="run-breath">运行 Breath</button>
+          </div>
+          <div class="ob-status" id="breath-status"></div>
+          <div class="ob-grid" id="breath-results"></div>
+        </section>
+
+      </div>
+
+      <aside>
+        <section class="ob-panel" id="dream-panel">
+          <h2>Dream 自省消化</h2>
+          <p class="ob-muted">Dream 只读取最近未消化的动态记忆，不会自动写入或改写。需要沉淀时载入为 feel source，需要放下时显式标记 resolved。</p>
+          <div class="ob-row">
+            <div class="ob-field">
+              <label>候选数量</label>
+              <input class="ob-input" id="dream-limit" type="number" min="1" max="30" value="10" />
+            </div>
+            <div class="ob-field">
+              <label>操作</label>
+              <button class="ob-btn" id="run-dream" type="button">运行 Dream</button>
+            </div>
+          </div>
+          <div class="ob-status" id="dream-status"></div>
+          <div class="ob-detail-content" id="dream-text" style="display:none"></div>
+          <div class="ob-grid" id="dream-results" style="margin-top:12px"></div>
+        </section>
+
+        <section class="ob-panel" id="crystal-panel" style="margin-top:18px">
+          <h2>Feel 结晶</h2>
+          <p class="ob-muted">扫描相似 feel，先预览，再选择写入 OB principle、key_record、both，或浓缩成普通 feel。</p>
+          <div class="ob-row">
+            <div class="ob-field">
+              <label>Cluster 数</label>
+              <input class="ob-input" id="crystal-limit" type="number" min="1" max="20" value="3" />
+            </div>
+            <div class="ob-field">
+              <label>每组展示</label>
+              <input class="ob-input" id="crystal-max-items" type="number" min="1" max="20" value="5" />
+            </div>
+            <div class="ob-field">
+              <label>操作</label>
+              <button class="ob-btn" id="run-feel-crystals" type="button">扫描结晶</button>
+            </div>
+          </div>
+          <div class="ob-status" id="crystal-status"></div>
+          <div class="ob-grid" id="crystal-results" style="margin-top:12px"></div>
+        </section>
+
+        <section class="ob-panel" id="grow-panel" style="margin-top:18px">
+          <h2>Grow 沉淀</h2>
+          <div class="ob-form">
+            <div class="ob-field">
+              <label>匹配 Query（可选）</label>
+              <input class="ob-input" id="grow-query" placeholder="为空时用正文寻找最相近 bucket" />
+            </div>
+            <div class="ob-field">
+              <label>Domain / Type（可选）</label>
+              <input class="ob-input" id="grow-domain" placeholder="relationship / character_life / feel" />
+            </div>
+            <div class="ob-field">
+              <label>新增内容</label>
+              <textarea class="ob-textarea" id="grow-content" placeholder="会合并进最匹配的 bucket；没有匹配则新建。"></textarea>
+            </div>
+            <button class="ob-btn" id="run-grow">Grow</button>
+          </div>
+          <div class="ob-status" id="grow-status"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+  <div class="ob-modal" id="bucket-modal" hidden>
+    <div class="ob-modal-backdrop" id="bucket-modal-backdrop"></div>
+    <section class="ob-panel ob-modal-card" id="bucket-edit-panel">
+      <div class="ob-modal-head">
+        <h2>编辑 Bucket</h2>
+        <button class="ob-btn secondary" id="close-bucket-modal" type="button">关闭</button>
+      </div>
+      <div class="ob-form">
+        <input type="hidden" id="edit-id" />
+        <input type="hidden" id="source-bucket" />
+        <div class="ob-field">
+          <label>Name</label>
+          <input class="ob-input" id="bucket-name" placeholder="例如：2026-05-12 关系浮现" />
+        </div>
+        <div class="ob-row">
+          <div class="ob-field">
+            <label>Type</label>
+            <select class="ob-select" id="bucket-type">
+              <option value="dynamic">dynamic</option>
+              <option value="permanent">permanent</option>
+              <option value="feel">feel</option>
+            </select>
+          </div>
+          <div class="ob-field">
+            <label>Importance</label>
+            <input class="ob-input" id="bucket-importance" type="number" min="1" max="10" value="5" />
+          </div>
+        </div>
+        <div class="ob-field">
+          <label>Domain（逗号分隔）</label>
+          <input class="ob-input" id="bucket-domain" placeholder="relationship, character_life" />
+        </div>
+        <div class="ob-field">
+          <label>Tags（逗号分隔）</label>
+          <input class="ob-input" id="bucket-tags" placeholder="snapshot, conversation, manual" />
+        </div>
+        <div class="ob-row">
+          <div class="ob-field">
+            <label>Valence</label>
+            <input class="ob-input" id="bucket-valence" type="number" min="0" max="1" step="0.05" value="0.5" />
+          </div>
+          <div class="ob-field">
+            <label>Arousal</label>
+            <input class="ob-input" id="bucket-arousal" type="number" min="0" max="1" step="0.05" value="0.3" />
+          </div>
+        </div>
+        <div class="ob-checks">
+          <label><input type="checkbox" id="bucket-pinned" /> pinned</label>
+          <label><input type="checkbox" id="bucket-protected" /> protected</label>
+          <label><input type="checkbox" id="bucket-resolved" /> resolved</label>
+        </div>
+        <div class="ob-field">
+          <label>Content</label>
+          <textarea class="ob-textarea" id="bucket-content" placeholder="写入要沉淀到 OB 的记忆正文"></textarea>
+        </div>
+        <div class="ob-actions">
+          <button class="ob-btn" id="save-bucket">保存</button>
+          <button class="ob-btn secondary" id="reset-form">清空表单</button>
+          <button class="ob-btn secondary" id="make-dynamic-selected" type="button">设为 dynamic</button>
+          <button class="ob-btn secondary" id="make-permanent-selected" type="button">设为 permanent</button>
+          <button class="ob-btn warn" id="archive-selected" type="button">归档</button>
+          <button class="ob-btn secondary" id="restore-selected" type="button">恢复为 dynamic</button>
+        </div>
+      </div>
+      <div class="ob-status" id="edit-status"></div>
+    </section>
+  </div>
+  <button class="ob-btn secondary ob-back-top" id="back-to-top" type="button">回到顶部</button>
+
+  <script>
+    const state = { buckets: [], breath: [], dream: [], crystals: [], selected: null, typeFilter: 'all', selectedIds: new Set() };
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const listFromInput = (value) => String(value || '').split(/[，,]/).map(s => s.trim()).filter(Boolean);
+    const metaOf = (item) => item?.metadata || {};
+    const domainsOf = (item) => Array.isArray(metaOf(item).domain) ? metaOf(item).domain : [];
+    const tagsOf = (item) => Array.isArray(metaOf(item).tags) ? metaOf(item).tags : [];
+    const typeOf = (item) => {
+      const type = metaOf(item).type || 'dynamic';
+      return type === 'archived' ? 'archive' : type;
+    };
+    const normalizeTitle = (value) => String(value || '')
+      .normalize('NFKC')
+      .toLowerCase()
+      .replace(/[\s"'“”‘’`《》〈〉「」『』【】\[\]（）()，,。.!！?？:：;；、\-—_·]/g, '');
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        ...options,
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) throw new Error(data.detail || data.message || res.statusText);
+      return data;
+    }
+
+    function setStatus(id, message) {
+      $(id).textContent = message || '';
+    }
+
+    function renderStats(stats) {
+      const byType = stats.by_type || {};
+      const byDomain = stats.by_domain || {};
+      const topDomains = Object.entries(byDomain).sort((a, b) => b[1] - a[1]).slice(0, 4)
+        .map(([k, v]) => `${esc(k)} ${v}`).join(' · ') || '暂无 domain';
+      const covered = Number(stats.embedding_covered_pct || 0);
+      $('stats-cards').innerHTML = `
+        <div class="ob-stat"><b>${esc(stats.total || 0)}</b><span>bucket 总数</span></div>
+        <div class="ob-stat"><b>${esc(byType.dynamic || 0)}</b><span>dynamic</span></div>
+        <div class="ob-stat"><b>${esc(byType.permanent || 0)}</b><span>permanent</span></div>
+        <div class="ob-stat"><b>${covered}%</b><span>${stats.embedding_enabled ? 'embedding 已启用' : 'embedding 未启用'} · ${esc(stats.embedding_total || 0)} 条</span></div>
+        <div class="ob-stat" style="grid-column:1/-1"><b style="font-size:16px">${topDomains}</b><span>高频 domain</span></div>
+      `;
+    }
+
+    function renderFilters() {
+      const types = ['all', 'dynamic', 'permanent', 'feel', 'archive'];
+      $('type-filters').innerHTML = types.map(type => `
+        <button type="button" data-type="${esc(type)}" class="${state.typeFilter === type ? 'active' : ''}">${esc(type)}</button>
+      `).join('');
+      $('type-filters').querySelectorAll('button').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.typeFilter = btn.dataset.type;
+          renderFilters();
+          renderBuckets();
+        });
+      });
+    }
+
+    function filteredBuckets() {
+      const q = $('local-filter').value.trim().toLowerCase();
+      return state.buckets.filter(item => {
+        if (state.typeFilter !== 'all' && typeOf(item) !== state.typeFilter) return false;
+        if (!q) return true;
+        const meta = metaOf(item);
+        const haystack = [item.id, item.content, meta.name, typeOf(item), domainsOf(item).join(' '), tagsOf(item).join(' ')].join(' ').toLowerCase();
+        return haystack.includes(q);
+      });
+    }
+
+    function prioritizedBuckets(items) {
+      return [...items].sort((a, b) => {
+        const aRank = (state.selected?.id === a.id ? 0 : state.selectedIds.has(a.id) ? 1 : 2);
+        const bRank = (state.selected?.id === b.id ? 0 : state.selectedIds.has(b.id) ? 1 : 2);
+        if (aRank !== bRank) return aRank - bRank;
+        return bucketCreatedTime(b) - bucketCreatedTime(a);
+      });
+    }
+
+    function bucketCreatedTime(item) {
+      const meta = metaOf(item);
+      const raw = meta.created || meta.created_at || meta.updated_at || meta.last_active || '';
+      const time = Date.parse(raw);
+      return Number.isFinite(time) ? time : 0;
+    }
+
+    function updateBulkStatus() {
+      const selected = state.selectedIds.size;
+      const visible = filteredBuckets().length;
+      const permanent = state.buckets.filter(item => typeOf(item) === 'permanent').length;
+      $('bulk-status').textContent = `已选择 ${selected} 个 bucket · 当前显示 ${visible} 个 · permanent 总数 ${permanent}`;
+    }
+
+    function toggleBucketSelection(id, checked) {
+      if (!id) return;
+      if (checked) state.selectedIds.add(id);
+      else state.selectedIds.delete(id);
+      renderBuckets();
+    }
+
+    function selectVisibleBuckets({ permanentOnly = false } = {}) {
+      filteredBuckets().forEach(item => {
+        if (!permanentOnly || typeOf(item) === 'permanent') {
+          state.selectedIds.add(item.id);
+        }
+      });
+      renderBuckets();
+    }
+
+    function bucketTitleCandidates(item) {
+      const meta = metaOf(item);
+      const firstLine = String(item.content || '').split(/\r?\n/).find(Boolean) || '';
+      return [meta.name, item.name, item.title, item.id, firstLine].filter(Boolean);
+    }
+
+    function titleMatchesBucket(title, item) {
+      const wanted = normalizeTitle(title);
+      if (!wanted) return false;
+      return bucketTitleCandidates(item).some(candidate => {
+        const current = normalizeTitle(candidate);
+        if (!current) return false;
+        return current === wanted || current.includes(wanted) || (current.length >= 8 && wanted.includes(current));
+      });
+    }
+
+    function extractTitlesFromJson(payload) {
+      const rootItems = Array.isArray(payload) ? payload : payload?.items;
+      const items = Array.isArray(rootItems) ? rootItems : [];
+      return [...new Set(items.map(item => item?.title || item?.name).filter(Boolean))];
+    }
+
+    async function selectBucketsFromJsonTitleFile(file) {
+      if (!file) return;
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const titles = extractTitlesFromJson(payload);
+      if (!titles.length) {
+        setStatus('list-status', 'JSON 中没有找到 items[].title。');
+        return;
+      }
+      const matchedTitles = new Set();
+      const matchedIds = new Set();
+      for (const item of filteredBuckets()) {
+        const matched = titles.find(title => titleMatchesBucket(title, item));
+        if (matched) {
+          matchedTitles.add(matched);
+          matchedIds.add(item.id);
+        }
+      }
+      matchedIds.forEach(id => state.selectedIds.add(id));
+      renderBuckets();
+      const missing = titles.length - matchedTitles.size;
+      setStatus('list-status', `JSON 标题匹配完成：命中 ${matchedIds.size} 个 bucket / ${titles.length} 个标题，未命中 ${missing} 个。`);
+    }
+
+    function clearBulkSelection() {
+      state.selectedIds.clear();
+      renderBuckets();
+    }
+
+    function cardHtml(item) {
+      const meta = metaOf(item);
+      const isActive = state.selected?.id === item.id;
+      const isChecked = state.selectedIds.has(item.id);
+      const isPrioritized = isActive || isChecked;
+      const type = typeOf(item);
+      const pills = [
+        `<span class="ob-pill ${type === 'archive' ? 'archive' : ''}">${esc(type)}</span>`,
+        ...domainsOf(item).slice(0, 3).map(d => `<span class="ob-pill">${esc(d)}</span>`)
+      ].join('');
+      return `
+        <article class="ob-card ${isActive ? 'active' : ''} ${isChecked ? 'selected' : ''} ${isPrioritized ? 'prioritized' : ''}" data-id="${esc(item.id)}">
+          <div class="ob-card-head">
+            <input class="ob-select-check" type="checkbox" data-id="${esc(item.id)}" ${isChecked ? 'checked' : ''} aria-label="选择 bucket" />
+            <h3>${esc(meta.name || item.id)}</h3>
+          </div>
+          <div class="ob-meta">${pills}</div>
+          <div class="ob-meta">imp ${esc(meta.importance ?? '')} · v ${esc(meta.valence ?? '')} · a ${esc(meta.arousal ?? '')} · score ${esc(item.score ?? '')}</div>
+          <div class="ob-meta">${esc(meta.last_active || meta.created || '')}</div>
+          <div class="ob-content">${esc(item.content || '')}</div>
+        </article>
+      `;
+    }
+
+    function dreamCardHtml(item) {
+      const meta = metaOf(item);
+      return `
+        <article class="ob-card dream-card" data-id="${esc(item.id)}">
+          <h3>${esc(meta.name || item.id)}</h3>
+          <div class="ob-meta">
+            <span class="ob-pill">${esc(typeOf(item))}</span>
+            ${domainsOf(item).slice(0, 3).map(d => `<span class="ob-pill">${esc(d)}</span>`).join('')}
+          </div>
+          <div class="ob-meta">V ${esc(meta.valence ?? '')} · A ${esc(meta.arousal ?? '')} · created ${esc(meta.created || '')}</div>
+          <div class="ob-content">${esc(item.content || '')}</div>
+          <div class="ob-actions">
+            <button class="ob-btn secondary dream-feel" type="button" data-id="${esc(item.id)}">载入为 feel source</button>
+            <button class="ob-btn warn dream-resolve" type="button" data-id="${esc(item.id)}">标记 resolved</button>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderBuckets() {
+      const items = prioritizedBuckets(filteredBuckets());
+      $('list-status').textContent = `显示 ${items.length} / ${state.buckets.length} 个 bucket`;
+      $('bucket-grid').innerHTML = items.length ? items.map(cardHtml).join('') : '<div class="ob-empty">没有匹配的 bucket。</div>';
+      $('bucket-grid').querySelectorAll('.ob-select-check').forEach(check => {
+        check.addEventListener('click', event => event.stopPropagation());
+        check.addEventListener('change', () => toggleBucketSelection(check.dataset.id, check.checked));
+      });
+      $('bucket-grid').querySelectorAll('.ob-card').forEach(card => {
+        card.addEventListener('click', () => selectBucket(card.dataset.id));
+      });
+      updateBulkStatus();
+    }
+
+    function renderBreathResults() {
+      $('breath-results').innerHTML = state.breath.length ? state.breath.map(cardHtml).join('') : '<div class="ob-empty">Breath 暂无结果。</div>';
+      $('breath-results').querySelectorAll('.ob-card').forEach(card => {
+        card.addEventListener('click', () => selectBucket(card.dataset.id, state.breath));
+      });
+    }
+
+    function renderDreamResults() {
+      $('dream-results').innerHTML = state.dream.length ? state.dream.map(dreamCardHtml).join('') : '<div class="ob-empty">Dream 暂无候选。</div>';
+      $('dream-results').querySelectorAll('.ob-card').forEach(card => {
+        card.addEventListener('click', (event) => {
+          if (event.target.closest('button')) return;
+          selectBucket(card.dataset.id, state.dream);
+        });
+      });
+      $('dream-results').querySelectorAll('.dream-feel').forEach(btn => {
+        btn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          loadDreamAsFeel(btn.dataset.id);
+        });
+      });
+      $('dream-results').querySelectorAll('.dream-resolve').forEach(btn => {
+        btn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          resolveBucket(btn.dataset.id).catch(err => setStatus('dream-status', err.message));
+        });
+      });
+    }
+
+    function crystalCardHtml(cluster, index) {
+      const hidden = Number(cluster.hidden_count || 0);
+      const excerpts = (cluster.items || []).map(item => `
+        <div class="ob-detail-content" style="margin-top:8px">
+          <div class="ob-meta">${esc(item.id || '')} · sim ${esc(item.similarity ?? '')}</div>
+          ${esc(item.excerpt || item.content || '')}
+        </div>
+      `).join('');
+      const suggested = cluster.suggested_content || cluster.suggested_core || '';
+      return `
+        <article class="ob-card crystal-card" data-index="${index}">
+          <h3>${esc(cluster.cluster_id || `cluster-${index + 1}`)}</h3>
+          <div class="ob-meta">
+            <span class="ob-pill">${esc((cluster.feel_ids || []).length)} feel</span>
+            ${hidden ? `<span class="ob-pill">${hidden} hidden</span>` : ''}
+          </div>
+          ${excerpts || '<div class="ob-empty">没有可展示摘录。</div>'}
+          <div class="ob-field" style="margin-top:10px">
+            <label>结晶预览</label>
+            <textarea class="ob-textarea crystal-preview" data-index="${index}">${esc(suggested)}</textarea>
+          </div>
+          <div class="ob-actions">
+            <button class="ob-btn crystal-write" type="button" data-index="${index}" data-mode="principle">OB principle</button>
+            <button class="ob-btn secondary crystal-write" type="button" data-index="${index}" data-mode="thread">key_record</button>
+            <button class="ob-btn secondary crystal-write" type="button" data-index="${index}" data-mode="both">both</button>
+            <button class="ob-btn secondary crystal-write" type="button" data-index="${index}" data-mode="feel">普通 feel 浓缩</button>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderCrystalResults() {
+      $('crystal-results').innerHTML = state.crystals.length
+        ? state.crystals.map(crystalCardHtml).join('')
+        : '<div class="ob-empty">没有发现可结晶的 feel cluster。</div>';
+      $('crystal-results').querySelectorAll('.crystal-write').forEach(btn => {
+        btn.addEventListener('click', () => crystallizeCluster(Number(btn.dataset.index), btn.dataset.mode)
+          .catch(err => setStatus('crystal-status', err.message)));
+      });
+    }
+
+    function selectBucket(id, source = state.buckets) {
+      const item = source.find(b => b.id === id) || state.buckets.find(b => b.id === id);
+      if (!item) return;
+      state.selected = item;
+      fillForm(item);
+      openBucketModal();
+    }
+
+    function fillForm(item) {
+      const meta = metaOf(item);
+      $('edit-id').value = item.id || '';
+      $('bucket-name').value = meta.name || item.id || '';
+      $('bucket-type').value = ['dynamic', 'permanent', 'feel'].includes(typeOf(item)) ? typeOf(item) : 'dynamic';
+      $('bucket-importance').value = meta.importance || 5;
+      $('bucket-domain').value = domainsOf(item).join(', ');
+      $('bucket-tags').value = tagsOf(item).join(', ');
+      $('bucket-valence').value = meta.valence ?? 0.5;
+      $('bucket-arousal').value = meta.arousal ?? 0.3;
+      $('bucket-pinned').checked = !!meta.pinned;
+      $('bucket-protected').checked = !!meta.protected;
+      $('bucket-resolved').checked = !!meta.resolved;
+      $('bucket-content').value = item.content || '';
+      $('make-dynamic-selected').disabled = false;
+      $('make-permanent-selected').disabled = false;
+      $('archive-selected').disabled = typeOf(item) === 'archive';
+      $('restore-selected').disabled = typeOf(item) !== 'archive';
+      setStatus('edit-status', `正在编辑 ${item.id}`);
+      renderBuckets();
+    }
+
+    function openBucketModal() {
+      $('bucket-modal').hidden = false;
+      document.body.style.overflow = 'hidden';
+    }
+
+    function closeBucketModal() {
+      $('bucket-modal').hidden = true;
+      document.body.style.overflow = '';
+    }
+
+    function clearForm() {
+      ['edit-id', 'bucket-name', 'bucket-domain', 'bucket-tags', 'bucket-content'].forEach(id => $(id).value = '');
+      $('source-bucket').value = '';
+      $('bucket-type').value = 'dynamic';
+      $('bucket-importance').value = 5;
+      $('bucket-valence').value = 0.5;
+      $('bucket-arousal').value = 0.3;
+      ['bucket-pinned', 'bucket-protected', 'bucket-resolved'].forEach(id => $(id).checked = false);
+      ['make-dynamic-selected', 'make-permanent-selected', 'archive-selected', 'restore-selected'].forEach(id => $(id).disabled = true);
+      setStatus('edit-status', '');
+    }
+
+    function formPayload() {
+      return {
+        name: $('bucket-name').value.trim(),
+        type: $('bucket-type').value,
+        importance: Number($('bucket-importance').value || 5),
+        domain: listFromInput($('bucket-domain').value),
+        tags: listFromInput($('bucket-tags').value),
+        valence: Number($('bucket-valence').value || 0.5),
+        arousal: Number($('bucket-arousal').value || 0.3),
+        pinned: $('bucket-pinned').checked,
+        protected: $('bucket-protected').checked,
+        resolved: $('bucket-resolved').checked,
+        source_bucket: $('source-bucket').value.trim(),
+        content: $('bucket-content').value.trim()
+      };
+    }
+
+    async function loadStats() {
+      const stats = await api('/api/ob/stats');
+      renderStats(stats);
+    }
+
+    async function loadBuckets() {
+      setStatus('list-status', '正在加载 bucket...');
+      const includeArchive = $('include-archive').value === 'true';
+      const data = await api(`/api/ob/buckets?include_archive=${includeArchive}&limit=500`);
+      state.buckets = data.items || [];
+      const knownIds = new Set(state.buckets.map(item => item.id));
+      [...state.selectedIds].forEach(id => {
+        if (!knownIds.has(id)) state.selectedIds.delete(id);
+      });
+      renderFilters();
+      renderBuckets();
+    }
+
+    async function setBucketType(id, targetType) {
+      if (!id || !targetType) return null;
+      const data = await api(`/api/ob/buckets/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ type: targetType })
+      });
+      return data.item;
+    }
+
+    async function applyBulkType() {
+      const ids = [...state.selectedIds];
+      const targetType = $('bulk-type').value;
+      if (!ids.length) {
+        setStatus('list-status', '请先选择要批量修改的 bucket。');
+        return;
+      }
+      const permanentCount = ids.filter(id => typeOf(state.buckets.find(item => item.id === id)) === 'permanent').length;
+      const message = `确认将 ${ids.length} 个 bucket 改为 ${targetType}？其中 permanent ${permanentCount} 个。`;
+      if (!confirm(message)) return;
+      let ok = 0;
+      let failed = 0;
+      for (const id of ids) {
+        try {
+          await setBucketType(id, targetType);
+          ok += 1;
+          setStatus('list-status', `批量修改中：${ok + failed}/${ids.length}`);
+        } catch (err) {
+          failed += 1;
+        }
+      }
+      state.selectedIds.clear();
+      await loadStats();
+      await loadBuckets();
+      setStatus('list-status', `批量修改完成：成功 ${ok}，失败 ${failed}`);
+    }
+
+    async function setSelectedBucketType(targetType) {
+      if (!state.selected) return;
+      setStatus('list-status', `正在将 ${state.selected.id} 设为 ${targetType}...`);
+      const item = await setBucketType(state.selected.id, targetType);
+      state.selected = item;
+      await loadStats();
+      await loadBuckets();
+      selectBucket(item.id);
+      setStatus('list-status', `已设为 ${targetType}`);
+    }
+
+    async function runBreath(forceNatural = false) {
+      setStatus('breath-status', 'Breath 正在运行...');
+      const payload = {
+        query: forceNatural ? '' : $('breath-query').value.trim(),
+        domain: $('breath-domain').value.trim(),
+        top_k: Number($('breath-limit').value || 12),
+        include_archive: $('breath-archive').checked
+      };
+      if ($('breath-valence').value !== '') payload.valence = Number($('breath-valence').value);
+      if ($('breath-arousal').value !== '') payload.arousal = Number($('breath-arousal').value);
+      const data = await api('/api/ob/breath', { method: 'POST', body: JSON.stringify(payload) });
+      state.breath = data.items || [];
+      setStatus('breath-status', `返回 ${state.breath.length} 条结果`);
+      renderBreathResults();
+    }
+
+    async function runDiagnostics() {
+      setStatus('diagnostics-status', '正在读取 OB 诊断...');
+      const data = await api('/api/ob/diagnostics');
+      $('diagnostics-output').textContent = JSON.stringify(data, null, 2);
+      setStatus('diagnostics-status', '诊断完成');
+    }
+
+    async function runBreathDebug() {
+      setStatus('diagnostics-status', '正在计算 Breath Debug...');
+      const params = new URLSearchParams();
+      const query = $('breath-query').value.trim();
+      const domain = $('breath-domain').value.trim();
+      if (query) params.set('q', query);
+      if (domain) params.set('domain', domain);
+      if ($('breath-valence').value !== '') params.set('valence', $('breath-valence').value);
+      if ($('breath-arousal').value !== '') params.set('arousal', $('breath-arousal').value);
+      if ($('breath-archive').checked) params.set('include_archive', 'true');
+      const data = await api(`/api/ob/breath-debug?${params.toString()}`);
+      $('diagnostics-output').textContent = JSON.stringify(data, null, 2);
+      setStatus('diagnostics-status', `Debug 完成：${(data.items || []).length} 条`);
+    }
+
+    async function runDecay(dryRun = true) {
+      if (!dryRun && !confirm('确认执行 OB decay？低于阈值的 bucket 会被移动到 archive。')) return;
+      setStatus('diagnostics-status', dryRun ? '正在 dry-run decay...' : '正在执行 decay...');
+      const data = await api('/api/ob/decay/run', {
+        method: 'POST',
+        body: JSON.stringify({ dry_run: dryRun })
+      });
+      $('diagnostics-output').textContent = JSON.stringify(data, null, 2);
+      await loadStats();
+      if (!dryRun) await loadBuckets();
+      setStatus('diagnostics-status', dryRun ? 'Decay dry-run 完成' : 'Decay 执行完成');
+    }
+
+    async function runEmbeddingBackfill(dryRun = true) {
+      if (!dryRun && !confirm('确认补齐缺失的 OB embedding？会调用当前配置的 embedding API。')) return;
+      setStatus('diagnostics-status', dryRun ? '正在检查缺失 embedding...' : '正在补齐缺失 embedding...');
+      const data = await api('/api/ob/embeddings/backfill', {
+        method: 'POST',
+        body: JSON.stringify({ dry_run: dryRun, limit: 80, include_archive: true })
+      });
+      $('diagnostics-output').textContent = JSON.stringify(data, null, 2);
+      if (!dryRun) await loadStats();
+      setStatus('diagnostics-status', dryRun
+        ? `缺失 embedding：${data.missing || 0}`
+        : `补齐完成：成功 ${data.success || 0}，失败 ${data.failed || 0}，剩余待检查 ${Math.max(0, (data.missing || 0) - (data.success || 0))}`);
+    }
+
+    async function runDream() {
+      setStatus('dream-status', 'Dream 正在读取近期未消化记忆...');
+      const data = await api('/api/ob/dream', {
+        method: 'POST',
+        body: JSON.stringify({ limit: Number($('dream-limit').value || 10) })
+      });
+      state.dream = data.items || [];
+      $('dream-text').style.display = '';
+      $('dream-text').textContent = data.text || '没有需要消化的新记忆。';
+      setStatus('dream-status', `返回 ${state.dream.length} 条候选`);
+      renderDreamResults();
+    }
+
+    async function runFeelCrystals() {
+      setStatus('crystal-status', '正在扫描相似 feel...');
+      const data = await api('/api/ob/feel-crystals', {
+        method: 'POST',
+        body: JSON.stringify({
+          limit: Number($('crystal-limit').value || 3),
+          max_items_per_cluster: Number($('crystal-max-items').value || 5)
+        })
+      });
+      state.crystals = data.clusters || [];
+      setStatus('crystal-status', `返回 ${state.crystals.length} 个 cluster${data.has_more ? '，还有下一页' : ''}`);
+      renderCrystalResults();
+    }
+
+    async function crystallizeCluster(index, mode) {
+      const cluster = state.crystals[index];
+      if (!cluster) return;
+      const textarea = $('crystal-results').querySelector(`.crystal-preview[data-index="${index}"]`);
+      const content = (textarea?.value || '').trim();
+      if (!content) {
+        setStatus('crystal-status', '请先填写结晶预览内容。');
+        return;
+      }
+      const hidden = Number(cluster.hidden_count || 0);
+      const includeAll = hidden > 0
+        ? confirm(`这个 cluster 还有 ${hidden} 条未展示 feel。确定处理整个 cluster？取消则只处理当前显示项。`)
+        : true;
+      const payload = {
+        mode,
+        cluster_id: cluster.cluster_id,
+        include_all: includeAll,
+        feel_ids: includeAll ? [] : (cluster.items || []).map(item => item.id).filter(Boolean),
+        cursor_snapshot: cluster.cursor_snapshot || '',
+        domain: ['core'],
+        key_record_type: 'auto',
+        key_record_title: 'Feel crystal'
+      };
+      if (mode === 'principle') payload.principle_content = content;
+      if (mode === 'thread') payload.key_record_content = content;
+      if (mode === 'both') {
+        payload.principle_content = content;
+        payload.key_record_content = content;
+      }
+      if (mode === 'feel') payload.feel_content = content;
+      setStatus('crystal-status', `正在写入 ${mode}...`);
+      const data = await api('/api/ob/crystallize-feel', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      setStatus('crystal-status', `结晶完成：标记 ${(data.ob && data.ob.marked_count) || 0} 条 feel`);
+      await loadStats();
+      await loadBuckets();
+      await runFeelCrystals();
+    }
+
+    function loadDreamAsFeel(id) {
+      const item = state.dream.find(bucket => bucket.id === id) || state.buckets.find(bucket => bucket.id === id);
+      if (!item) return;
+      const meta = metaOf(item);
+      clearForm();
+      $('source-bucket').value = item.id;
+      $('bucket-type').value = 'feel';
+      $('bucket-name').value = `feel from ${meta.name || item.id}`;
+      $('bucket-importance').value = 6;
+      $('bucket-valence').value = meta.valence ?? 0.5;
+      $('bucket-arousal').value = meta.arousal ?? 0.3;
+      $('bucket-tags').value = 'dream, feel';
+      $('bucket-content').value = `关于「${meta.name || item.id}」的感受：`;
+      setStatus('edit-status', `已载入 ${item.id} 作为 feel source。保存后源 bucket 会标记 digested。`);
+      openBucketModal();
+    }
+
+    async function resolveBucket(id) {
+      if (!id) return;
+      setStatus('dream-status', `正在标记 ${id} 为 resolved...`);
+      await api(`/api/ob/buckets/${encodeURIComponent(id)}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'dream 消化后显式放下' })
+      });
+      await loadStats();
+      await loadBuckets();
+      await runDream();
+    }
+
+    async function saveBucket() {
+      const payload = formPayload();
+      if (!payload.content) {
+        setStatus('edit-status', 'content 不能为空。');
+        return;
+      }
+      const id = $('edit-id').value.trim();
+      setStatus('edit-status', id ? '正在更新 bucket...' : '正在创建 bucket...');
+      const data = id
+        ? await api(`/api/ob/buckets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) })
+        : await api('/api/ob/hold', { method: 'POST', body: JSON.stringify(payload) });
+      state.selected = data.item;
+      await loadStats();
+      await loadBuckets();
+      closeBucketModal();
+      clearForm();
+      setStatus('edit-status', '已保存。');
+    }
+
+    async function runGrow() {
+      const content = $('grow-content').value.trim();
+      if (!content) {
+        setStatus('grow-status', '新增内容不能为空。');
+        return;
+      }
+      setStatus('grow-status', 'Grow 正在沉淀...');
+      const data = await api('/api/ob/grow', {
+        method: 'POST',
+        body: JSON.stringify({
+          content,
+          query: $('grow-query').value.trim(),
+          domain: $('grow-domain').value.trim()
+        })
+      });
+      $('grow-content').value = '';
+      await loadStats();
+      await loadBuckets();
+      selectBucket(data.item.id);
+      setStatus('grow-status', `已沉淀到 ${data.item.id}`);
+    }
+
+    async function archiveSelected() {
+      if (!state.selected) return;
+      setStatus('list-status', `正在归档 ${state.selected.id}...`);
+      await api(`/api/ob/buckets/${encodeURIComponent(state.selected.id)}/archive`, { method: 'POST' });
+      state.selected = null;
+      closeBucketModal();
+      clearForm();
+      await loadStats();
+      await loadBuckets();
+    }
+
+    async function restoreSelected() {
+      if (!state.selected) return;
+      setStatus('list-status', `正在恢复 ${state.selected.id}...`);
+      const data = await api(`/api/ob/buckets/${encodeURIComponent(state.selected.id)}/restore`, {
+        method: 'POST',
+        body: JSON.stringify({ target_type: 'dynamic' })
+      });
+      await loadStats();
+      await loadBuckets();
+      selectBucket(data.item.id);
+    }
+
+    async function refreshAll() {
+      try {
+        await loadStats();
+        await loadBuckets();
+      } catch (err) {
+        setStatus('list-status', err.message || String(err));
+      }
+    }
+
+    $('refresh-all').addEventListener('click', refreshAll);
+    $('new-bucket').addEventListener('click', () => {
+      state.selected = null;
+      clearForm();
+      openBucketModal();
+    });
+    $('natural-breath').addEventListener('click', () => runBreath(true).catch(err => setStatus('breath-status', err.message)));
+    $('run-breath').addEventListener('click', () => runBreath(false).catch(err => setStatus('breath-status', err.message)));
+    $('run-diagnostics').addEventListener('click', () => runDiagnostics().catch(err => setStatus('diagnostics-status', err.message)));
+    $('run-breath-debug').addEventListener('click', () => runBreathDebug().catch(err => setStatus('diagnostics-status', err.message)));
+    $('run-decay-dry').addEventListener('click', () => runDecay(true).catch(err => setStatus('diagnostics-status', err.message)));
+    $('run-decay-apply').addEventListener('click', () => runDecay(false).catch(err => setStatus('diagnostics-status', err.message)));
+    $('run-embedding-dry').addEventListener('click', () => runEmbeddingBackfill(true).catch(err => setStatus('diagnostics-status', err.message)));
+    $('run-embedding-backfill').addEventListener('click', () => runEmbeddingBackfill(false).catch(err => setStatus('diagnostics-status', err.message)));
+    $('run-dream').addEventListener('click', () => runDream().catch(err => setStatus('dream-status', err.message)));
+    $('run-feel-crystals').addEventListener('click', () => runFeelCrystals().catch(err => setStatus('crystal-status', err.message)));
+    $('save-bucket').addEventListener('click', () => saveBucket().catch(err => setStatus('edit-status', err.message)));
+    $('reset-form').addEventListener('click', clearForm);
+    $('close-bucket-modal').addEventListener('click', closeBucketModal);
+    $('bucket-modal-backdrop').addEventListener('click', closeBucketModal);
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !$('bucket-modal').hidden) closeBucketModal();
+    });
+    $('run-grow').addEventListener('click', () => runGrow().catch(err => setStatus('grow-status', err.message)));
+    $('make-dynamic-selected').addEventListener('click', () => setSelectedBucketType('dynamic').catch(err => setStatus('list-status', err.message)));
+    $('make-permanent-selected').addEventListener('click', () => setSelectedBucketType('permanent').catch(err => setStatus('list-status', err.message)));
+    $('archive-selected').addEventListener('click', () => archiveSelected().catch(err => setStatus('list-status', err.message)));
+    $('restore-selected').addEventListener('click', () => restoreSelected().catch(err => setStatus('list-status', err.message)));
+    $('select-visible').addEventListener('click', () => selectVisibleBuckets());
+    $('select-visible-permanent').addEventListener('click', () => selectVisibleBuckets({ permanentOnly: true }));
+    $('select-from-json-title').addEventListener('click', () => $('json-title-select-file').click());
+    $('json-title-select-file').addEventListener('change', (event) => {
+      selectBucketsFromJsonTitleFile(event.target.files?.[0])
+        .catch(err => setStatus('list-status', err.message || String(err)))
+        .finally(() => { event.target.value = ''; });
+    });
+    $('clear-selection').addEventListener('click', clearBulkSelection);
+    $('apply-bulk-type').addEventListener('click', () => applyBulkType().catch(err => setStatus('list-status', err.message)));
+    $('include-archive').addEventListener('change', loadBuckets);
+    $('local-filter').addEventListener('input', renderBuckets);
+    $('back-to-top').addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+    refreshAll().then(() => runBreath(true)).catch(err => setStatus('list-status', err.message || String(err)));
+  </script>
+</body>
+</html>

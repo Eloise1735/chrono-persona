@@ -46,6 +46,27 @@ class MemoryStoreConfig:
 
 
 @dataclass
+class OBDecayEmotionWeightsConfig:
+    base: float = 1.0
+    arousal_boost: float = 0.8
+
+
+@dataclass
+class OBDecayConfig:
+    lambda_: float = 0.05
+    threshold: float = 0.3
+    check_interval_hours: float = 24.0
+    emotion_weights: OBDecayEmotionWeightsConfig = field(default_factory=OBDecayEmotionWeightsConfig)
+
+
+@dataclass
+class OBConfig:
+    enabled: bool = True
+    buckets_dir: str = "./data/ob_buckets"
+    decay: OBDecayConfig = field(default_factory=OBDecayConfig)
+
+
+@dataclass
 class CharacterConfig:
     system_prompt: str | None = None
     system_prompt_file: str | None = None
@@ -67,6 +88,7 @@ class AppConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     memory_store: MemoryStoreConfig = field(default_factory=MemoryStoreConfig)
+    ob: OBConfig = field(default_factory=OBConfig)
     character: CharacterConfig = field(default_factory=CharacterConfig)
     wechat: WeChatConfig = field(default_factory=WeChatConfig)
 
@@ -115,6 +137,17 @@ def load_config(config_path: str | None = None) -> AppConfig:
             cfg.environment.llm = _dict_to_dataclass(LLMConfig, env_data["llm"])
     if "memory_store" in raw:
         cfg.memory_store = _dict_to_dataclass(MemoryStoreConfig, raw["memory_store"])
+    if "ob" in raw:
+        ob_data = dict(raw["ob"] or {})
+        decay_data = dict(ob_data.get("decay") or {})
+        if "lambda" in decay_data and "lambda_" not in decay_data:
+            decay_data["lambda_"] = decay_data.pop("lambda")
+        if decay_data:
+            emotion_data = decay_data.get("emotion_weights")
+            if isinstance(emotion_data, dict):
+                decay_data["emotion_weights"] = _dict_to_dataclass(OBDecayEmotionWeightsConfig, emotion_data)
+            ob_data["decay"] = _dict_to_dataclass(OBDecayConfig, decay_data)
+        cfg.ob = _dict_to_dataclass(OBConfig, ob_data)
     if "character" in raw:
         cfg.character = _dict_to_dataclass(CharacterConfig, raw["character"])
     if "wechat" in raw:

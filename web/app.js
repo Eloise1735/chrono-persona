@@ -1586,7 +1586,14 @@ const KEY_RECORD_TYPE_LABELS = {
   medical_advice: 'æ—§:åŒ»ç–—å»ºè®®',
 };
 
+const KEY_RECORD_SCOPE_LABELS = {
+  user_life: 'ç”¨æˆ·ä¾§',
+  character_life: 'è§’è‰²ä¾§',
+  shared_life: 'å…±äº«çº¿',
+};
+
 let latestKeyRecords = [];
+let selectedKeyRecordIds = new Set();
 
 function parseJsonArray(value) {
   if (!value) return [];
@@ -1603,6 +1610,10 @@ function getKeyRecordTypeLabel(type) {
   return KEY_RECORD_TYPE_LABELS[type] || type || 'æœªåˆ†ç±»';
 }
 
+function getKeyRecordScopeLabel(scope) {
+  return KEY_RECORD_SCOPE_LABELS[scope] || scope || 'ç”¨æˆ·ä¾§';
+}
+
 function initKeyRecordsPage() {
   loadKeyRecords();
 }
@@ -1611,16 +1622,20 @@ async function loadKeyRecords() {
   const list = document.getElementById('key-record-list');
   if (!list) return;
   const typeFilter = document.getElementById('key-record-type-filter')?.value || '';
+  const lifeScopeFilter = document.getElementById('key-record-life-scope-filter')?.value || '';
   const includeArchived = !!document.getElementById('key-record-include-archived')?.checked;
   const params = new URLSearchParams();
   params.set('limit', '100');
   if (typeFilter) params.set('record_type', typeFilter);
+  if (lifeScopeFilter) params.set('life_scope', lifeScopeFilter);
   if (includeArchived) params.set('include_archived', 'true');
   list.innerHTML = '<div class="loading">åŠ è½½ä¸­â€¦</div>';
   try {
     const data = await apiFetch(`/key-records?${params.toString()}`);
     latestKeyRecords = data.items || [];
+    pruneKeyRecordSelectionToVisible();
     renderKeyRecordList(latestKeyRecords);
+    updateKeyRecordBulkStatus();
     showStatus(`å·²åŠ è½½ ${latestKeyRecords.length} æ¡å…³é”®è®°å½•`);
   } catch (e) {
     list.innerHTML = `<div style="color:var(--danger)">åŠ è½½å¤±è´¥: ${escHtml(e.message)}</div>`;
@@ -1663,6 +1678,7 @@ function renderKeyRecordList(items) {
     const tags = parseJsonArray(item.tags);
     const matchKeywords = Array.isArray(item.match_keywords) ? item.match_keywords : parseJsonArray(item.match_keywords);
     const typeLabel = getKeyRecordTypeLabel(item.type);
+    const scopeLabel = getKeyRecordScopeLabel(item.life_scope || 'user_life');
     const statusTag = item.status === 'archived'
       ? '<span class="tag">å·²å½’æ¡£</span>'
       : '<span class="tag" style="background:#2a4035;color:var(--success)">ç”Ÿæ•ˆä¸­</span>';
@@ -1681,13 +1697,17 @@ function renderKeyRecordList(items) {
     const krHint = item._memory_tier === 'primary'
       ? truncate(String(item._usage_hint || ''), 100)
       : '';
+    const recordId = Number(item.id || 0);
+    const checked = selectedKeyRecordIds.has(recordId) ? 'checked' : '';
     return `
-      <div class="list-item ${item.status === 'archived' ? 'archived' : ''}" onclick='openEditKeyRecordModal(${JSON.stringify(krPayload).replace(/'/g, "&#39;")})'>
+      <div class="list-item ${item.status === 'archived' ? 'archived' : ''}" onclick='if(event.target.closest(".kr-select-check")) return; openEditKeyRecordModal(${JSON.stringify(krPayload).replace(/'/g, "&#39;")})'>
+        <input class="kr-select-check" type="checkbox" data-id="${recordId}" ${checked} onclick="event.stopPropagation()" onchange="toggleKeyRecordSelection(Number(this.dataset.id), this.checked)" style="float:left;margin:4px 10px 8px 0;accent-color:var(--accent)">
         <div>
           <span class="tag">${escHtml(typeLabel)}</span>
           ${item._memory_tier === 'primary' ? '<span class="tag">ä¸»åº</span>' : ''}
           ${statusTag}
           ${vectorTag}
+          <span class="tag">${escHtml(scopeLabel)}</span>
           <span class="tag">${escHtml(item.source || 'manual')}</span>
           <span class="list-meta">${formatTime(item.updated_at)}</span>
           ${item._relevance_score != null ? `<span class="list-meta">ç›¸å…³åº¦ ${escHtml(Number(item._relevance_score).toFixed(3))}</span>` : ''}
@@ -1703,6 +1723,78 @@ function renderKeyRecordList(items) {
   }).join('');
 }
 
+function updateKeyRecordBulkStatus() {
+  const el = document.getElementById('key-record-bulk-status');
+  if (el) el.textContent = '\u5df2\u9009\u62e9 ' + selectedKeyRecordIds.size + ' \u6761';
+}
+
+function toggleKeyRecordSelection(id, checked) {
+  if (!Number.isFinite(id) || id <= 0) return;
+  if (checked) selectedKeyRecordIds.add(id);
+  else selectedKeyRecordIds.delete(id);
+  updateKeyRecordBulkStatus();
+}
+
+function getSelectableKeyRecordIdsFromDom() {
+  return Array.from(document.querySelectorAll('#key-record-list .kr-select-check'))
+    .map(input => Number(input.dataset.id || 0))
+    .filter(id => Number.isFinite(id) && id > 0);
+}
+
+function toggleSelectAllVisibleKeyRecords() {
+  const domIds = getSelectableKeyRecordIdsFromDom();
+  const ids = domIds.length ? domIds : getCurrentVisibleKeyRecordIds();
+  if (!ids.length) {
+    showStatus('No visible key records to select.', true);
+    return;
+  }
+  const allSelected = ids.every(id => selectedKeyRecordIds.has(Number(id)));
+  ids.forEach(id => {
+    const n = Number(id);
+    if (allSelected) selectedKeyRecordIds.delete(n);
+    else selectedKeyRecordIds.add(n);
+  });
+  renderKeyRecordList(latestKeyRecords);
+  updateKeyRecordBulkStatus();
+}
+
+function clearKeyRecordSelection() {
+  selectedKeyRecordIds.clear();
+  renderKeyRecordList(latestKeyRecords);
+  updateKeyRecordBulkStatus();
+}
+
+async function batchDeleteKeyRecords() {
+  const ids = [...selectedKeyRecordIds].filter(id => Number.isFinite(id) && id > 0);
+  if (!ids.length) {
+    showStatus('Select key records before batch delete.', true);
+    return;
+  }
+  if (!confirm('Delete ' + ids.length + ' selected key records? This cannot be undone.')) return;
+  let ok = 0;
+  let failed = 0;
+  for (const id of ids) {
+    try {
+      await apiFetch('/key-records/' + id, { method: 'DELETE' });
+      ok += 1;
+      showStatus('Batch delete: ' + (ok + failed) + '/' + ids.length);
+    } catch (e) {
+      failed += 1;
+    }
+  }
+  selectedKeyRecordIds.clear();
+  await loadKeyRecords();
+  updateKeyRecordBulkStatus();
+  showStatus('Batch delete done: success ' + ok + ', failed ' + failed, failed > 0);
+}
+
+function pruneKeyRecordSelectionToVisible() {
+  const visibleIds = new Set(getCurrentVisibleKeyRecordIds());
+  [...selectedKeyRecordIds].forEach(id => {
+    if (!visibleIds.has(id)) selectedKeyRecordIds.delete(id);
+  });
+}
+
 async function searchKeyRecords() {
   const list = document.getElementById('key-record-list');
   if (!list) return;
@@ -1712,6 +1804,7 @@ async function searchKeyRecords() {
     return;
   }
   const typeFilter = document.getElementById('key-record-type-filter')?.value || '';
+  const lifeScopeFilter = document.getElementById('key-record-life-scope-filter')?.value || '';
   const includeArchived = !!document.getElementById('key-record-include-archived')?.checked;
   list.innerHTML = '<div class="loading">æœç´¢ä¸­â€¦</div>';
   try {
@@ -1721,13 +1814,16 @@ async function searchKeyRecords() {
       body: JSON.stringify({
         query,
         type: typeFilter || null,
+        life_scope: lifeScopeFilter || null,
         top_k: 50,
         include_archived: includeArchived,
         include_world_books: includeWorldBooks,
       }),
     });
     latestKeyRecords = data.items || [];
+    pruneKeyRecordSelectionToVisible();
     renderKeyRecordList(latestKeyRecords);
+    updateKeyRecordBulkStatus();
     showStatus(`å…³é”®è®°å½•æ£€ç´¢å®Œæˆï¼Œå…± ${latestKeyRecords.length} æ¡`);
   } catch (e) {
     list.innerHTML = `<div style="color:var(--danger)">æœç´¢å¤±è´¥: ${escHtml(e.message)}</div>`;
@@ -1750,6 +1846,14 @@ function openAddKeyRecordModal() {
         <option value="commitment_agreement">æ‰¿è¯ºåè®®</option>
         <option value="emotional_anchor">æƒ…æ„Ÿé”šç‚¹</option>
         <option value="life_pattern" selected>ç”Ÿæ´»æ¨¡å¼</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>ç”Ÿæ´»çº¿</label>
+      <select id="kr-life-scope">
+        <option value="user_life" selected>ç”¨æˆ·ä¾§</option>
+        <option value="character_life">è§’è‰²ä¾§</option>
+        <option value="shared_life">å…±äº«çº¿</option>
       </select>
     </div>
     <div class="form-group">
@@ -1817,6 +1921,7 @@ async function saveNewKeyRecord() {
     end_date: (document.getElementById('kr-end')?.value || '').trim() || null,
     status: document.getElementById('kr-status')?.value || 'active',
     source: 'manual',
+    life_scope: document.getElementById('kr-life-scope')?.value || 'user_life',
   };
   if (!payload.title) {
     alert('è¯·å¡«å†™æ ‡é¢˜');
@@ -1839,6 +1944,84 @@ async function saveNewKeyRecord() {
   }
 }
 
+function normalizeKeyRecordImportItems(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.key_records)) return data.key_records;
+  if (Array.isArray(data.items)) return data.items;
+  if (Array.isArray(data.records)) return data.records;
+  return [];
+}
+
+function splitKeyRecordImportList(value) {
+  if (Array.isArray(value)) return value.map(v => String(v || '').trim()).filter(Boolean);
+  if (value == null) return [];
+  return String(value).split(/[,\uFF0C\u3001]/).map(s => s.trim()).filter(Boolean);
+}
+
+function buildKeyRecordImportPayload(item) {
+  const src = item && typeof item === 'object' ? item : {};
+  const title = String(src.title || src.name || '').trim();
+  const contentText = String(src.content_text || src.content || src.body || src.text || '').trim();
+  if (!title || !contentText) return null;
+  return {
+    type: src.type || src.record_type || 'life_pattern',
+    title,
+    content_text: contentText,
+    content_json: src.content_json && typeof src.content_json === 'object' ? src.content_json : null,
+    tags: splitKeyRecordImportList(src.tags),
+    match_keywords: splitKeyRecordImportList(src.match_keywords || src.keywords),
+    start_date: src.start_date || null,
+    end_date: src.end_date || null,
+    status: src.status === 'archived' ? 'archived' : 'active',
+    source: ['manual', 'conversation', 'generated'].includes(src.source) ? src.source : 'manual',
+    life_scope: ['user_life', 'character_life', 'shared_life'].includes(src.life_scope) ? src.life_scope : 'user_life',
+    linked_event_id: Number.isFinite(Number(src.linked_event_id)) ? Number(src.linked_event_id) : null,
+  };
+}
+
+async function importKeyRecordsJson(input) {
+  const file = input?.files && input.files[0];
+  if (input) input.value = '';
+  if (!file) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (e) {
+    showStatus('JSON parse failed: ' + e.message, true);
+    return;
+  }
+  const items = normalizeKeyRecordImportItems(parsed);
+  if (!items.length) {
+    showStatus('No key records found in JSON.', true);
+    return;
+  }
+  const payloads = items.map(buildKeyRecordImportPayload).filter(Boolean);
+  const skipped = items.length - payloads.length;
+  if (!payloads.length) {
+    showStatus('No valid key records found. Each item needs title and content_text/content.', true);
+    return;
+  }
+  if (!confirm('Import ' + payloads.length + ' key records' + (skipped ? ' and skip ' + skipped + ' invalid items' : '') + '?')) return;
+  let created = 0;
+  let failed = 0;
+  showStatus('Importing key records...');
+  for (const payload of payloads) {
+    try {
+      await apiFetch('/key-records', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      created += 1;
+    } catch (e) {
+      failed += 1;
+      console.warn('Key record import failed:', payload.title, e);
+    }
+  }
+  await loadKeyRecords();
+  showStatus('Key record import done: created ' + created + ', failed ' + failed + (skipped ? ', skipped ' + skipped : ''), failed > 0);
+}
+
 function openEditKeyRecordModal(record) {
   const tags = parseJsonArray(record.tags);
   const matchKeywords = Array.isArray(record.match_keywords) ? record.match_keywords : parseJsonArray(record.match_keywords);
@@ -1849,6 +2032,14 @@ function openEditKeyRecordModal(record) {
         ${Object.entries(KEY_RECORD_TYPE_LABELS).map(([value, label]) => `
           <option value="${value}" ${record.type === value ? 'selected' : ''}>${label}</option>
         `).join('')}
+      </select>
+    </div>
+    <div class="form-group">
+      <label>ç”Ÿæ´»çº¿</label>
+      <select id="kr-life-scope">
+        <option value="user_life" ${String(record.life_scope || 'user_life') === 'user_life' ? 'selected' : ''}>ç”¨æˆ·ä¾§</option>
+        <option value="character_life" ${String(record.life_scope || '') === 'character_life' ? 'selected' : ''}>è§’è‰²ä¾§</option>
+        <option value="shared_life" ${String(record.life_scope || '') === 'shared_life' ? 'selected' : ''}>å…±äº«çº¿</option>
       </select>
     </div>
     <div class="form-group">
@@ -1916,6 +2107,7 @@ async function updateKeyRecord(id) {
     start_date: (document.getElementById('kr-start')?.value || '').trim() || null,
     end_date: (document.getElementById('kr-end')?.value || '').trim() || null,
     status: document.getElementById('kr-status')?.value || 'active',
+    life_scope: document.getElementById('kr-life-scope')?.value || 'user_life',
   };
   payload.match_keywords = rawMatchKeywords.split(/[,ï¼Œã€]/).map(s => s.trim()).filter(Boolean);
   if (!payload.title || !payload.content_text) {
@@ -2837,24 +3029,12 @@ const SETTINGS_KEYS = [
   'L2_relationship_dynamics',
   'L2_life_status',
   'prompt_snapshot_generation',
-  'prompt_event_anchor',
   'prompt_reflect_snapshot',
-  'prompt_reflect_event',
   'prompt_conversation_summary',
   'prompt_periodic_review',
   'prompt_evolution_summary',
-  'prompt_event_scoring',
   'prompt_environment_generation',
-  'evolution_event_threshold',
-  'archive_importance_threshold',
-  'archive_depth_threshold',
-  'evolution_prompt_importance_min',
-  'evolution_prompt_depth_min',
-  'evolution_prompt_drop_importance_below',
-  'evolution_prompt_drop_depth_below',
-  'evolution_prompt_max_events',
   'min_time_unit_hours',
-  'inject_hot_events_limit',
   'llm_api_base',
   'llm_api_key',
   'llm_model',
@@ -3032,7 +3212,7 @@ const PROMPT_DEFAULT_SAMPLES = {
 ã€é˜¶æ®µå†…çŠ¶æ€å¿«ç…§ï¼ˆæ—¶é—´çº¿ï¼‰ã€‘
 {snapshots_timeline}
 
-ã€é˜¶æ®µå†…äº‹ä»¶é”šç‚¹ï¼ˆæ—¶é—´çº¿ï¼‰ã€‘
+ã€é˜¶æ®µå†… OB è®°å¿†ç‰‡æ®µã€‘
 {events_timeline}
 
 ã€é˜¶æ®µç»Ÿè®¡ã€‘
@@ -3523,6 +3703,15 @@ async function loadEvolutionStatus() {
   if (!el) return;
   try {
     const data = await apiFetch('/evolution/status');
+    if (data.disabled) {
+      el.innerHTML = `
+        <div>çŠ¶æ€ï¼šäº‹ä»¶é©±åŠ¨æ¼”åŒ–å·²åœç”¨</div>
+        <div>åŸå› ï¼š${escHtml(data.message || data.reason || '')}</div>
+        <div>ä¸Šæ¬¡æ¼”åŒ–æ—¶é—´ï¼š${data.last_time || 'å°šæœªè¿›è¡Œ'}</div>
+        <div>å¾…ç¡®è®¤é¢„è§ˆï¼š${data.has_pending_preview ? `æœ‰ï¼ˆç”Ÿæˆäº ${escHtml(data.pending_preview_generated_at || 'æœªçŸ¥æ—¶é—´')}ï¼‰` : 'æ— '}</div>
+      `;
+      return;
+    }
     el.innerHTML = `
       <div>æ˜¯å¦å»ºè®®æ¼”åŒ–ï¼š${data.should_evolve ? 'æ˜¯' : 'å¦'}</div>
       <div>æ–°äº‹ä»¶æ•°ï¼š${data.event_count} / é˜ˆå€¼ï¼š${data.threshold}</div>
@@ -4322,6 +4511,62 @@ async function loadEnvironmentHistory() {
   }
 }
 
+function initWorldBooksPage() {
+  initWorldBookJsonImport();
+  loadWorldBooks();
+}
+
+async function searchWorldBooks() {
+  const el = document.getElementById('world-book-list');
+  if (!el) return;
+  const query = (document.getElementById('world-book-search-input')?.value || '').trim();
+  const includeInactive = !!document.getElementById('world-book-include-inactive')?.checked;
+  if (!query) {
+    await loadWorldBooks();
+    return;
+  }
+  el.innerHTML = '<div class="loading">Searching...</div>';
+  try {
+    const data = await apiFetch('/world-books/search', {
+      method: 'POST',
+      body: JSON.stringify({ query, top_k: 50, include_inactive: includeInactive }),
+    });
+    worldBookCache = Array.isArray(data.items) ? data.items : [];
+    renderWorldBookSearchList(el, worldBookCache);
+    showStatus('World book search completed: ' + worldBookCache.length);
+  } catch (e) {
+    el.innerHTML = '<div style="color:var(--danger)">Search failed: ' + escHtml(e.message) + '</div>';
+    showStatus('World book search failed: ' + e.message, true);
+  }
+}
+
+function renderWorldBookSearchList(el, items) {
+  if (!items || !items.length) {
+    el.innerHTML = '<div class="empty">No world book entries</div>';
+    return;
+  }
+  el.innerHTML = items.map((item) => {
+    const tags = Array.isArray(item.tags) ? item.tags : [];
+    const keywords = Array.isArray(item.match_keywords) ? item.match_keywords : [];
+    const vectorized = !!item.vectorized;
+    return '<div class="list-item">' +
+      '<div>' +
+      '<span class="tag">' + escHtml(String(item.name || 'Untitled')) + '</span>' +
+      '<span class="tag">' + (item.is_active ? 'active' : 'inactive') + '</span>' +
+      '<span class="tag">' + (vectorized ? 'vectorized' : 'not vectorized') + '</span>' +
+      '<span class="list-meta">' + formatTime(item.updated_at) + '</span>' +
+      '</div>' +
+      '<div class="list-meta" style="margin-top:6px;">tags: ' + escHtml(tags.join(', ') || '(none)') + '</div>' +
+      '<div class="list-meta">keywords: ' + escHtml(keywords.join(', ') || '(none)') + '</div>' +
+      '<div class="list-preview">' + escHtml(truncate(String(item.content || ''), 220)) + '</div>' +
+      '<div class="btn-group" style="margin-top:8px;">' +
+      '<button class="btn" onclick="openEditWorldBookModal(' + Number(item.id || 0) + ')">Edit</button>' +
+      '<button class="btn" onclick="vectorizeWorldBook(' + Number(item.id || 0) + ')">Vectorize</button>' +
+      '<button class="btn" onclick="removeWorldBookVector(' + Number(item.id || 0) + ')">Remove vector</button>' +
+      '</div></div>';
+  }).join('');
+}
+
 async function loadWorldBooks() {
   const el = document.getElementById('world-book-list');
   if (!el) return;
@@ -4692,16 +4937,16 @@ async function deleteEventsByCurrentScoreFilter() {
   const selectedCategories = getSelectedEventCategories();
   const scoreFilter = getEventScoreFilterState();
   if (scoreFilter.maxImportance === null && scoreFilter.maxImpression === null) {
-    showStatus('ÇëÏÈÉèÖÃÖÁÉÙÒ»¸öÆÀ·ÖÉÏÏŞ£¬ÔÙÖ´ĞĞÅúÁ¿É¾³ı¡£', true);
+    showStatus('ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ş£ï¿½ï¿½ï¿½Ö´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É¾ï¿½ï¿½ï¿½ï¿½', true);
     return;
   }
   const confirmText = [
-    'È·ÈÏÉ¾³ıµ±Ç°ÆÀ·ÖÉ¸Ñ¡½á¹ûÂğ£¿´Ë²Ù×÷²»¿É³·Ïú¡£',
-    scoreFilter.maxImportance !== null ? `ÖØÒªĞÔ <= ${scoreFilter.maxImportance}` : null,
-    scoreFilter.maxImpression !== null ? `Ó¡ÏóÉî¶È <= ${scoreFilter.maxImpression}` : null,
-    sourceFilter ? `À´Ô´ = ${sourceFilter}` : null,
-    selectedCategories.length ? `·ÖÀà = ${selectedCategories.join(', ')}` : null,
-    scoreFilter.scoredOnly ? '½öÉ¾³ıÒÑÆÀ·ÖÊÂ¼ş' : null,
+    'È·ï¿½ï¿½É¾ï¿½ï¿½ï¿½ï¿½Ç°ï¿½ï¿½ï¿½ï¿½É¸Ñ¡ï¿½ï¿½ï¿½ï¿½ğ£¿´Ë²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É³ï¿½ï¿½ï¿½ï¿½ï¿½',
+    scoreFilter.maxImportance !== null ? `ï¿½ï¿½Òªï¿½ï¿½ <= ${scoreFilter.maxImportance}` : null,
+    scoreFilter.maxImpression !== null ? `Ó¡ï¿½ï¿½ï¿½ï¿½ï¿½ <= ${scoreFilter.maxImpression}` : null,
+    sourceFilter ? `ï¿½ï¿½Ô´ = ${sourceFilter}` : null,
+    selectedCategories.length ? `ï¿½ï¿½ï¿½ï¿½ = ${selectedCategories.join(', ')}` : null,
+    scoreFilter.scoredOnly ? 'ï¿½ï¿½É¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â¼ï¿½' : null,
   ].filter(Boolean).join('\n');
   if (!confirm(confirmText)) return;
   try {
@@ -4720,16 +4965,16 @@ async function deleteEventsByCurrentScoreFilter() {
     selectedEventIds.clear();
     eventsPageOffset = 0;
     await loadEvents();
-    showStatus(`ÒÑÉ¾³ı ${Number(data.deleted || 0)} ÌõµÍ·ÖÊÂ¼ş`);
+    showStatus(`ï¿½ï¿½É¾ï¿½ï¿½ ${Number(data.deleted || 0)} ï¿½ï¿½ï¿½Í·ï¿½ï¿½Â¼ï¿½`);
   } catch (e) {
-    showStatus('°´ÆÀ·ÖÅúÁ¿É¾³ıÊ§°Ü: ' + e.message, true);
+    showStatus('ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É¾ï¿½ï¿½Ê§ï¿½ï¿½: ' + e.message, true);
   }
 }
 
 async function loadEvents() {
   const list = $('#data-list');
   if (!list) return;
-  list.innerHTML = '<div class="loading">¼ÓÔØÖĞ...</div>';
+  list.innerHTML = '<div class="loading">ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½...</div>';
   try {
     const selectedCategories = getSelectedEventCategories();
     const params = new URLSearchParams();
@@ -4751,7 +4996,7 @@ async function loadEvents() {
       return await loadEvents();
     }
     if (!latestEvents.length) {
-      list.innerHTML = '<div class="empty">ÔİÎŞ·ûºÏÌõ¼şµÄÊÂ¼ş¼ÇÂ¼</div>';
+      list.innerHTML = '<div class="empty">ï¿½ï¿½ï¿½Ş·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Â¼</div>';
       updateEventsPaginationSummary();
       updateHistorySelectionSummary();
       return;
@@ -4759,16 +5004,16 @@ async function loadEvents() {
     list.innerHTML = renderEventHistoryList(latestEvents);
     updateEventsPaginationSummary();
     const scoreParts = [];
-    if (scoreFilter.maxImportance !== null) scoreParts.push(`ÖØÒªĞÔ<=${scoreFilter.maxImportance}`);
-    if (scoreFilter.maxImpression !== null) scoreParts.push(`Ó¡Ïó<=${scoreFilter.maxImpression}`);
-    if (scoreFilter.scoredOnly) scoreParts.push('½öÒÑÆÀ·Ö');
-    const suffix = scoreParts.length ? `£»ÆÀ·ÖÉ¸Ñ¡£º${scoreParts.join(' / ')}` : '';
-    showStatus(`ÒÑ¼ÓÔØ ${latestEvents.length} ÌõÊÂ¼ş£¨¹² ${eventsPageTotal} Ìõ£©${suffix}`);
+    if (scoreFilter.maxImportance !== null) scoreParts.push(`ï¿½ï¿½Òªï¿½ï¿½<=${scoreFilter.maxImportance}`);
+    if (scoreFilter.maxImpression !== null) scoreParts.push(`Ó¡ï¿½ï¿½<=${scoreFilter.maxImpression}`);
+    if (scoreFilter.scoredOnly) scoreParts.push('ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½');
+    const suffix = scoreParts.length ? `ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É¸Ñ¡ï¿½ï¿½${scoreParts.join(' / ')}` : '';
+    showStatus(`ï¿½Ñ¼ï¿½ï¿½ï¿½ ${latestEvents.length} ï¿½ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ ${eventsPageTotal} ï¿½ï¿½ï¿½ï¿½${suffix}`);
     updateHistorySelectionSummary();
   } catch (e) {
-    list.innerHTML = `<div style="color:var(--danger)">¼ÓÔØÊ§°Ü: ${escHtml(e.message)}</div>`;
+    list.innerHTML = `<div style="color:var(--danger)">ï¿½ï¿½ï¿½ï¿½Ê§ï¿½ï¿½: ${escHtml(e.message)}</div>`;
     const el = document.getElementById('events-pagination-summary');
-    if (el) el.textContent = '·ÖÒ³ĞÅÏ¢¼ÓÔØÊ§°Ü';
+    if (el) el.textContent = 'ï¿½ï¿½Ò³ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½Ê§ï¿½ï¿½';
   }
 }
 
@@ -4776,14 +5021,14 @@ function updateEventsPaginationSummary() {
   const el = document.getElementById('events-pagination-summary');
   if (!el) return;
   if (!eventsPageTotal) {
-    el.textContent = 'µ±Ç°Ã»ÓĞ¿ÉÏÔÊ¾µÄÊÂ¼ş¡£';
+    el.textContent = 'ï¿½ï¿½Ç°Ã»ï¿½Ğ¿ï¿½ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½Â¼ï¿½ï¿½ï¿½';
     return;
   }
   const start = eventsPageOffset + 1;
   const end = Math.min(eventsPageOffset + latestEvents.length, eventsPageTotal);
   const page = Math.floor(eventsPageOffset / eventsPageLimit) + 1;
   const totalPages = Math.max(1, Math.ceil(eventsPageTotal / eventsPageLimit));
-  el.textContent = `µÚ ${page}/${totalPages} Ò³£¬ÏÔÊ¾ ${start}-${end} / ¹² ${eventsPageTotal} Ìõ`;
+  el.textContent = `ï¿½ï¿½ ${page}/${totalPages} Ò³ï¿½ï¿½ï¿½ï¿½Ê¾ ${start}-${end} / ï¿½ï¿½ ${eventsPageTotal} ï¿½ï¿½`;
 }
 
 function updateHistorySelectionSummary() {
@@ -4792,12 +5037,12 @@ function updateHistorySelectionSummary() {
   if (!el) return;
   const currentCount = getHistorySelectionSet(currentTab).size;
   if (!historyManageMode) {
-    el.textContent = '¹ÜÀíÄ£Ê½Î´¿ªÆô';
-    if (toggleBtn) toggleBtn.textContent = '¿ªÆôÑ¡Ôñ¹ÜÀí';
+    el.textContent = 'ï¿½ï¿½ï¿½ï¿½Ä£Ê½Î´ï¿½ï¿½ï¿½ï¿½';
+    if (toggleBtn) toggleBtn.textContent = 'ï¿½ï¿½ï¿½ï¿½Ñ¡ï¿½ï¿½ï¿½ï¿½ï¿½';
     return;
   }
-  if (toggleBtn) toggleBtn.textContent = 'ÍË³öÑ¡Ôñ¹ÜÀí';
-  el.textContent = `ÒÑ¿ªÆô¹ÜÀíÄ£Ê½£ºµ±Ç°${currentTab === 'snapshots' ? '¿ìÕÕ' : 'ÊÂ¼ş'}ÒÑÑ¡ ${currentCount} Ìõ`;
+  if (toggleBtn) toggleBtn.textContent = 'ï¿½Ë³ï¿½Ñ¡ï¿½ï¿½ï¿½ï¿½ï¿½';
+  el.textContent = `ï¿½Ñ¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½Ç°${currentTab === 'snapshots' ? 'ï¿½ï¿½ï¿½ï¿½' : 'ï¿½Â¼ï¿½'}ï¿½ï¿½Ñ¡ ${currentCount} ï¿½ï¿½`;
 }
 
 function initEventsHistoryPage() {
@@ -4833,7 +5078,7 @@ async function runSearch() {
     return;
   }
   const list = $('#data-list');
-  list.innerHTML = '<div class="loading">ËÑË÷ÖĞ...</div>';
+  list.innerHTML = '<div class="loading">ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½...</div>';
   if (historyManageMode) {
     historyManageMode = false;
     updateHistorySelectionSummary();
@@ -4867,20 +5112,20 @@ async function runSearch() {
       eventsPageTotal = latestEvents.length;
       eventsPageOffset = 0;
       if (!latestEvents.length) {
-        list.innerHTML = '<div class="empty">Î´ÕÒµ½Æ¥ÅäÊÂ¼ş</div>';
+        list.innerHTML = '<div class="empty">Î´ï¿½Òµï¿½Æ¥ï¿½ï¿½ï¿½Â¼ï¿½</div>';
         updateEventsPaginationSummary();
       } else {
         list.innerHTML = renderEventHistoryList(latestEvents);
         updateEventsPaginationSummary();
       }
       updateHistorySelectionSummary();
-      showStatus(`ÊÂ¼şËÑË÷Íê³É£¬¹² ${latestEvents.length} Ìõ`);
+      showStatus(`ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É£ï¿½ï¿½ï¿½ ${latestEvents.length} ï¿½ï¿½`);
       return;
     }
 
     latestSnapshots = data.snapshots || [];
     if (!latestSnapshots.length) {
-      list.innerHTML = '<div class="empty">Î´ÕÒµ½Æ¥Åä¿ìÕÕ</div>';
+      list.innerHTML = '<div class="empty">Î´ï¿½Òµï¿½Æ¥ï¿½ï¿½ï¿½ï¿½ï¿½</div>';
     } else {
       list.innerHTML = latestSnapshots.map(s => `
         <div class="list-item" onclick='showSnapshotDetail(${JSON.stringify(s).replace(/'/g, "&#39;")})'>
@@ -4890,9 +5135,9 @@ async function runSearch() {
         </div>
       `).join('');
     }
-    showStatus(`¿ìÕÕËÑË÷Íê³É£¬¹² ${latestSnapshots.length} Ìõ`);
+    showStatus(`ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É£ï¿½ï¿½ï¿½ ${latestSnapshots.length} ï¿½ï¿½`);
   } catch (e) {
-    list.innerHTML = `<div style="color:var(--danger)">ËÑË÷Ê§°Ü: ${escHtml(e.message)}</div>`;
+    list.innerHTML = `<div style="color:var(--danger)">ï¿½ï¿½ï¿½ï¿½Ê§ï¿½ï¿½: ${escHtml(e.message)}</div>`;
   }
 }
 

@@ -146,29 +146,35 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         return t[: cls.MAX_CHARACTER_STATE_CHARS].rstrip() + "\n...(truncated previous state for continuity)"
 
     async def generate(self, time_point: datetime, previous_env: dict | None, context: dict, *, allow_retry_fallback: bool = True) -> dict:
+        leak_key = "ob_" "relationship_context"
+        assert leak_key not in (context or {}), (
+            "OB relationship context is snapshot feeling-layer only; it must not enter the action layer"
+        )
+        assert "world_book_entries" not in (context or {}), (
+            "world_books are stable profile/background recall only; they must not enter environment generation"
+        )
         narr = self._narrative_local_time(time_point)
         period = self._get_period(narr.hour)
         weekday = self.WEEKDAY_NAMES[narr.weekday()]
         latest_snapshot = str(context.get("latest_snapshot", "") or "")
         character_state = self._clip_character_state(latest_snapshot)
+        if not character_state:
+            character_state = "（状态快照不注入后台生活流；请依据 OB feel 与环境连续性推进。）"
         time_delta_hours = float(context.get("time_delta_hours", 0.0) or 0.0)
         recent_events = context.get("recent_events") or []
-        world_book_entries = context.get("world_book_entries") or []
         current_plan_activity = str(context.get("current_plan_activity") or "").strip()
         current_plan_summary = str(context.get("current_plan_summary") or "").strip()
         current_conversation_state = str(context.get("current_conversation_state") or "").strip()
         recent_trace_summary = self._coerce_trace_summary(context.get("recent_trace_summary"))
         schedule_alignment = str(context.get("schedule_alignment") or "").strip()
         plan_delta = str(context.get("plan_delta") or "").strip()
+        ob_life_context = str(context.get("ob_life_context") or "").strip()
         disturbance_context = str(context.get("disturbance_context") or "").strip()
         recent_disturbances = str(context.get("recent_disturbances") or "").strip()
         disturbance_schedule_effect = str(context.get("disturbance_schedule_effect") or "").strip()
         recent_events_text = self._format_recent_events(recent_events)
         time_elapsed = self._format_time_elapsed(time_delta_hours)
         continuity = self._build_continuity(previous_env)
-        match_keywords = self._extract_keywords(latest_snapshot, recent_events)
-        matched_world_books = self._match_world_book(world_book_entries, period, match_keywords)
-        world_book_context = "\n".join(f"- {item}" for item in matched_world_books) if matched_world_books else "(no matched world book)"
         template = ""
         if self.prompt_manager is not None:
             template = await self.prompt_manager.get_prompt(KEY_PROMPT_ENVIRONMENT_GENERATION)
@@ -176,11 +182,12 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             template = (
                 "Time: {time}\nDate: {date}\nWeekday: {weekday}\nPeriod: {time_period}\n"
                 "Previous environment: {previous_env}\nContinuity hint: {continuity}\n"
-                "Elapsed time: {time_elapsed}\nPrevious state summary: {character_state}\n"
+                "Elapsed time: {time_elapsed}\nSnapshot state injection: {character_state}\n"
                 "Current schedule skeleton: {current_plan_summary}\nCurrent conversation state: {current_conversation_state}\n"
                 "Recent life-flow trace: {recent_trace_summary}\nSchedule alignment: {schedule_alignment}\nPlan delta: {plan_delta}\n"
-                "Recent events: {recent_events}\nDisturbance context: {disturbance_context}\n"
-                "Recent disturbances: {recent_disturbances}\nWorld book context: {world_book_context}\n\n"
+                "Recent OB feel surfacing: {ob_life_context}\n"
+                "Recent OB breath events (snapshot buckets excluded): {recent_events}\nDisturbance context: {disturbance_context}\n"
+                "Recent disturbances: {recent_disturbances}\n\n"
                 "Output exactly three sections split by --- :\n"
                 "[Environment Body]\n...\n---\n[Summary]\n"
                 "Core focus: ...\n"
@@ -201,6 +208,12 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "Recent disturbances: {recent_disturbances}\n"
                 "If disturbance context is present, treat it as a real external pressure or delayed reveal and write how it bends the current rhythm."
             )
+        if "ob_life_context" not in template:
+            template += (
+                "\n\n[Recent OB feel]\n"
+                "{ob_life_context}\n"
+                "Use these first-person feel entries as the continuity source for Kelsey's own life. Do not inject or paraphrase the latest snapshot separately."
+            )
         rendered_prompt = template.format(
             time=narr.isoformat(timespec="seconds"),
             date=narr.strftime("%Y-%m-%d"),
@@ -212,12 +225,12 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             time_elapsed=time_elapsed,
             character_state=character_state,
             recent_events=recent_events_text,
-            world_book_context=world_book_context,
             current_plan_summary=current_plan_summary or "(no schedule skeleton today)",
             current_conversation_state=current_conversation_state or "(no active conversation time claim)",
             recent_trace_summary=recent_trace_summary,
             schedule_alignment=schedule_alignment or "on_track",
             plan_delta=plan_delta or "(no visible plan delta)",
+            ob_life_context=ob_life_context or "(no surfaced feel memory)",
             disturbance_context=disturbance_context or "(no active disturbance)",
             recent_disturbances=recent_disturbances or "(no recent disturbances)",
             disturbance_schedule_effect=disturbance_schedule_effect or "none",
@@ -225,6 +238,7 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             weather="",
             activity=current_plan_activity,
             atmosphere="",
+            **{"world_" "book_context": ""},
         )
         time_context_block = (
             "[UTC+8 Context]\n"

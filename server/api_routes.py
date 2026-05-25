@@ -43,6 +43,7 @@ from server.models import (
     WorldBookCreateRequest,
     WorldBookUpdateRequest,
     WorldBookAutoMetaRequest,
+    WorldBookSearchRequest,
     KeyRecordBatchVectorizeRequest,
     WorldBookJsonImportRequest,
     UpsertModelPricingRequest,
@@ -80,6 +81,42 @@ _evolution_engine = None
 _llm_client = None
 _env_llm_client = None
 _snapshot_llm_client = None
+_ob_client = None
+_ob_embedding_store = None
+_ob_decay_engine = None
+
+_OB_BUCKET_TYPES = {"dynamic", "permanent", "feel", "archive", "archived"}
+
+
+def _ob_payload_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
+    return []
+
+
+def _ob_payload_float(value, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = default
+    return max(minimum, min(maximum, num))
+
+
+def _ob_payload_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        num = default
+    return max(minimum, min(maximum, num))
+
+
+def _ob_bucket_item(bucket) -> dict:
+    formatted = _ob_client.format_buckets([bucket]) if _ob_client is not None and bucket is not None else []
+    if not formatted:
+        raise HTTPException(404, "OB bucket not found")
+    return formatted[0]
 
 
 def _normalize_plan_action_type(value: str | None) -> str:
@@ -308,9 +345,12 @@ def set_dependencies(
     snapshot_llm_client=None,
     plan_engine=None,
     npc_engine=None,
+    ob_client=None,
+    ob_embedding_store=None,
+    ob_decay_engine=None,
 ):
     global _db, _state_machine, _memory_store, _prompt_manager, _evolution_engine
-    global _llm_client, _env_llm_client, _snapshot_llm_client, _plan_engine, _npc_engine
+    global _llm_client, _env_llm_client, _snapshot_llm_client, _plan_engine, _npc_engine, _ob_client, _ob_embedding_store, _ob_decay_engine
     _db = db
     _state_machine = state_machine
     _memory_store = memory_store
@@ -321,6 +361,9 @@ def set_dependencies(
     _snapshot_llm_client = snapshot_llm_client
     _plan_engine = plan_engine
     _npc_engine = npc_engine
+    _ob_client = ob_client
+    _ob_embedding_store = ob_embedding_store
+    _ob_decay_engine = ob_decay_engine
 
 
 async def _ensure_event_meta(event: EventAnchor) -> EventAnchor:
@@ -549,6 +592,420 @@ async def api_summarize_conversation(req: SummarizeConversationRequest):
 async def api_search_memories(req: MemorySearchRequest):
     results = await _state_machine.recall_memories(req.query, top_k=req.top_k)
     return {"results": results}
+
+
+@router.get("/ob/stats")
+async def get_ob_stats():
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    stats = await _ob_client.stats()
+    total = int(stats.get("total") or 0)
+    embedding_total = _ob_embedding_store.count() if _ob_embedding_store is not None else 0
+    embedding_enabled = (
+        await _ob_embedding_store.is_enabled()
+        if _ob_embedding_store is not None
+        else False
+    )
+    stats.update(
+        {
+            "embedding_enabled": bool(embedding_enabled),
+            "embedding_total": int(embedding_total),
+            "embedding_covered_pct": round((embedding_total / total * 100.0), 2) if total else 0.0,
+            "decay_engine": {
+                "running": bool(_ob_decay_engine.is_running) if _ob_decay_engine is not None else False,
+                "last_result": _ob_decay_engine.last_result if _ob_decay_engine is not None else None,
+            },
+        }
+    )
+    return stats
+
+
+@router.get("/ob/pulse")
+async def ob_pulse(include_archive: bool = False):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    result = await _ob_client.pulse(include_archive=include_archive)
+    result["decay_engine"] = {
+        "running": bool(_ob_decay_engine.is_running) if _ob_decay_engine is not None else False,
+        "last_result": _ob_decay_engine.last_result if _ob_decay_engine is not None else None,
+    }
+    return result
+
+
+@router.get("/ob/diagnostics")
+async def ob_diagnostics():
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    result = await _ob_client.diagnostics()
+    total = int((result.get("stats") or {}).get("total") or 0)
+    embedding_total = _ob_embedding_store.count() if _ob_embedding_store is not None else 0
+    result["embedding"] = {
+        "enabled": await _ob_embedding_store.is_enabled() if _ob_embedding_store is not None else False,
+        "total": embedding_total,
+        "covered_pct": round((embedding_total / total * 100.0), 2) if total else 0.0,
+    }
+    result["decay_engine"] = {
+        "running": bool(_ob_decay_engine.is_running) if _ob_decay_engine is not None else False,
+        "last_result": _ob_decay_engine.last_result if _ob_decay_engine is not None else None,
+    }
+    return result
+
+
+@router.get("/ob/breath-debug")
+async def ob_breath_debug(
+    q: str = "",
+    domain: str = "",
+    valence: float | None = None,
+    arousal: float | None = None,
+    include_archive: bool = False,
+):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    return await _ob_client.breath_debug(
+        query=q,
+        domain=domain or None,
+        valence=valence,
+        arousal=arousal,
+        include_archive=include_archive,
+    )
+
+
+@router.post("/ob/decay/run")
+async def ob_decay_run(payload: dict | None = Body(default=None)):
+    if _ob_decay_engine is None:
+        raise HTTPException(400, "OB decay engine is not initialized")
+    payload = payload or {}
+    return await _ob_decay_engine.run_decay_cycle(dry_run=bool(payload.get("dry_run", True)))
+
+
+@router.post("/ob/embeddings/backfill")
+async def ob_embedding_backfill(payload: dict | None = Body(default=None)):
+    if _ob_client is None or _ob_embedding_store is None:
+        raise HTTPException(400, "OB embedding store is not initialized")
+    payload = payload or {}
+    dry_run = bool(payload.get("dry_run", True))
+    limit = _ob_payload_int(payload.get("limit"), 50, 1, 500)
+    buckets = await _ob_client.list_buckets(include_archive=bool(payload.get("include_archive", True)))
+    missing = [b for b in buckets if _ob_embedding_store.get(b.id) is None and str(b.content or "").strip()]
+    selected = missing[:limit]
+    result = {"dry_run": dry_run, "missing": len(missing), "attempted": len(selected), "success": 0, "failed": 0, "items": []}
+    if dry_run:
+        result["items"] = [{"id": b.id, "name": b.metadata.get("name") or b.id} for b in selected]
+        return result
+    for bucket in selected:
+        ok = await _ob_embedding_store.upsert(bucket.id, bucket.content)
+        result["success" if ok else "failed"] += 1
+        result["items"].append({"id": bucket.id, "ok": bool(ok)})
+    return result
+
+
+@router.get("/ob/network")
+async def ob_network(limit: int = 200, min_similarity: float = 0.5):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    capped = max(1, min(int(limit or 200), 500))
+    buckets = await _ob_client.list_buckets(include_archive=False)
+    buckets = buckets[:capped]
+    nodes = []
+    embeddings = {}
+    for bucket in buckets:
+        meta = bucket.metadata or {}
+        nodes.append({
+            "id": bucket.id,
+            "name": meta.get("name") or bucket.id,
+            "type": _ob_client._bucket_type(meta),
+            "domain": meta.get("domain", []),
+            "score": _ob_client.calculate_score(meta),
+            "pinned": bool(meta.get("pinned")),
+            "digested": bool(meta.get("digested")),
+        })
+        if _ob_embedding_store is not None:
+            emb = _ob_embedding_store.get(bucket.id)
+            if emb:
+                embeddings[bucket.id] = emb
+    edges = []
+    ids = list(embeddings)
+    threshold = max(0.0, min(float(min_similarity), 1.0))
+    for i, left in enumerate(ids):
+        for right in ids[i + 1:]:
+            sim = _ob_client._cosine_similarity(embeddings[left], embeddings[right])
+            if sim >= threshold:
+                edges.append({"source": left, "target": right, "similarity": round(sim, 4)})
+    return {"nodes": nodes, "edges": edges}
+
+
+@router.get("/ob/buckets")
+async def list_ob_buckets(include_archive: bool = False, limit: int = 100):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    buckets = await _ob_client.list_buckets(include_archive=include_archive)
+    buckets.sort(
+        key=lambda item: str((getattr(item, "metadata", {}) or {}).get("last_active") or ""),
+        reverse=True,
+    )
+    capped = max(1, min(500, int(limit or 100)))
+    return {"items": _ob_client.format_buckets(buckets[:capped])}
+
+
+@router.post("/ob/breath")
+async def ob_breath(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    domain = payload.get("domain") or None
+    domain_text = ",".join(_ob_payload_list(domain)).lower() if domain is not None else ""
+    default_limit = 3 if domain_text == "feel" else 8
+    buckets = await _ob_client.breath(
+        query=str(payload.get("query") or ""),
+        limit=int(payload.get("top_k") or payload.get("limit") or default_limit),
+        domain=domain,
+        valence=payload.get("valence"),
+        arousal=payload.get("arousal"),
+        include_archive=bool(payload.get("include_archive") or False),
+    )
+    return {"items": _ob_client.format_buckets(buckets)}
+
+
+@router.post("/ob/breath-bundle")
+async def ob_breath_bundle(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    return await _ob_client.breath_bundle(
+        top_k=_ob_payload_int(payload.get("top_k"), 8, 1, 50),
+        feel_top_k=_ob_payload_int(payload.get("feel_top_k"), 3, 1, 20),
+    )
+
+
+@router.post("/ob/feel-crystals")
+async def ob_feel_crystals(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    return await _ob_client.feel_crystals(
+        limit=_ob_payload_int(payload.get("limit"), 3, 1, 20),
+        max_items_per_cluster=_ob_payload_int(payload.get("max_items_per_cluster"), 5, 1, 20),
+        min_cluster_size=_ob_payload_int(payload.get("min_cluster_size"), 3, 2, 20),
+        min_similarity=_ob_payload_float(payload.get("min_similarity"), 0.7),
+        cursor=str(payload.get("cursor") or ""),
+    )
+
+
+async def _ob_create_feel_crystal_key_record(payload: dict, *, content: str, mode: str) -> dict | None:
+    if _state_machine is None:
+        raise HTTPException(400, "State machine is not initialized")
+    body = str(content or "").strip()
+    if not body:
+        raise HTTPException(400, "key_record_content is required for key_record crystallization")
+    record_type = str(payload.get("key_record_type") or "").strip()
+    result = await _state_machine.upsert_key_record(
+        record_type=record_type if record_type and record_type.lower() != "auto" else None,
+        title=str(payload.get("key_record_title") or "Feel crystal").strip() or "Feel crystal",
+        content_text=body,
+        tags=["feel_crystal", "ob"] + _ob_payload_list(payload.get("key_record_tags")),
+        content_json={
+            "source": "ob_feel_crystal",
+            "mode": mode,
+            "cluster_id": str(payload.get("cluster_id") or ""),
+            "feel_ids": _ob_payload_list(payload.get("feel_ids")),
+            "include_all": bool(payload.get("include_all") or False),
+        },
+        source="ob_feel_crystal",
+        life_scope=str(payload.get("life_scope") or "character_life").strip() or "character_life",
+        update_if_exists=bool(payload.get("update_if_exists", True)),
+    )
+    return result
+
+
+@router.post("/ob/crystallize-feel")
+async def ob_crystallize_feel(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in {"principle", "thread", "both", "feel"}:
+        raise HTTPException(400, "mode must be principle, thread, both, or feel")
+
+    key_record_result = None
+    extra_targets: list[str] = []
+    if mode in {"thread", "both"}:
+        key_content = str(payload.get("key_record_content") or payload.get("principle_content") or payload.get("feel_content") or "").strip()
+        key_record_result = await _ob_create_feel_crystal_key_record(payload, content=key_content, mode=mode)
+        record = (key_record_result or {}).get("record") or {}
+        record_id = record.get("id")
+        if record_id is not None:
+            extra_targets.append(f"key_record:{record_id}")
+
+    try:
+        ob_result = await _ob_client.crystallize_feel(
+            mode=mode,
+            principle_content=str(payload.get("principle_content") or ""),
+            feel_content=str(payload.get("feel_content") or ""),
+            domain=_ob_payload_list(payload.get("domain")) or None,
+            feel_ids=_ob_payload_list(payload.get("feel_ids")),
+            cluster_id=str(payload.get("cluster_id") or ""),
+            include_all=bool(payload.get("include_all") or False),
+            extra_targets=extra_targets,
+            min_cluster_size=_ob_payload_int(payload.get("min_cluster_size"), 3, 2, 20),
+            min_similarity=_ob_payload_float(payload.get("min_similarity"), 0.7),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ob": ob_result, "key_record": key_record_result}
+
+
+@router.post("/ob/dream")
+async def ob_dream(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    limit = _ob_payload_int(payload.get("limit"), 10, 1, 30)
+    return await _ob_client.dream(limit=limit)
+
+
+@router.post("/ob/hold")
+async def ob_hold(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "content is required")
+    bucket_type = str(payload.get("type") or payload.get("bucket_type") or "dynamic").strip()
+    if bucket_type not in {"dynamic", "permanent", "feel"}:
+        bucket_type = "dynamic"
+    source_bucket = str(payload.get("source_bucket") or "").strip()
+    extra_metadata = {"source_bucket": source_bucket} if bucket_type == "feel" and source_bucket else None
+    bucket_id = await _ob_client.hold(
+        content,
+        name=str(payload.get("name") or "").strip() or None,
+        tags=_ob_payload_list(payload.get("tags")),
+        domain=_ob_payload_list(payload.get("domain")),
+        importance=_ob_payload_int(payload.get("importance"), 5, 1, 10),
+        valence=_ob_payload_float(payload.get("valence"), 0.5),
+        arousal=_ob_payload_float(payload.get("arousal"), 0.3),
+        bucket_type=bucket_type,
+        pinned=bool(payload.get("pinned") or False),
+        protected=bool(payload.get("protected") or False),
+        resolved=bool(payload.get("resolved") or False),
+        extra_metadata=extra_metadata,
+    )
+    if bucket_type == "feel" and source_bucket:
+        await _ob_client.update(
+            source_bucket,
+            digested=True,
+            digested_at=datetime.utcnow().isoformat(),
+            model_valence=_ob_payload_float(payload.get("valence"), 0.5),
+            model_arousal=_ob_payload_float(payload.get("arousal"), 0.3),
+        )
+    bucket = await _ob_client.get(bucket_id)
+    return {"item": _ob_bucket_item(bucket)}
+
+
+@router.post("/ob/grow")
+async def ob_grow(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "content is required")
+    bucket_id = await _ob_client.grow(
+        content,
+        query=str(payload.get("query") or ""),
+        domain=payload.get("domain") or None,
+        importance=payload.get("importance"),
+        valence=payload.get("valence"),
+        arousal=payload.get("arousal"),
+    )
+    bucket = await _ob_client.get(bucket_id)
+    return {"item": _ob_bucket_item(bucket)}
+
+
+@router.get("/ob/buckets/{bucket_id}")
+async def get_ob_bucket(bucket_id: str):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    bucket = await _ob_client.get(bucket_id)
+    return {"item": _ob_bucket_item(bucket)}
+
+
+@router.patch("/ob/buckets/{bucket_id}")
+async def update_ob_bucket(bucket_id: str, payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    updates: dict = {}
+    if "content" in payload:
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise HTTPException(400, "content cannot be empty")
+        updates["content"] = content
+    if "name" in payload:
+        updates["name"] = str(payload.get("name") or "").strip() or bucket_id
+    if "domain" in payload:
+        updates["domain"] = _ob_payload_list(payload.get("domain"))
+    if "tags" in payload:
+        updates["tags"] = _ob_payload_list(payload.get("tags"))
+    if "type" in payload:
+        bucket_type = str(payload.get("type") or "dynamic").strip()
+        if bucket_type not in _OB_BUCKET_TYPES:
+            raise HTTPException(400, "Unsupported OB bucket type")
+        updates["type"] = bucket_type
+    for key in ("pinned", "protected", "resolved"):
+        if key in payload:
+            updates[key] = bool(payload.get(key))
+    if "importance" in payload:
+        updates["importance"] = _ob_payload_int(payload.get("importance"), 5, 1, 10)
+    if "valence" in payload:
+        updates["valence"] = _ob_payload_float(payload.get("valence"), 0.5)
+    if "arousal" in payload:
+        updates["arousal"] = _ob_payload_float(payload.get("arousal"), 0.3)
+    if not updates:
+        raise HTTPException(400, "No OB bucket updates supplied")
+    ok = await _ob_client.update(bucket_id, **updates)
+    if not ok:
+        raise HTTPException(404, "OB bucket not found")
+    bucket = await _ob_client.get(bucket_id)
+    return {"item": _ob_bucket_item(bucket)}
+
+
+@router.post("/ob/buckets/{bucket_id}/archive")
+async def archive_ob_bucket(bucket_id: str):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    ok = await _ob_client.archive(bucket_id)
+    if not ok:
+        raise HTTPException(404, "OB bucket not found")
+    bucket = await _ob_client.get(bucket_id)
+    return {"ok": True, "item": _ob_bucket_item(bucket)}
+
+
+@router.post("/ob/buckets/{bucket_id}/restore")
+async def restore_ob_bucket(bucket_id: str, payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    target_type = str(payload.get("target_type") or "dynamic").strip()
+    if target_type not in {"dynamic", "permanent", "feel"}:
+        raise HTTPException(400, "target_type must be dynamic, permanent, or feel")
+    ok = await _ob_client.restore(bucket_id, target_type=target_type)
+    if not ok:
+        raise HTTPException(404, "OB bucket not found")
+    bucket = await _ob_client.get(bucket_id)
+    return {"ok": True, "item": _ob_bucket_item(bucket)}
+
+
+@router.post("/ob/buckets/{bucket_id}/resolve")
+async def resolve_ob_bucket(bucket_id: str, payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    ok = await _ob_client.resolve(bucket_id, reason=str(payload.get("reason") or ""))
+    if not ok:
+        raise HTTPException(404, "OB bucket not found")
+    bucket = await _ob_client.get(bucket_id)
+    return {"ok": True, "item": _ob_bucket_item(bucket)}
 
 
 @router.post("/review/periodic")
@@ -847,13 +1304,17 @@ async def list_key_records(
     limit: int = 50,
     record_type: str | None = None,
     status: str | None = None,
+    life_scope: str | None = None,
     include_archived: bool = False,
 ):
+    if life_scope not in {None, "", "user_life", "character_life", "shared_life"}:
+        raise HTTPException(400, "Unsupported key record life_scope")
     items = await _db.get_all_key_records(
         offset=offset,
         limit=limit,
         record_type=record_type,
         status=status,
+        life_scope=life_scope or None,
         include_archived=include_archived,
     )
     return {"items": [_serialize_key_record(i) for i in items]}
@@ -865,10 +1326,11 @@ async def search_key_records(req: KeyRecordSearchRequest):
         query=req.query,
         top_k=req.top_k,
         record_type=req.type,
+        life_scope=req.life_scope,
         include_archived=req.include_archived,
-        include_world_books=req.include_world_books,
+        include_world_books=False,
     )
-    return {"items": items}
+    return {"items": items, "include_world_books": False}
 
 
 @router.get("/key-records/{record_id}")
@@ -901,6 +1363,7 @@ async def create_key_record(req: CreateKeyRecordRequest):
         end_date=req.end_date,
         status=req.status,
         source=req.source,
+        life_scope=req.life_scope,
         linked_event_id=req.linked_event_id,
         created_at=now,
         updated_at=now,
@@ -944,6 +1407,8 @@ async def update_key_record(record_id: int, req: UpdateKeyRecordRequest):
         fields["status"] = req.status
     if req.source is not None:
         fields["source"] = req.source
+    if req.life_scope is not None:
+        fields["life_scope"] = req.life_scope
     if req.linked_event_id is not None:
         fields["linked_event_id"] = req.linked_event_id
     if fields:
@@ -1077,6 +1542,16 @@ async def batch_vectorize_key_records(req: KeyRecordBatchVectorizeRequest):
 async def list_world_books(offset: int = 0, limit: int = 100):
     items = await _db.list_world_books(offset=offset, limit=limit)
     return {"items": [_serialize_world_book(i) for i in items]}
+
+
+@router.post("/world-books/search")
+async def search_world_books(req: WorldBookSearchRequest):
+    items = await _state_machine.recall_world_books(
+        query=req.query,
+        top_k=req.top_k,
+        include_inactive=req.include_inactive,
+    )
+    return {"items": items}
 
 
 @router.get("/world-books/{item_id}")
@@ -2276,9 +2751,12 @@ async def bulk_import(req: BulkImportRequest):
             source = str(item.get("source") or "manual")
             if source not in {"manual", "conversation", "generated"}:
                 source = "manual"
+            life_scope = str(item.get("life_scope") or "user_life")
+            if life_scope not in {"user_life", "character_life", "shared_life"}:
+                life_scope = "user_life"
 
             if req.upsert_key_records:
-                existing = await _db.get_key_record_by_type_title(record_type, title)
+                existing = await _db.get_key_record_by_type_title(record_type, title, life_scope=life_scope)
                 if existing:
                     await _db.update_key_record(
                         int(existing.id),
@@ -2290,6 +2768,7 @@ async def bulk_import(req: BulkImportRequest):
                         end_date=item.get("end_date"),
                         status=status,
                         source=source,
+                        life_scope=life_scope,
                         linked_event_id=item.get("linked_event_id"),
                     )
                     upsert_method = getattr(_memory_store, "upsert_key_record_vector", None)
@@ -2313,6 +2792,7 @@ async def bulk_import(req: BulkImportRequest):
                 end_date=item.get("end_date"),
                 status=status,  # type: ignore[arg-type]
                 source=source,  # type: ignore[arg-type]
+                life_scope=life_scope,  # type: ignore[arg-type]
                 linked_event_id=item.get("linked_event_id"),
                 created_at=str(item.get("created_at") or now_iso),
                 updated_at=str(item.get("updated_at") or now_iso),
