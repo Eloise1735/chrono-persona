@@ -18,6 +18,7 @@ from server.vector_memory_store import (
     KEY_VECTOR_EMBEDDING_MODEL,
     KEY_VECTOR_EMBEDDING_TIMEOUT,
 )
+from server.security import get_secret_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class OBEmbeddingStore:
     async def _runtime_config(self) -> dict[str, Any]:
         return {
             "embedding_api_base": await self._get_setting(KEY_VECTOR_EMBEDDING_API_BASE, ""),
-            "embedding_api_key": await self._get_setting(KEY_VECTOR_EMBEDDING_API_KEY, ""),
+            "embedding_api_key": get_secret_from_env(KEY_VECTOR_EMBEDDING_API_KEY, ""),
             "embedding_model": await self._get_setting(KEY_VECTOR_EMBEDDING_MODEL, "text-embedding-3-small"),
             "embedding_dim": int(await self._get_setting(KEY_VECTOR_EMBEDDING_DIM, "256")),
             "timeout_sec": float(await self._get_setting(KEY_VECTOR_EMBEDDING_TIMEOUT, "15")),
@@ -90,20 +91,64 @@ class OBEmbeddingStore:
         timeout_sec = max(3.0, float(cfg.get("timeout_sec") or 15))
         if not api_base or not api_key:
             return []
+        url = f"{api_base.rstrip('/')}/embeddings"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        # Some embedding services only accept arrays — try string first, then list.
+        attempts: list[Any] = [text, [text]]
         try:
             async with httpx.AsyncClient(timeout=timeout_sec) as client:
-                resp = await client.post(
-                    f"{api_base.rstrip('/')}/embeddings",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={"model": model, "input": text},
+                last_status: int | None = None
+                last_body: str = ""
+                for idx, input_payload in enumerate(attempts):
+                    resp = await client.post(
+                        url,
+                        headers=headers,
+                        json={"model": model, "input": input_payload},
+                    )
+                    last_status = resp.status_code
+                    last_body = resp.text or ""
+                    if resp.status_code >= 400:
+                        logger.warning(
+                            "OB embedding HTTP %s (attempt %d): %s",
+                            resp.status_code,
+                            idx + 1,
+                            last_body[:300],
+                        )
+                        continue
+                    if not last_body.strip():
+                        logger.warning(
+                            "OB embedding empty 2xx body (attempt %d, model=%s, text_len=%d)",
+                            idx + 1,
+                            model,
+                            len(text),
+                        )
+                        continue
+                    try:
+                        payload = resp.json()
+                    except ValueError:
+                        logger.warning(
+                            "OB embedding non-JSON body (attempt %d, content-type=%s): %s",
+                            idx + 1,
+                            resp.headers.get("content-type"),
+                            last_body[:300],
+                        )
+                        continue
+                    data = payload.get("data") or []
+                    if data and isinstance(data, list):
+                        emb = data[0].get("embedding")
+                        if isinstance(emb, list) and emb:
+                            return self._normalize_vector([float(x) for x in emb])
+                    logger.warning(
+                        "OB embedding response missing data (attempt %d): %s",
+                        idx + 1,
+                        str(payload)[:300],
+                    )
+                logger.warning(
+                    "OB embedding gave up after %d attempts; last_status=%s text_preview=%r",
+                    len(attempts),
+                    last_status,
+                    text[:80],
                 )
-            resp.raise_for_status()
-            payload = resp.json()
-            data = payload.get("data") or []
-            if data and isinstance(data, list):
-                emb = data[0].get("embedding")
-                if isinstance(emb, list) and emb:
-                    return self._normalize_vector([float(x) for x in emb])
         except Exception:
             logger.exception("OB embedding request failed")
         return []

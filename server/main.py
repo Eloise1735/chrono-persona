@@ -13,7 +13,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.requests import Request
 
 from server.config import load_config
@@ -28,11 +28,12 @@ from server.evolution import EvolutionEngine
 from server.automation_engine import AutomationEngine
 from server.npc_engine import NPCEngine
 from server.plan_engine import PlanEngine
-from server.mcp_tools import mcp, set_state_machine, set_evolution_engine
+from server.mcp_tools import mcp, set_state_machine, set_evolution_engine, set_plan_engine
 from server.ob_client import OBClient
 from server.ob_decay import OBDecayEngine, ob_decay_settings_from_config
 from server.ob_embedding import OBEmbeddingStore
 from server.api_routes import router as api_router, set_dependencies
+from server.security import get_admin_token, request_has_admin_token
 
 # Keep logs in UTC+8 to match application-facing time displays.
 _CST = timezone(timedelta(hours=8))
@@ -215,6 +216,7 @@ async def lifespan(app: FastAPI):
 
     set_state_machine(sm)
     set_evolution_engine(evolution_engine)
+    set_plan_engine(plan_engine)
     from server.mcp_tools import set_ob_client
     set_ob_client(ob_client)
     from server.mcp_tools import set_ob_decay_engine
@@ -262,6 +264,27 @@ app = FastAPI(title="Kelsey State Machine", lifespan=lifespan)
 
 
 @app.middleware("http")
+async def require_admin_token_for_private_surfaces(request: Request, call_next):
+    """Optional shared-secret guard for API and MCP surfaces.
+
+    Set KELSEY_ADMIN_TOKEN on the server and send it as X-Kelsey-Admin-Token
+    or Authorization: Bearer <token>. If unset, local/dev behavior stays unchanged.
+    """
+    token = get_admin_token()
+    path = request.url.path
+    if token and path.startswith(("/api", "/mcp", "/mcp-http")):
+        if request.method.upper() == "OPTIONS":
+            return await call_next(request)
+        if not request_has_admin_token(request, token):
+            return JSONResponse(
+                {"detail": "Admin token required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def log_unhandled_request_exceptions(request: Request, call_next):
     """Log unhandled request exceptions with a full traceback."""
     try:
@@ -277,13 +300,31 @@ async def log_unhandled_request_exceptions(request: Request, call_next):
 
 @app.middleware("http")
 async def normalize_mcp_streamable_http_path(request: Request, call_next):
-    """RikkaHub / FastMCP path quirks: avoid 307 on /mcp-http and 404 on /mcp-http/."""
+    """RikkaHub / FastMCP path quirks: avoid redirects and strict Accept failures."""
     if request.scope["type"] == "http":
         path = request.scope["path"]
         if path in ("/mcp-http", "/mcp-http/"):
             request.scope["path"] = "/mcp-http/mcp"
         elif path == "/mcp-http/mcp/":
             request.scope["path"] = "/mcp-http/mcp"
+        if request.scope["path"] == "/mcp-http/mcp" and request.method.upper() == "POST":
+            headers = list(request.scope.get("headers") or [])
+            accept = ""
+            accept_index = None
+            for index, (name, value) in enumerate(headers):
+                if name.lower() == b"accept":
+                    accept = value.decode("latin-1")
+                    accept_index = index
+                    break
+            accepts_json = "application/json" in accept
+            accepts_sse = "text/event-stream" in accept
+            if not (accepts_json and accepts_sse):
+                normalized = b"application/json, text/event-stream"
+                if accept_index is None:
+                    headers.append((b"accept", normalized))
+                else:
+                    headers[accept_index] = (b"accept", normalized)
+                request.scope["headers"] = headers
     return await call_next(request)
 
 

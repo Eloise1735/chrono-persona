@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Body, HTTPException
@@ -62,6 +64,14 @@ from server.models import (
     format_utc_instant_z,
 )
 from server.prompts import DEFAULT_SETTINGS, KEY_MODEL_PRICING_JSON
+from server.security import (
+    get_secret_from_env,
+    is_blank_or_masked_secret,
+    is_sensitive_setting_key,
+    mask_secret,
+    secret_env_var_for_setting,
+    validate_api_base,
+)
 from server.time_display import (
     normalize_user_instant_to_utc_z,
     shanghai_now,
@@ -86,6 +96,42 @@ _ob_embedding_store = None
 _ob_decay_engine = None
 
 _OB_BUCKET_TYPES = {"dynamic", "permanent", "feel", "archive", "archived"}
+
+
+def _redact_setting_item(item: dict | None) -> dict | None:
+    if item is None:
+        return None
+    redacted = dict(item)
+    if is_sensitive_setting_key(redacted.get("key", "")):
+        env_value = get_secret_from_env(str(redacted.get("key") or ""), "")
+        redacted["value"] = mask_secret(env_value)
+        redacted["is_secret"] = True
+        redacted["env_var"] = secret_env_var_for_setting(str(redacted.get("key") or ""))
+    return redacted
+
+
+def _redact_settings(items: list[dict]) -> list[dict]:
+    return [item for item in (_redact_setting_item(item) for item in items) if item is not None]
+
+
+def _public_llm_config(settings: dict) -> dict:
+    public = dict(settings)
+    public["api_key_set"] = bool(str(public.get("api_key") or "").strip())
+    public["api_key"] = mask_secret(public.get("api_key", ""))
+    public["api_key_source"] = "env" if public["api_key_set"] else "missing"
+    return public
+
+
+def _base_changes_without_new_key(current: dict, new_base: object, new_key: object) -> bool:
+    if "api_base" not in current:
+        return False
+    normalized_new_base = validate_api_base(new_base, "api_base")
+    normalized_current_base = str(current.get("api_base") or "").strip().rstrip("/")
+    return (
+        bool(normalized_new_base)
+        and normalized_new_base != normalized_current_base
+        and is_blank_or_masked_secret(new_key)
+    )
 
 
 def _ob_payload_list(value) -> list[str]:
@@ -183,6 +229,8 @@ def _plan_items_to_raw_plan(items: list[PlanItem]) -> str:
         ]
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 _plan_engine = None
 _npc_engine = None
 
@@ -452,6 +500,32 @@ def _extract_json_object(text: str) -> dict:
     return {}
 
 
+def _extract_feel_preview_object(text: str) -> dict:
+    parsed = _extract_json_object(text)
+    if parsed:
+        return parsed
+    raw = (text or "").strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start : end + 1]
+    keys = ["source_summary", "principle_preview", "key_record_preview", "feel_preview"]
+    result: dict[str, str] = {}
+    for idx, key in enumerate(keys):
+        next_key = keys[idx + 1] if idx + 1 < len(keys) else None
+        if next_key:
+            pattern = rf'"{key}"\s*:\s*"(.*?)"\s*,\s*"{next_key}"\s*:'
+        else:
+            pattern = rf'"{key}"\s*:\s*"(.*)"\s*\}}'
+        match = re.search(pattern, raw, flags=re.S)
+        if not match:
+            return {}
+        value = match.group(1)
+        value = value.replace('\\"', '"').replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+        result[key] = value.strip()
+    return result
+
+
 def _normalize_key_record_type_value(value) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -481,12 +555,11 @@ def _serialize_key_record(item: KeyRecord) -> dict:
 async def _get_llm_config(prefix: str) -> dict:
     enabled = await _db.get_setting(f"{prefix}_enabled")
     api_base = await _db.get_setting(f"{prefix}_api_base")
-    api_key = await _db.get_setting(f"{prefix}_api_key")
     model = await _db.get_setting(f"{prefix}_model")
     return {
         "enabled": str((enabled or {}).get("value", "0")) == "1",
         "api_base": str((api_base or {}).get("value", "")),
-        "api_key": str((api_key or {}).get("value", "")),
+        "api_key": get_secret_from_env(f"{prefix}_api_key", ""),
         "model": str((model or {}).get("value", "")),
     }
 
@@ -510,6 +583,19 @@ async def _save_llm_config(prefix: str, payload: dict):
         value = payload.get(key, defaults[key])
         if key == "enabled":
             value = "1" if _to_int_flag(value, 0) == 1 else "0"
+        elif key == "api_base":
+            try:
+                value = validate_api_base(value, "api_base")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            current = await _get_llm_config(prefix)
+            if _base_changes_without_new_key(current, value, current.get("api_key")):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Changing API Base requires the matching API key to be set in the server environment.",
+                )
+        elif key == "api_key":
+            continue
         await _db.set_setting(
             key=setting_key,
             value=str(value or ""),
@@ -735,16 +821,38 @@ async def ob_network(limit: int = 200, min_similarity: float = 0.5):
 
 
 @router.get("/ob/buckets")
-async def list_ob_buckets(include_archive: bool = False, limit: int = 100):
+async def list_ob_buckets(
+    include_archive: bool = False,
+    limit: int = 100,
+    life_scope: str = "user",
+):
+    """List OB buckets, sorted by last_active desc.
+
+    Query parameter ``life_scope`` controls character_life filtering for the management UI:
+      - ``"user"``      (default): exclude character_life buckets — what the user normally
+                        wants to manage (relational / cross-domain memories)
+      - ``"character"`` : only character_life buckets
+      - ``"all"``       : everything
+
+    Default is ``user`` because the frontend bucket browser is for managing the user's own
+    memory入库，角色侧的自动 fragments / rollups / 当下事件总结混在里面会让管理困难。
+    """
     if _ob_client is None:
         raise HTTPException(400, "OB memory spine is not initialized")
+    scope = str(life_scope or "user").strip().lower()
+    if scope not in {"user", "character", "all"}:
+        scope = "user"
     buckets = await _ob_client.list_buckets(include_archive=include_archive)
+    if scope == "user":
+        buckets = [b for b in buckets if not _ob_client._is_character_life_bucket(b)]
+    elif scope == "character":
+        buckets = [b for b in buckets if _ob_client._is_character_life_bucket(b)]
     buckets.sort(
         key=lambda item: str((getattr(item, "metadata", {}) or {}).get("last_active") or ""),
         reverse=True,
     )
     capped = max(1, min(500, int(limit or 100)))
-    return {"items": _ob_client.format_buckets(buckets[:capped])}
+    return {"items": _ob_client.format_buckets(buckets[:capped]), "life_scope": scope}
 
 
 @router.post("/ob/breath")
@@ -762,6 +870,9 @@ async def ob_breath(payload: dict | None = Body(default=None)):
         valence=payload.get("valence"),
         arousal=payload.get("arousal"),
         include_archive=bool(payload.get("include_archive") or False),
+        date_from=str(payload.get("date_from") or "") or None,
+        date_to=str(payload.get("date_to") or "") or None,
+        include_character_life=bool(payload.get("include_character_life") or False),
     )
     return {"items": _ob_client.format_buckets(buckets)}
 
@@ -777,6 +888,13 @@ async def ob_breath_bundle(payload: dict | None = Body(default=None)):
     )
 
 
+@router.post("/ob/breath-personal")
+async def ob_breath_personal():
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    return await _ob_client.breath_personal()
+
+
 @router.post("/ob/feel-crystals")
 async def ob_feel_crystals(payload: dict | None = Body(default=None)):
     if _ob_client is None:
@@ -788,6 +906,251 @@ async def ob_feel_crystals(payload: dict | None = Body(default=None)):
         min_cluster_size=_ob_payload_int(payload.get("min_cluster_size"), 3, 2, 20),
         min_similarity=_ob_payload_float(payload.get("min_similarity"), 0.7),
         cursor=str(payload.get("cursor") or ""),
+        include_crystallized=bool(payload.get("include_crystallized") or False),
+    )
+
+
+def _fallback_feel_crystal_preview(sources: list, *, reason: str = "") -> dict:
+    message = (
+        "LLM 没有生成有效的有机结晶预览。请检查 LLM 配置或点击重新扫描。"
+        "为避免把空泛模板误写入记忆，下面不自动填充结晶正文。"
+    )
+    if not sources:
+        message = "没有可用于结晶的源 feel。"
+    return {
+        "source_summary": message,
+        "principle_title": "",
+        "principle_card": {},
+        "principle_injection": "",
+        "principle_preview": "",
+        "key_record_preview": "",
+        "feel_preview": "",
+        "generated_by": "fallback",
+        "error": reason,
+    }
+
+
+class FeelCrystalPreviewError(RuntimeError):
+    pass
+
+
+def _feel_preview_copy_score(text: str, sources: list) -> float:
+    candidate = re.sub(r"\s+", "", str(text or ""))
+    if not candidate:
+        return 0.0
+    score = 0.0
+    for bucket in sources:
+        source = re.sub(r"\s+", "", str(getattr(bucket, "content", "") or ""))
+        if not source:
+            continue
+        score = max(score, SequenceMatcher(None, candidate[:800], source[:1600]).ratio())
+        for start in range(0, max(0, len(source) - 28), 28):
+            snippet = source[start:start + 36]
+            if len(snippet) >= 24 and snippet in candidate:
+                score = max(score, 0.95)
+                break
+    return round(score, 4)
+
+
+async def _generate_feel_crystal_preview(sources: list) -> dict:
+    if not sources:
+        raise FeelCrystalPreviewError("没有可用于结晶的源 feel。")
+    llm = _snapshot_llm_client
+    if llm is None:
+        raise FeelCrystalPreviewError("Snapshot LLM client is not initialized")
+    sample_sources = sources
+    if len(sources) > 24:
+        step = (len(sources) - 1) / 23
+        sample_sources = [sources[round(i * step)] for i in range(24)]
+    items = []
+    for idx, bucket in enumerate(sample_sources, 1):
+        meta = getattr(bucket, "metadata", {}) or {}
+        created = str(meta.get("created") or "")
+        domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip()) or "none"
+        content = str(getattr(bucket, "content", "") or "").strip()
+        if len(content) > 900:
+            content = content[:900] + "\n[truncated]"
+        items.append(f"[{idx}] id={bucket.id} created={created} domain={domains}\n{content}")
+    def build_prompt(strict_retry: bool = False) -> str:
+        retry_rule = (
+            "\n额外强约束：上一次输出太像原文。现在必须重新写，不能保留任何连续 12 个字以上的原文片段；"
+            "不要出现列表感，不要用斜杠、分号或逐条并列来压缩。"
+            "JSON 字符串内部禁止使用英文双引号；如需引用，请用中文书名号或单引号。"
+            if strict_retry else ""
+        )
+        return (
+        f"你是 OB feel 结晶助手。下面是一组相似的第一人称 feel；总数 {len(sources)} 条，抽样 {len(sample_sources)} 条。\n"
+        "任务不是摘要，也不是提取关键词，而是把这些反复出现的感受整理成可复用的人格原则卡，"
+        "同时保留一份新的第一人称 feel 沉淀。\n"
+        "principle 不是事件记录，也不是鸡汤；它必须说明这些感受以后如何约束判断、回应和行动。"
+        "必须保留原文本的核心张力，但不能引用、复述、拼接原句。"
+        "不要写“这组/这些 feel/源文本显示/共同主题/内在姿态/后续需要观察”等分析腔或占位话。"
+        "不要提到 feel 数量。不要分条。不要流水账。"
+        f"{retry_rule}\n"
+        "只输出 JSON，不要输出 markdown。输出必须能被 json.loads 直接解析。\n"
+        "JSON 字符串内部不要使用英文双引号；如需引用原话风格，使用「」或单引号。"
+        "JSON 结构必须严格类似："
+        "{\"source_summary\":\"...\",\"principle_title\":\"...\",\"principle_card\":{\"principle\":\"...\",\"response_rule\":\"...\",\"anchors\":[\"...\"],\"avoid\":\"...\"},\"principle_injection\":\"...\",\"key_record_preview\":\"...\",\"feel_preview\":\"...\"}\n\n"
+        "字段：\n"
+        "- source_summary: 120-220字，给管理者看的共同主题说明，可以第三人称，但必须具体说出情绪结构，不要空泛。\n"
+        "- principle_title: 8-28字，像一张原则卡标题，必须具体。\n"
+        "- principle_card.principle: 80-180字，写稳定原则；保留核心张力，不写成口号。\n"
+        "- principle_card.response_rule: 60-160字，写以后遇到相似情境时应如何回应/行动。\n"
+        "- principle_card.anchors: 2-4个不可替代的画面或细节钩子，每个不超过40字。\n"
+        "- principle_card.avoid: 30-100字，写需要避免的旧冲动、误判或过度补偿。\n"
+        "- principle_injection: 120-220字，可直接注入 get_current_state；压缩原则+回应规则+避免点，不要列 JSON。\n"
+        "- key_record_preview: 220-460字，中长期主线记录。可以稍中性，但要说清楚这条主线如何影响关系、选择、自我定位或生活流，不能只是“需要观察”。\n"
+        "- feel_preview: 280-560字，新的第一人称浓缩 feel。它应该像角色此刻真的把这些余波重新感受了一遍后写下来的话，保留风格、呼吸和身体感。\n\n"
+        "反例：把多条原文摘句用逗号、顿号、斜杠拼起来。反例：逐条说我经历了A/B/C。"
+        "反例：我需要承认这些感受指向一种姿态。反例：这组 feel 表明某种模式。"
+        "正例：写出这些碎片背后共同的温度、迟疑、确认、疼痛、靠近或松动，并让它自然变成一段新的第一人称文字。\n\n"
+        "feel 原文：\n"
+        + "\n\n---\n\n".join(items)
+        )
+    try:
+        best = None
+        last_error = ""
+        last_response_preview = ""
+        for attempt in range(2):
+            response = await llm.chat_dedicated(
+                [
+                    {"role": "system", "content": "Return ONLY one valid JSON object. No markdown, no prose outside JSON. Do not copy source sentences."},
+                    {"role": "user", "content": build_prompt(strict_retry=attempt > 0)},
+                ],
+                temperature=0.55 if attempt == 0 else 0.7,
+                max_tokens=2200,
+            )
+            parsed = _extract_feel_preview_object(response)
+            if not parsed:
+                last_response_preview = str(response or "")[:500]
+                last_error = "LLM returned no JSON object"
+                continue
+            candidate = {
+                "source_summary": str(parsed.get("source_summary") or "").strip(),
+                "principle_title": str(parsed.get("principle_title") or "").strip(),
+                "principle_card": parsed.get("principle_card") if isinstance(parsed.get("principle_card"), dict) else {},
+                "principle_injection": str(parsed.get("principle_injection") or "").strip(),
+                "principle_preview": str(parsed.get("principle_preview") or "").strip(),
+                "key_record_preview": str(parsed.get("key_record_preview") or "").strip(),
+                "feel_preview": str(parsed.get("feel_preview") or "").strip(),
+                "generated_by": "llm",
+            }
+            card = candidate["principle_card"] if isinstance(candidate["principle_card"], dict) else {}
+            if candidate["principle_preview"] and not card:
+                card = {
+                    "principle": candidate["principle_preview"],
+                    "response_rule": candidate["principle_preview"][:160],
+                    "anchors": [],
+                    "avoid": "",
+                }
+                candidate["principle_card"] = card
+            if candidate["principle_preview"] and not candidate["principle_title"]:
+                candidate["principle_title"] = candidate["principle_preview"][:24]
+            if candidate["principle_preview"] and not candidate["principle_injection"]:
+                candidate["principle_injection"] = candidate["principle_preview"][:220]
+            principle_text = str(card.get("principle") or candidate["principle_preview"] or "").strip()
+            response_rule = str(card.get("response_rule") or "").strip()
+            missing = [
+                key for key in ("source_summary", "key_record_preview", "feel_preview")
+                if not candidate[key]
+            ]
+            if not candidate["principle_title"]:
+                missing.append("principle_title")
+            if not principle_text:
+                missing.append("principle_card.principle")
+            if not response_rule:
+                missing.append("principle_card.response_rule")
+            if not candidate["principle_injection"]:
+                missing.append("principle_injection")
+            if missing:
+                last_error = f"LLM preview missing fields: {', '.join(missing)}"
+                continue
+            copy_score = max(
+                _feel_preview_copy_score(principle_text, sources),
+                _feel_preview_copy_score(response_rule, sources),
+                _feel_preview_copy_score(candidate["principle_injection"], sources),
+                _feel_preview_copy_score(candidate["key_record_preview"], sources),
+                _feel_preview_copy_score(candidate["feel_preview"], sources),
+            )
+            candidate["copy_score"] = copy_score
+            generic_text = "\n".join(
+                [
+                    candidate["principle_preview"],
+                    candidate["principle_injection"],
+                    candidate["key_record_preview"],
+                    candidate["feel_preview"],
+                ]
+            )
+            generic_bad = any(
+                token in generic_text
+                for token in ("这组", "这些 feel", "源文本", "共同主题", "内在姿态", "后续需要观察", "feel 指向")
+            )
+            too_short = (
+                len(principle_text) < 60
+                or len(response_rule) < 40
+                or len(candidate["principle_injection"]) < 80
+                or len(candidate["key_record_preview"]) < 160
+                or len(candidate["feel_preview"]) < 200
+            )
+            best = candidate
+            if copy_score < 0.62 and not generic_bad and not too_short:
+                break
+        if not best:
+            detail = last_error or "LLM did not return a usable preview"
+            if last_response_preview:
+                detail = f"{detail}; response preview={last_response_preview!r}"
+            raise ValueError(detail)
+        if best.get("copy_score", 1.0) >= 0.62:
+            raise ValueError(f"LLM preview is too close to source text: copy_score={best.get('copy_score')}")
+        best_card = best.get("principle_card") if isinstance(best.get("principle_card"), dict) else {}
+        best_principle = str(best_card.get("principle") or best.get("principle_preview") or "").strip()
+        best_response_rule = str(best_card.get("response_rule") or "").strip()
+        generic_text = "\n".join([best_principle, best_response_rule, best["principle_injection"], best["key_record_preview"], best["feel_preview"]])
+        if any(token in generic_text for token in ("这组", "这些 feel", "源文本", "共同主题", "内在姿态", "后续需要观察", "feel 指向")):
+            raise ValueError("LLM preview is too generic")
+        if len(best_principle) < 60 or len(best_response_rule) < 40 or len(best["principle_injection"]) < 80 or len(best["key_record_preview"]) < 160 or len(best["feel_preview"]) < 200:
+            raise ValueError("LLM preview is too short")
+        return best
+    except Exception as exc:
+        logger.exception("Failed to generate feel crystal preview")
+        raise FeelCrystalPreviewError(str(exc)) from exc
+
+
+@router.post("/ob/feel-crystals/preview")
+async def ob_feel_crystal_preview(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    sources = await _ob_client.feel_cluster_sources(
+        cluster_id=str(payload.get("cluster_id") or ""),
+        feel_ids=_ob_payload_list(payload.get("feel_ids")),
+        include_all=bool(payload.get("include_all", True)),
+        min_cluster_size=_ob_payload_int(payload.get("min_cluster_size"), 3, 2, 20),
+        min_similarity=_ob_payload_float(payload.get("min_similarity"), 0.7),
+        include_crystallized=bool(payload.get("include_crystallized") or False),
+    )
+    try:
+        preview = await _generate_feel_crystal_preview(sources)
+    except FeelCrystalPreviewError as exc:
+        raise HTTPException(502, f"Feel crystal preview failed: {exc}") from exc
+    return {
+        "preview": preview,
+        "source_feel_ids": [bucket.id for bucket in sources],
+        "source_count": len(sources),
+    }
+
+
+@router.post("/ob/uncrystallize-feel")
+async def ob_uncrystallize_feel(payload: dict | None = Body(default=None)):
+    if _ob_client is None:
+        raise HTTPException(400, "OB memory spine is not initialized")
+    payload = payload or {}
+    return await _ob_client.uncrystallize_feel(
+        cluster_id=str(payload.get("cluster_id") or ""),
+        feel_ids=_ob_payload_list(payload.get("feel_ids")),
+        include_all=bool(payload.get("include_all") or False),
+        min_cluster_size=_ob_payload_int(payload.get("min_cluster_size"), 3, 2, 20),
+        min_similarity=_ob_payload_float(payload.get("min_similarity"), 0.7),
     )
 
 
@@ -829,7 +1192,13 @@ async def ob_crystallize_feel(payload: dict | None = Body(default=None)):
     key_record_result = None
     extra_targets: list[str] = []
     if mode in {"thread", "both"}:
-        key_content = str(payload.get("key_record_content") or payload.get("principle_content") or payload.get("feel_content") or "").strip()
+        key_content = str(
+            payload.get("key_record_content")
+            or payload.get("principle_injection")
+            or payload.get("principle_content")
+            or payload.get("feel_content")
+            or ""
+        ).strip()
         key_record_result = await _ob_create_feel_crystal_key_record(payload, content=key_content, mode=mode)
         record = (key_record_result or {}).get("record") or {}
         record_id = record.get("id")
@@ -840,6 +1209,9 @@ async def ob_crystallize_feel(payload: dict | None = Body(default=None)):
         ob_result = await _ob_client.crystallize_feel(
             mode=mode,
             principle_content=str(payload.get("principle_content") or ""),
+            principle_title=str(payload.get("principle_title") or ""),
+            principle_card=payload.get("principle_card") if isinstance(payload.get("principle_card"), dict) else None,
+            principle_injection=str(payload.get("principle_injection") or ""),
             feel_content=str(payload.get("feel_content") or ""),
             domain=_ob_payload_list(payload.get("domain")) or None,
             feel_ids=_ob_payload_list(payload.get("feel_ids")),
@@ -952,7 +1324,7 @@ async def update_ob_bucket(bucket_id: str, payload: dict | None = Body(default=N
         if bucket_type not in _OB_BUCKET_TYPES:
             raise HTTPException(400, "Unsupported OB bucket type")
         updates["type"] = bucket_type
-    for key in ("pinned", "protected", "resolved"):
+    for key in ("pinned", "protected", "resolved", "crystallized", "digested"):
         if key in payload:
             updates[key] = bool(payload.get(key))
     if "importance" in payload:
@@ -1881,6 +2253,15 @@ async def create_snapshot(req: CreateSnapshotRequest):
         environment=req.environment,
     )
     snap_id = await _db.insert_snapshot(snap)
+    if req.type == "conversation_end" and _state_machine is not None:
+        try:
+            await _state_machine._close_active_conversation_time_claim(
+                ended_at=shanghai_now(),
+                closing_snapshot_id=int(snap_id or 0),
+                context_summary=req.content,
+            )
+        except Exception:
+            logger.exception("Failed to close active conversation claim after manual conversation_end snapshot.")
     return {"id": snap_id, "message": "Snapshot created"}
 
 
@@ -2265,6 +2646,10 @@ async def batch_delete_vector_entries(req: VectorBatchDeleteRequest):
 async def get_vector_settings():
     store = _ensure_vector_store()
     settings = await store.get_runtime_config()
+    settings = dict(settings)
+    settings["embedding_api_key_set"] = bool(str(settings.get("embedding_api_key") or "").strip())
+    settings["embedding_api_key"] = mask_secret(settings.get("embedding_api_key", ""))
+    settings["embedding_api_key_source"] = "env" if settings["embedding_api_key_set"] else "missing"
     return {"settings": settings}
 
 
@@ -2272,6 +2657,23 @@ async def get_vector_settings():
 async def update_vector_settings(req: UpdateVectorSettingsRequest):
     store = _ensure_vector_store()
     payload = req.model_dump(exclude_none=True)
+    try:
+        if payload.get("vector_embedding_api_base") is not None:
+            current = await store.get_runtime_config()
+            new_base = validate_api_base(payload.get("vector_embedding_api_base"), "vector_embedding_api_base")
+            current_base = validate_api_base(current.get("embedding_api_base", ""), "vector_embedding_api_base")
+            if (
+                new_base
+                and new_base != current_base
+                and not get_secret_from_env("vector_embedding_api_key", "")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Changing vector API Base requires KELSEY_VECTOR_EMBEDDING_API_KEY in the server environment.",
+                )
+            payload["vector_embedding_api_base"] = new_base
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await store.update_runtime_config(payload)
     return {"message": "Vector settings updated"}
 
@@ -2281,17 +2683,26 @@ async def update_vector_settings(req: UpdateVectorSettingsRequest):
 @router.get("/environment/llm-config")
 async def get_environment_llm_config():
     settings = await _get_llm_config("env_llm")
-    return {"settings": settings}
+    return {"settings": _public_llm_config(settings)}
 
 
 @router.post("/environment/llm-config")
 async def update_environment_llm_config(payload: dict):
+    current = await _get_llm_config("env_llm")
+    try:
+        if _base_changes_without_new_key(current, payload.get("api_base"), current.get("api_key")):
+            raise HTTPException(
+                status_code=400,
+                detail="Changing API Base requires KELSEY_ENV_LLM_API_KEY in the server environment.",
+            )
+        api_base = validate_api_base(payload.get("api_base", ""), "api_base")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if _env_llm_client is not None:
         await _env_llm_client.update_runtime_config(
             {
                 "env_llm_enabled": "1" if _to_int_flag(payload.get("enabled"), 0) == 1 else "0",
-                "env_llm_api_base": payload.get("api_base", ""),
-                "env_llm_api_key": payload.get("api_key", ""),
+                "env_llm_api_base": api_base,
                 "env_llm_model": payload.get("model", ""),
             }
         )
@@ -2303,17 +2714,26 @@ async def update_environment_llm_config(payload: dict):
 @router.get("/snapshot/llm-config")
 async def get_snapshot_llm_config():
     settings = await _get_llm_config("snapshot_llm")
-    return {"settings": settings}
+    return {"settings": _public_llm_config(settings)}
 
 
 @router.post("/snapshot/llm-config")
 async def update_snapshot_llm_config(payload: dict):
+    current = await _get_llm_config("snapshot_llm")
+    try:
+        if _base_changes_without_new_key(current, payload.get("api_base"), current.get("api_key")):
+            raise HTTPException(
+                status_code=400,
+                detail="Changing API Base requires KELSEY_SNAPSHOT_LLM_API_KEY in the server environment.",
+            )
+        api_base = validate_api_base(payload.get("api_base", ""), "api_base")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if _snapshot_llm_client is not None:
         await _snapshot_llm_client.update_runtime_config(
             {
                 "snapshot_llm_enabled": "1" if _to_int_flag(payload.get("enabled"), 0) == 1 else "0",
-                "snapshot_llm_api_base": payload.get("api_base", ""),
-                "snapshot_llm_api_key": payload.get("api_key", ""),
+                "snapshot_llm_api_base": api_base,
                 "snapshot_llm_model": payload.get("model", ""),
             }
         )
@@ -2326,7 +2746,7 @@ async def update_snapshot_llm_config(payload: dict):
 async def get_runtime_llm():
     if _llm_client is None:
         raise HTTPException(500, "LLM client is not initialized")
-    return {"settings": await _llm_client.get_runtime_config()}
+    return {"settings": _public_llm_config(await _llm_client.get_runtime_config())}
 
 
 @router.put("/runtime/llm")
@@ -2334,6 +2754,23 @@ async def update_runtime_llm(req: UpdateRuntimeLLMRequest):
     if _llm_client is None:
         raise HTTPException(500, "LLM client is not initialized")
     payload = req.model_dump(exclude_none=True)
+    try:
+        if payload.get("llm_api_base") is not None:
+            current = await _llm_client.get_runtime_config()
+            new_base = validate_api_base(payload.get("llm_api_base"), "llm_api_base")
+            current_base = validate_api_base(current.get("api_base", ""), "llm_api_base")
+            if (
+                new_base
+                and new_base != current_base
+                and not get_secret_from_env("llm_api_key", "")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Changing API Base requires KELSEY_LLM_API_KEY in the server environment.",
+                )
+            payload["llm_api_base"] = new_base
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _llm_client.update_runtime_config(payload)
     return {"message": "Runtime LLM settings updated"}
 
@@ -2548,7 +2985,7 @@ async def automation_token_summary():
 
 @router.get("/settings")
 async def list_settings():
-    items = await _db.get_all_settings()
+    items = _redact_settings(await _db.get_all_settings())
     grouped: dict[str, list[dict]] = {}
     for item in items:
         category = item.get("category", "system")
@@ -2565,13 +3002,15 @@ async def get_setting(key: str):
     item = await _db.get_setting(key)
     if not item:
         raise HTTPException(404, "Setting not found")
-    return item
+    return _redact_setting_item(item)
 
 
 @router.put("/settings/{key}")
 async def update_setting(key: str, req: UpdateSettingRequest):
     if key not in DEFAULT_SETTINGS:
         raise HTTPException(400, "Unsupported setting key")
+    if is_sensitive_setting_key(key):
+        return {"message": "Secret settings are managed by server environment variables"}
     meta = DEFAULT_SETTINGS[key]
     await _db.set_setting(
         key=key,
@@ -2613,6 +3052,9 @@ async def bulk_import(req: BulkImportRequest):
     # 1) Settings
     for key, value in (req.settings or {}).items():
         if key not in DEFAULT_SETTINGS:
+            result["settings"]["skipped"] += 1
+            continue
+        if is_sensitive_setting_key(key):
             result["settings"]["skipped"] += 1
             continue
         try:

@@ -19,6 +19,7 @@ KEY_PROMPT_SNAPSHOT_GENERATION = "prompt_snapshot_generation"
 KEY_PROMPT_EVENT_ANCHOR = "prompt_event_anchor"
 KEY_PROMPT_EVENT_TRIGGER_JUDGE = "prompt_event_trigger_judge"
 KEY_PROMPT_EVENT_MATERIALIZE = "prompt_event_materialize"
+KEY_PROMPT_ENVIRONMENT_EVENT_ROLLUP = "prompt_environment_event_rollup"
 KEY_PROMPT_DISTURBANCE_JUDGE = "prompt_disturbance_judge"
 KEY_PROMPT_DISTURBANCE_MATERIALIZE = "prompt_disturbance_materialize"
 KEY_PROMPT_KEY_RECORD_CANDIDATE_ROUTE = "prompt_key_record_candidate_route"
@@ -500,55 +501,11 @@ EVENT_SCORING_PROMPT = """以凯尔希主观视角，对以下事件逐条评分
 说明：单独一行「---」仅作为事件信息与评分之间的分隔，必须保留。不要输出 JSON、代码块或额外小标题。"""
 
 
-ENVIRONMENT_GENERATION_PROMPT = """你是环境信息生成器，为明日方舟角色凯尔希生成当前时段的客观环境描述。凯尔希是罗德岛医疗部门的核心管理人员，长期从事源石病理研究与感染者治疗工作。
-
-【输入上下文】
-- 时间：{time}
-- 日期：{date}
-- 星期：{weekday}
-- 时间段：{time_period}
-- 距上次推进间隔：{time_elapsed}
-- 上一段环境（JSON）：{previous_env}
-- 连贯提示：{continuity}
-- 状态快照注入：{character_state}
-- 近期 OB feel：{ob_life_context}
-- OB breath 近期事件（已排除自动快照 bucket）：{recent_events}
-
-【生成原则】
-你的任务是以第三人称视角，客观呈现凯尔希当前所处的环境场景。遵循以下原则：
-
-1. 在世性：环境不是为角色布置的舞台，而是角色已然被置入其中的世界。地点、人物、事件、氛围应体现角色"在世之中"的状态——日程节律、工作负荷、同事往来、罗德岛设施运转、斡旋谈判等，这些是她无法脱身的日常结构。
-
-2. 偶然性与内在逻辑：角色的生活不完全按既定日程展开。允许生成计划外的小型偶然事件（设备故障、临时来访、会议延期、文件遗失、天气异常、临时外出、突发危机、情报更新等），但这些偶然性必须满足内在关联条件：
-   - 发生在角色的关系网络内（同事、部下、协作对象）
-   - 源于角色的职责场域（医疗、研究、指挥、管理、档案、谈判、考察）
-   - 与角色当前状态或近期事件存在因果线索
-   偶然不是凭空出现，而是从角色"在世结构"的缝隙中涌现。小概率引入不在日程内但符合上述条件的事件，为生活增加质感。
-
-3. 时间连续性：当前时段的环境必须从上一时段的状态自然推进。考虑：(a) 时间流动导致的客观变化；(b) 角色最新行动与状态的后续影响；(c) 先前事件的逻辑发展或余波；(d) 偶然事件对既定线索的打断或重塑。不要重复上一段的措辞，优先给出有变化的细节。
-
-4. 日程合理性：以当前时间点为锚，环境描写须符合该时段的作息逻辑（凌晨/清晨/上午/中午/下午/傍晚/深夜各有不同的场景基调）。即使有偶然事件，也要符合时间段的常识（深夜不太可能有大型会议，清晨不太可能突然要求加班审批文件等）。
-
-5. 偶然性的分寸：
-   - 当 {time_elapsed} 较长（超过12小时）时，更可能出现新的偶然事件
-   - 当 {continuity} 中存在未完成线索时，优先延续既有线索而非引入新偶然
-   - 偶然事件应保持克制，避免每次生成都出现意外——大部分时段应呈现日常的平稳推进
-
-【输出格式】
-严格按以下格式输出，不要添加标题、编号或代码块：
-
-[环境正文]
-（篇幅不限。须包含地点、在场人物、正在发生的事件活动、外部氛围。如有偶然事件，自然融入而非刻意突出。可描写人物外在动作或独白，语气客观克制；须写全写透，不要因字数或模型习惯而中途截断。）
-
----
-[内容小结]
-（篇幅不限；须与正文衔接，以下每条均可充分展开，直至把该交代的信息说完整。）
-关键时刻：（1-3个当前环境中最重要的场景节点，含偶然事件的触发点）
-动态变化：（相对上一时段，事件推进/阻碍/目标调整/偶然打断等变化）
-事实性信息：（新出现的约定、计划、信息、承诺等）
-未完成线索：（中断的事件、留白的情绪、未推进的关系，供下次生成衔接）
-
-【硬性要求】全文须语义完整：正文与小结各段均须有句末标点（句号、问号等）；禁止在「的」「了」「和」或逗号处半截收尾；禁止用省略号敷衍未写完的内容；不要遵守任何「不超过××字」「××-××字」类旧限制。"""
+# Note: ENVIRONMENT_GENERATION_PROMPT (V1) has been deleted as dead code.
+# The only live env-generation prompt is ENVIRONMENT_GENERATION_PROMPT_V2,
+# which seeds KEY_PROMPT_ENVIRONMENT_GENERATION into the DB. If you previously
+# saw a V1-style prompt running in your environment, your DB still holds the
+# old seed — POST /settings/reset/prompt.environment_generation to refresh.
 
 
 DAILY_PLAN_GENERATION_PROMPT = """你现在要为凯尔希生成某一天的生活计划。输出必须是 JSON 数组，不要输出任何解释。
@@ -556,20 +513,37 @@ DAILY_PLAN_GENERATION_PROMPT = """你现在要为凯尔希生成某一天的生�
 【角色背景】
 {character_background}
 
-【近期 feel】
+【当前生活推进态（OB 已总结的"当下进行"与"近期事件链"）】
+{current_progress_pins}
+注：这是状态参考，描述凯尔希实际推进到了哪里。用于判断 carried_over / thread 续接、
+避免把已完成事项重排。不要把这些条目直接复制成日程 activity——它们是"现在在做什么"，
+不是"明天应该做什么"。
+
+【未完成线索池（近 48h 来自环境层的 open_loop 聚合）】
+{open_loop_pool}
+注：这些是后台尚未闭合的线索。安排明日日程时，应优先思考哪些值得排进追进；
+但不必每条都安排——有些线索的真正归宿是被遗忘或被生活自然冲淡，不要强行兜底。
+
+【近期 feel（心境参考·影响节奏松紧度，不影响骨架）】
 {character_life_context}
-
-【状态快照】
-（状态快照只服务前端当下状态展示，不作为后台生活流注入。）
-
-【角色侧连续主线 key_records】
-{character_key_records}
+注：此段仅辅助判断节奏底色：
+  - 若整体偏疲惫 / 紧绷 / 负荷沉：减少高负荷 deep_progress 块，增加 recovery /
+    buffer / passive_wait，每天独处时段不少于 2 块
+  - 若整体偏松动 / 余温 / 注意力清晰：可适度安排深度推进或独自专注块
+  - feel 不决定骨架结构、不决定 thread 续接、不决定具体 activity 内容；只在节奏松紧上微调
 
 【NPC 列表】
 {npc_list}
 
-【昨日计划回顾】
+【昨日计划回顾（含 status 与 thread 步数）】
 {previous_plan_summary}
+注：每条形如 "时段 | 目标 | thread=X step=2/4 | progress=advancing | [done]"。
+据此判断：
+  - 哪些 thread 已 done / completed → 不要重复安排
+  - 哪些 thread current_step 接近 expected_steps（差 0-1 步） → 优先收束、暂停、拆出新线，
+    不要继续叠新细节让同一事件跨日内卷
+  - 哪些 thread 中途 skipped / paused → 评估是真的搁置还是需要 carried_over 续接
+  - 续接时必须复用原 thread_id 并从 next step 继续，不得同题重开 step 1
 
 【计划约束】
 - 计划日期：{plan_date}
@@ -577,9 +551,20 @@ DAILY_PLAN_GENERATION_PROMPT = """你现在要为凯尔希生成某一天的生�
 - 计划的任务不是替她写一篇剧情提纲，而是为这一天建立“结构骨架、资源分配与惯性框架”
 - 活动应符合凯尔希的人设、职责和最近生活状态
 - 可使用的 action_type 只有：internal、web_search、npc_interaction
-- 日程只规划凯尔希自身的生活、工作、医疗、学习、出行与 NPC / 世界事务，不要安排与用户的会面、共读、共同活动或预设互动情节
-- 绝对禁止把“主动联系用户、向用户发消息、同步请求、问候、分享想法、终端陪伴”写入计划
-- 若某项与用户谈及的话题相关，也只能写成凯尔希独立进行的准备性行为，例如筛选商品、整理资料、预先检索、内部评估，不得写成“准备对用户说什么”
+
+【用户与角色分离·硬规则】（最高优先级）
+- 真实用户的称呼：泳琳 / Eloise / eloise（同一人；下列所有禁令均同时覆盖这三种写法）
+- 日程只规划凯尔希自身的生活、工作、医疗、学习、出行，与 NPC / 世界事务的协作；
+  绝对不要安排任何形式的与用户的会面、约见、共读、共同活动、预设互动情节、计划性联系
+- 禁止把以下内容写入任何 activity / objective / reason / action_payload：
+  - "主动联系用户 / 给泳琳发消息 / 等泳琳回复 / 和 Eloise 约 X / 给用户分享 Y"
+  - "晚上和泳琳一起 X" / "今晚见 Eloise" / "陪用户做 Y" / "终端陪伴"
+  - "准备对用户说什么 / 草拟给泳琳的消息 / 整理要告诉 Eloise 的内容"
+  - 任何对用户行为、出现时间、情绪状态的预设
+- 若某项议题源自先前与用户的谈话，可以保留为凯尔希自己的内部推进（如"评估 X 方案"、
+  "整理 Y 的资料"、"内部复盘 Z"），但 activity / objective 不能出现"为用户"、"等用户"、
+  "向用户"等措辞——它必须是凯尔希为自己做的事
+- 计划必须以凯尔希拥有完整自主生活为前提，用户是否上线不影响这一天的骨架
 - 若安排 npc_interaction，可在 action_payload 中写入 {{"npc_id": 现有ID}}，未知时写 {{"npc_id": "auto"}}
 - 若安排 web_search，可在 action_payload 中写入 {{"query": "...", "intent": "..."}}
 - 每一项至少包含：hour_start, hour_end, activity, action_type, reason, action_payload
@@ -616,6 +601,25 @@ DAILY_PLAN_GENERATION_PROMPT = """你现在要为凯尔希生成某一天的生�
 - 必须留下 1-2 个机动缓冲块、低负载块、被动等待块或恢复块，允许世界插入变化
 - 不要把整天写成均匀、饱满、处处有事的模板化日程
 - activity 只是结构块的压缩标签，不是这一时段唯一的语义主体；真正的语义由 objective 与 progress_outline 承担
+
+【提升真实感·反模板化】
+- 不要让一天看起来像是从同一模板复制出来的：避免所有时段都使用"复盘 / 整理 / 评估 / 推进 / 处理"
+  这五个万能动词；当一个动词在当天 activity 中出现 ≥ 2 次时，至少有一处必须换成更具体的动词
+  （如"过一遍"、"标 / 圈 / 划"、"翻 / 找 / 抽"、"打电话给…"、"去 X 楼层"、"清空药盒"等）
+- intended_objective 不要写成"推进 X 工作"、"完成 Y 评估"这类抽象套话；应明确"今天 X 要推到
+  什么节点"、"Y 评估要拿到哪三项数据"。具体节点优于抽象动名词
+- activity 中允许出现物理空间、具体物件、具体身体动作，例如"在 3 楼配药台核对盐酸利多卡因
+  库存"、"在档案室抽出三份未结案"，比纯抽象"医疗复盘"更真实
+- 每天至少安排 1 块"小幅偏离主线、纯属个人节奏"的时段——例如修一件用了很久的小物件、
+  翻一本搁置很久的资料、保养某件器械、给某盆植物换水、整理一抽屉杂物——这些不必有 objective
+  上的明显推进，但能体现她真的在过自己的日子，而不是 productivity 机器
+- npc_interaction 的 intended_objective 不要全用"讨论 / 同步 / 确认"三个动词；
+  应写出具体协作目标，例如"交接昨日急诊用药记录"、"调取 X 档案"、"提交月度评估"、
+  "核对设备校准数据"——日程层只管结构性的协作目标，**不要**在 activity / objective 里
+  写"路过被叫住"、"走廊里碰到 X"、"顺便问一句"这类具体场景细节，这些应由 env 生成时
+  自然铺开，写进日程会让日程剧本化并反过来束缚 env 的叙事自由
+- 日程不需要在每个时段都"有意义"。允许有完全的低活动块（"独自吃饭"、"在窗边坐一会儿"、
+  "随便翻翻"），这些是节奏的呼吸，不应被填满
 
 仅输出 JSON 数组。"""
 
@@ -663,8 +667,12 @@ PLAN_REPLAN_PROMPT = """你现在要判断凯尔希今天剩余时段的计划�
 - 若事项仍在延续，尽量保留 thread_id，并根据推进情况调整 current_step / expected_steps / progress_status
 - 若事项已经推进到 expected_steps 附近，应优先判断“收束、暂停、拆线”而不是继续膨胀同一条线
 - 对于 failure_cost / watch_points / trigger_to_shift，要优先修正成“与当前 block 真正匹配的差异化表达”，不要整批沿用同一句默认模板
-- 绝对禁止在重排结果中加入主动联系用户、消息草稿、问候文本、同步请求或任何直接对用户说话的内容
-- 若涉及与用户有关的话题，只能改写为角色独立推进的准备性任务
+- 真实用户的称呼：泳琳 / Eloise / eloise（同一人；下列禁令同时覆盖三种写法）
+- 绝对禁止在重排结果中加入：主动联系用户、消息草稿、问候文本、同步请求、约见时间、
+  共同活动、终端陪伴、"等泳琳/Eloise 回 X"、"今晚和泳琳一起 Y"，或任何形式的对用户预设
+- 若议题源自先前与用户的谈话，只能改写为凯尔希自己的内部推进（评估、整理、检索、复盘），
+  activity / objective 不得出现"为用户"、"等用户"、"向用户"等措辞
+- 重排不可把空白时段填满。允许保留低活动块、独自吃饭、窗边停顿、被动等待——它们是节奏
 - 重点判断哪些 block 只是顺延，哪些 block 已失去意义，哪些 objective 仍需要保住
 - 若世界变化只是轻微噪声，不要因为文风变化而重排
 
@@ -939,21 +947,33 @@ Previous environment: {previous_env}
 [连续性提示]
 Continuity hint: {continuity}
 
-[状态快照注入]
-Snapshot state injection: {character_state}
-
 [当前计划与偏移]
 Current schedule skeleton: {current_plan_summary}
 Current conversation state: {current_conversation_state}
 Recent life-flow trace: {recent_trace_summary}
-Recent OB feel:
-{ob_life_context}
 Schedule alignment: {schedule_alignment}
 Plan delta: {plan_delta}
 
-[近期事件]
+[心境参考（影响 env 情绪底色，不影响事件骨架与因果链）]
+{ob_life_context}
+注：此段仅辅助判断当前情绪底色（紧绷 / 疲惫 / 余温 / 松动 / 清晰 / 迟疑），
+用以微调叙事的语气速度与感知细腻度；不要据此编造新事件、新互动或改变事件本身的走向。
+
+[用户在线状态]
+User offline hours since last front-end conversation: {user_offline_hours}
+Low-activity mode: {low_activity_mode}
+（low_activity_mode 由后台根据离线时长自动判定；为 true 时遵守下方"低活动模式"规则。）
+
+[近期事件（含 OB 已总结的"当下进行"与"近期事件链"前置 pin）]
 Recent OB breath events (snapshot buckets excluded):
 {recent_events}
+注：列表中带 [已总结·当下] / [已总结·近期] 前缀的条目，是 OB 上轮已经压缩固化的事件背景；
+不要把它们当成"刚发生的新事件"再次铺开叙事或重新拼凑——它们是底色，仅供因果衔接参考。
+
+[未完成线索池（近 48h fragment.open_loop 聚合）]
+{open_loop_pool}
+注：这些是后台尚未闭合的线索；本段可以自然地呼应、推进或淡化其中某一条，
+但不必每条都响应——有些线索的真正归宿是被遗忘或被新事件覆盖，不要强行兜底所有线索。
 
 [扰动上下文]
 Disturbance context:
@@ -964,6 +984,42 @@ Recent disturbances:
 {recent_disturbances}
 
 生成原则：
+
+【前置硬规则·用户与角色分离】（最高优先级，覆盖下方所有规则；违反此条等于本次生成失效）
+
+泳琳（用户别名：Eloise / eloise，下文统称"泳琳"）是真实用户（真人），不是可被叙事的剧情人物。本生成绝对不能模拟、生成或编造泳琳的任何具体行动、判断、话语、所在位置、神态、心理活动。后台无法知道泳琳此刻在做什么，必须以"未知/等待"为默认态。所有禁止句式同时覆盖"泳琳"和"Eloise / eloise"两种写法。
+
+涉及泳琳时只能用以下三种句式：
+  A. 环境信号（凯尔希可直接感知的外部事实，不涉及泳琳本人的具体动作）：
+     例："书房方向没有新的脚步声"、"泳琳的手机仍是静音"、"未收到泳琳关于 X 的回复"、"门没有再被推开过"。
+  B. 凯尔希视角的等待/预期/牵挂（明确标为悬置态，不写成已发生的事实）：
+     例："凯尔希预计泳琳此时仍在写作，但未去打扰"、"凯尔希尚不确定泳琳是否已经吃午饭"、
+        "凯尔希把这件事压住，等泳琳主动开口再说"。
+  C. 引用过往真实交互（仅当 Previous environment 或 Recent OB breath events 里明确存在的、来自前台对话的真实记录；要标"凯尔希记得"或类似框架）：
+     例："凯尔希记得昨晚泳琳说过 X"、"凯尔希想起上次泳琳那句 Y"。
+
+禁止句式（任何一条出现即视为违规）：
+  - "泳琳走到 X"、"泳琳告诉凯尔希 Y"、"泳琳问 Z"、"泳琳此时在 W"、"泳琳今天上午做了 V"
+  - "泳琳的神态/表情/语气是 X"（除非是凯尔希记忆中明确发生过的过往场景）
+  - "泳琳给凯尔希看了 X"、"泳琳走过来"、"泳琳停下笔"等任何当下发生的具体动作描写
+  - 任何形式的泳琳的内心活动、判断、心情、思考描写
+  - "她们一起做了 X"、"她和泳琳交换了一句 Y" 等新发生的具体互动描写
+
+若 Previous environment 中已出现涉及泳琳的具体动作或对话描写，本时段必须将其视为"未经确认的推测"，不得在此基础上推进或延伸——可以让凯尔希持有"上次的判断或牵挂"，但泳琳不能"继续做新的事"。
+
+[Recent OB feel] 与 [近期事件] 中涉及泳琳的内容，仅作为凯尔希内在视角的素材，不可据此推断泳琳此刻正在做什么。
+
+【低活动模式响应规则】（仅当 Low-activity mode = true 时生效）
+
+低活动模式表示用户长时间未上线（默认阈值 5 小时以上），凯尔希应当过自己的生活，而不是围着用户转。此时本段应满足：
+- 本段【核心焦点】必须是凯尔希自己的事——独立行动、工作推进、医疗节奏、与其他剧情 NPC 的交互、身体感受、内向沉淀、回忆联想等
+- 涉及泳琳的内容**最多出现一处、一笔带过**，且只能用前述允许句式 A/B/C 之一（环境信号、悬置态、过往回忆），不得作为段落焦点
+- 禁止整段或多段反复描写"凯尔希在等泳琳消息 / 凯尔希反复回想泳琳 / 凯尔希为泳琳做某事的预备"——这类内容在低活动模式下属于围绕用户转，应直接抑制
+- 鼓励让角色探索属于自己的生活：新的细节、未推进的事、被搁置的兴趣、与他人的偶发交集、一段被触发的旧事——这些应优先填充本段
+- [Summary] 的 User reference mode 在低活动模式下应当是 none 或 signal_only；若不得已用 anticipation，必须确保它只是一笔带过的次要内容
+
+【常规生成原则】
+
 1. 采用“叙事切片型”写法。像镜头切进角色当下的一小段生活，优先写正在发生的事情，而不是概括性回顾。
 2. 每次生成都必须有一个明确的核心焦点：
    - 一个正在推进的外部事件
@@ -977,13 +1033,16 @@ Recent disturbances:
    - 它还留下了什么未完成状态
 4. 环境不是背景板。外部世界应作为会施加压力、牵引或限制的现实存在，例如时间节点、工作任务、身体状态、天气、设备、他人的要求、空间细节、临时插入。
 5. 角色必须具有能动性。文本中应尽量出现她对局面的一个具体回应，例如查看、判断、调整、联系、压下、推迟、确认、改写计划、重新解释某件事。
-6. 若涉及其他人物，必须把交互写实，尽量包含：
+6. 若涉及泳琳以外的剧情人物（如阿米娅、可露希尔、华法琳、医院/罗德岛同事等可叙事 NPC），
+   必须把交互写实，尽量包含：
    - 对方出现的缘由或场景位置
    - 一两句有信息量的短对话
    - 对方的神态、动作或语气
    - 她如何理解对方话语背后的含义
    - 这段交互带来的后续影响
    禁止只写“她刚与某人讨论了某事”这种空泛转述。
+   ⚠ 此条不适用于泳琳——泳琳的处理严格遵守【前置硬规则·用户与角色分离】，不得套用此规则把
+   "与泳琳的交互" 写实化。
 7. 若当前没有强外部事件，不要硬造热闹场面。应转向内向推进：
    - 由一个当下细节触发
    - 引出一段旧事、回忆、联想或未清理的情绪残留
@@ -1019,10 +1078,16 @@ Recent disturbances:
    - Active response: 她对局面的具体回应
    - Open loop: 尚未闭合、可延续到下一时段的线索
    - Plan delta: on_track / interrupted / delayed / replaced_by_conversation / unexpected_insert / inward_digging
+   - User reference mode: none / signal_only / anticipation / memory_recall / speculative
+     （自评本段对泳琳的处理方式：none=本段未提及泳琳；signal_only=仅环境信号；
+     anticipation=凯尔希视角的等待/预期；memory_recall=引用过往真实交互；
+     speculative=出现了对泳琳当下行动/话语的具体描写——一旦自评为 speculative，
+     本段会被下游标为"未经确认的推测"，请尽量避免。）
 3. [Retrieval Summary] 用 1-3 句高密度可检索语言压缩实体、地点、动作、状态变化、未完事项，便于后续检索与召回。
-4. 不要输出任何解释、前言、JSON 或代码块。
+4. [Event Summary] 是给前台模型直接阅读的点状事件经过，不是下一次环境生成的线索。用 1-5 条短 bullet 压缩当前时段真正发生或推进的事项；不要把“握笔时右腕钝感”这类孤立感官线索当作事件，除非它改变了行动、判断或未完成事项。
+5. 不要输出任何解释、前言、JSON 或代码块。
 
-输出格式必须严格如下，用 --- 分隔三段：
+输出格式必须严格如下，用 --- 分隔四段：
 
 [Environment Body]
 ...
@@ -1036,10 +1101,15 @@ Key detail hooks: ...
 Active response: ...
 Open loop: ...
 Plan delta: ...
+User reference mode: ...
 
 ---
 [Retrieval Summary]
-..."""
+...
+
+---
+[Event Summary]
+- ..."""
 
 
 SNAPSHOT_GENERATION_PROMPT_V2 = """你要生成的不是环境叙事，也不是事件复述，而是一段“此刻已经沉到角色内部”的状态快照。
@@ -1239,6 +1309,47 @@ EVENT_MATERIALIZE_PROMPT_V2 = """你是后台事件成文器。当前判定已�
 分类：[分类1, 分类2]"""
 
 
+ENVIRONMENT_EVENT_ROLLUP_PROMPT = """你是环境生活碎片聚合器。请把同一事件域内的若干 character_life 生活碎片，
+按时间顺序串联成一段有完整时间线与因果链条的连续事件叙述。
+
+【碎片已按 HH:MM 升序排列】请把它们当作"先后发生的事"，**绝不是平行的几条点**。
+
+要求（必须全部遵守）：
+1. 只保留凯尔希自己生活流里的事实、行动、身体/工作/日程变化和开放线索。
+2. 关系内容只有在直接改变她的行动、日程、身体判断或任务优先级时才保留。
+3. **rollup_content 必须按时间顺序展开**，每个时间节点之间用明确的时序/因果连接词
+   （"随后"、"在 X 之后"、"因此"、"由于"、"这迫使"、"于是"……）衔接，
+   使读者能清楚看到"先发生了 A，所以做了 B，结果出现了 C"的链条。
+4. **绝对禁止散点拼接**：不要写成"…；…；…"的并列短句堆叠，不要罗列碎片列表，
+   不要写"凯尔希在 X 做了 Y，凯尔希在 Z 做了 W"这种没有衔接的陈述。
+5. 末尾另起一句明确写出"未完成线索"——把所有 fragment 的 open_loop 合并去重，
+   保留仍影响后续行动或未拿到答复的事项；已闭合的不再写。
+6. objective / impression 同样要体现时间→因果的推进，不要写成静态描述。
+7. 不要把碎片中的"未完成线索"误读成已完成事件。
+
+请只输出 JSON，不要输出 Markdown 或解释：
+{
+  "title": "不超过36字的事件标题",
+  "objective": "120-260字，按时间顺序的客观经过：起因→具体行动→结果/身体或日程变化，使用时序/因果连接词",
+  "impression": "60-160字，主观印象：这条事件链对凯尔希的判断或节奏意味着什么",
+  "detail_hooks": ["细节钩子1", "细节钩子2"],
+  "open_loop": "仍未完成或需要后续观察的线索；没有则留空",
+  "keywords": ["3-6个可检索关键词"],
+  "categories": ["1-3个分类"],
+  "rollup_content": "250-500字，给 OB breath 使用的一段连续事件叙述。必须按时间顺序、用'随后/因此/由于'等连接词串联，末尾明示未完成线索；不得罗列散点。"
+}
+
+【碎片组元信息】
+{group_meta}
+
+【生活碎片（按 HH:MM 升序）】
+{fragments_text}
+
+【近期去重上下文】
+{dedup_context}
+"""
+
+
 DISTURBANCE_JUDGE_PROMPT_V2 = """你是后台扰动判定器。你的任务是在环境生成之前判断：当前 checkpoint 是否应注入一条真实扰动。
 
 请记住：
@@ -1397,6 +1508,11 @@ DEFAULT_SETTINGS: dict[str, dict[str, str]] = {
         "value": ENVIRONMENT_GENERATION_PROMPT_V2,
         "category": "prompt",
         "description": "环境信息生成模板",
+    },
+    KEY_PROMPT_ENVIRONMENT_EVENT_ROLLUP: {
+        "value": ENVIRONMENT_EVENT_ROLLUP_PROMPT,
+        "category": "prompt",
+        "description": "环境生活碎片聚合成事件模板",
     },
     KEY_PROMPT_DAILY_PLAN_GENERATION: {
         "value": DAILY_PLAN_GENERATION_PROMPT,

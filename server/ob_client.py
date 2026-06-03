@@ -126,19 +126,46 @@ class OBClient:
         arousal: float | None = None,
         include_archive: bool = False,
         importance_min: int = 0,
+        include_core: bool = True,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        include_character_life: bool = False,
     ) -> list[OBBucket]:
+        """OB breath: query / surface / feel routing.
+
+        ``date_from`` / ``date_to`` (optional YYYY-MM-DD or full ISO) filter candidates by
+        ``metadata.created`` (the WRITE date — touch/last_active does NOT shift this).
+
+        ``include_character_life`` 默认 False —— breath 默认**排除** character_life buckets。
+        理由：character_life 内容会大量浮现并掩盖关系侧/用户侧的回忆，造成"角色侧噪音"。
+        当调用方需要 character_life 内容时：
+          - 传 ``domain="character_life"`` （会自动包含，因为这是显式请求该 domain）
+          - 或传 ``include_character_life=True`` （混合返回）
+        breath_bundle 内部的 personal 三槽通过 `_character_life_pins` 直接走，不受此默认影响。
+        """
         query = str(query or "").strip()
         domains = self._domain_filter(domain)
         limit = max(1, min(50, int(limit or (3 if domains == {"feel"} else 8))))
+        date_window = self._normalize_date_window(date_from, date_to)
+        # 当 caller 显式传 character_life domain，等同于"请专门给我 character_life"
+        # → 自然应该包含 character_life；否则默认排除。
+        include_char_life = bool(include_character_life) or "character_life" in domains
 
         if domains == {"feel"}:
-            return await self._feel_breath(limit=limit)
+            return await self._feel_breath(
+                limit=limit,
+                date_window=date_window,
+                # 不显式包含 char_life 时，feel 池也禁止 char_life feel 渗透
+                max_character_life=1 if include_char_life else 0,
+            )
 
         if importance_min and not query:
             buckets = [
                 b for b in await self.list_buckets(include_archive=include_archive)
                 if self._bucket_type(b.metadata) != "feel"
                 and int(b.metadata.get("importance", 0) or 0) >= int(importance_min)
+                and self._bucket_in_date_window(b, date_window)
+                and (include_char_life or not self._is_character_life_bucket(b))
             ]
             buckets.sort(key=lambda b: int(b.metadata.get("importance", 0) or 0), reverse=True)
             for bucket in buckets:
@@ -153,18 +180,124 @@ class OBClient:
                 valence=valence,
                 arousal=arousal,
                 include_archive=include_archive,
+                date_window=date_window,
+                include_character_life=include_char_life,
             )
             for bucket in selected:
                 await self.touch(bucket.id)
             return selected
 
-        return await self._surface_breath(limit=limit, domains=domains)
+        return await self._surface_breath(
+            limit=limit,
+            domains=domains,
+            include_core=include_core,
+            date_window=date_window,
+            include_character_life=include_char_life,
+        )
 
-    async def _feel_breath(self, *, limit: int, max_character_life: int = 1) -> list[OBBucket]:
+    def _normalize_date_window(
+        self, date_from: str | None, date_to: str | None
+    ) -> tuple[datetime | None, datetime | None]:
+        """Parse YYYY-MM-DD or ISO datetime strings into a UTC-naive window tuple.
+
+        Returns (start_inclusive, end_inclusive). Either or both can be None — meaning open.
+        End-of-day semantics: when only a date string is given for date_to, extend to the
+        end of that day (so date_to=2026-05-27 includes everything up to 2026-05-27 23:59:59).
+        """
+        def _parse(value: str | None, *, end_of_day: bool) -> datetime | None:
+            if not value:
+                return None
+            raw = str(value).strip()
+            if not raw:
+                return None
+            parsed = self._parse_dt(raw)
+            if parsed is None:
+                # Accept bare YYYY-MM-DD even if _parse_dt is strict.
+                try:
+                    parsed = datetime.strptime(raw[:10], "%Y-%m-%d")
+                except Exception:
+                    return None
+            # If user passed only YYYY-MM-DD and end_of_day, push to 23:59:59.
+            is_date_only = len(raw) == 10 and raw.count("-") == 2
+            if end_of_day and is_date_only:
+                parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return parsed
+
+        return _parse(date_from, end_of_day=False), _parse(date_to, end_of_day=True)
+
+    def _bucket_in_date_window(
+        self,
+        bucket: OBBucket,
+        date_window: tuple[datetime | None, datetime | None],
+    ) -> bool:
+        start, end = date_window
+        if start is None and end is None:
+            return True
+        # 显式使用 `created` 而不是 `last_active`：date_from/date_to 语义是"按写入日期检索"——
+        # last_active 会被 breath/touch 反复刷新（每次浮现都改），用它做窗口会让同一条记忆
+        # 不断"漂移"出窗口。created 在写入后基本冻结（touch 不改、grow merge 也不改），
+        # 是稳定的写入时间锚点。
+        ts_raw = str((bucket.metadata or {}).get("created") or "").strip()
+        if not ts_raw:
+            # buckets without a created timestamp are not date-filterable; keep them inclusive.
+            return True
+        ts = self._parse_dt(ts_raw)
+        if ts is None:
+            return True
+        if start is not None and ts < start:
+            return False
+        if end is not None and ts > end:
+            return False
+        return True
+
+    # 一周保护窗：刚 crystallize 的 feel 仍然有现实连续性价值（角色对话中
+    # 可能会自然引用昨天的感受）。dream 每天晚上跑会把 feel 标 crystallized，
+    # 若立即从浮现池剔除，角色会觉得"昨天的事已经忘了"。允许 crystallized
+    # AND 距 crystallized_at（或 fallback 时间戳）≤7 天的 feel 继续浮现。
+    FEEL_CRYSTALLIZED_PROTECTION_DAYS = 7.0
+
+    def _feel_is_eligible(self, meta: dict) -> bool:
+        """Filter feel for breath: keep non-crystallized; keep crystallized within protection window."""
+        if not meta.get("crystallized"):
+            return True
+        age_days = self._bucket_age_days(
+            meta,
+            prefer_keys=("crystallized_at", "last_active", "created"),
+        )
+        return age_days <= self.FEEL_CRYSTALLIZED_PROTECTION_DAYS
+
+    def _bucket_age_days(self, meta: dict, *, prefer_keys: tuple[str, ...]) -> float:
+        """Return age in days using the first available timestamp key. 0.0 on parse failure."""
+        for key in prefer_keys:
+            ts_raw = str(meta.get(key) or "").strip()
+            if not ts_raw:
+                continue
+            try:
+                ts = self._parse_dt(ts_raw)
+            except Exception:
+                continue
+            if ts is None:
+                continue
+            try:
+                delta = datetime.utcnow() - ts
+            except Exception:
+                continue
+            return max(0.0, delta.total_seconds() / 86400.0)
+        return 0.0
+
+    async def _feel_breath(
+        self,
+        *,
+        limit: int,
+        max_character_life: int = 1,
+        date_window: tuple[datetime | None, datetime | None] | None = None,
+    ) -> list[OBBucket]:
+        window = date_window or (None, None)
         feels = [
             bucket for bucket in await self.list_buckets(include_archive=False)
             if self._bucket_type(bucket.metadata) == "feel"
-            and not bucket.metadata.get("crystallized")
+            and self._feel_is_eligible(bucket.metadata)
+            and self._bucket_in_date_window(bucket, window)
         ]
         feels.sort(key=lambda b: str(b.metadata.get("created") or ""), reverse=True)
         char_limit = max(0, min(int(max_character_life or 0), int(limit or 0)))
@@ -177,27 +310,44 @@ class OBClient:
                 continue
             other_items.append(bucket)
         selected = char_items + other_items[: max(0, int(limit or 0) - len(char_items))]
-        selected.sort(key=lambda b: str(b.metadata.get("created") or ""), reverse=True)
+        # Note: do NOT re-sort by created here; char_items must stay in front. They are
+        # already created-desc within each group because `feels` was sorted above.
         for bucket in selected:
             bucket.score = 50.0
         return selected[:limit]
 
-    async def _surface_breath(self, *, limit: int, domains: set[str]) -> list[OBBucket]:
+    async def _surface_breath(
+        self,
+        *,
+        limit: int,
+        domains: set[str],
+        include_core: bool = True,
+        date_window: tuple[datetime | None, datetime | None] | None = None,
+        include_character_life: bool = True,
+    ) -> list[OBBucket]:
+        window = date_window or (None, None)
         buckets = await self.list_buckets(include_archive=False)
         if domains:
             buckets = [b for b in buckets if self._matches_domains(b, domains)]
+        if window != (None, None):
+            buckets = [b for b in buckets if self._bucket_in_date_window(b, window)]
+        if not include_character_life:
+            buckets = [b for b in buckets if not self._is_character_life_bucket(b)]
 
         core_quota = min(2, limit)
-        pinned_core = [b for b in buckets if b.metadata.get("pinned")]
-        protected_core = [
-            b for b in buckets
-            if b.metadata.get("protected")
-            and not b.metadata.get("pinned")
-            and (
-                self._bucket_type(b.metadata) == "permanent"
-                or "core" in {str(d).strip() for d in b.metadata.get("domain", [])}
-            )
-        ]
+        pinned_core: list[OBBucket] = []
+        protected_core: list[OBBucket] = []
+        if include_core:
+            pinned_core = [b for b in buckets if b.metadata.get("pinned")]
+            protected_core = [
+                b for b in buckets
+                if b.metadata.get("protected")
+                and not b.metadata.get("pinned")
+                and (
+                    self._bucket_type(b.metadata) == "permanent"
+                    or "core" in {str(d).strip() for d in b.metadata.get("domain", [])}
+                )
+            ]
         for bucket in pinned_core + protected_core:
             bucket.score = self.calculate_score(bucket.metadata)
         pinned_core.sort(key=lambda b: str(b.metadata.get("created") or ""), reverse=True)
@@ -274,17 +424,248 @@ class OBClient:
             add(bucket)
         return selected[:limit]
 
+    async def breath_personal(self) -> dict[str, Any]:
+        """Lightweight 子功能：只返回 breath_bundle 的 personal 三槽。
+
+        同一对话内多次需要刷新"我最近做了什么 / 心境如何"时调用此工具，
+        节省 token——相当于把 breath_bundle 的第一层单独拆出来。
+
+        返回：
+          { "personal": [...至多 3 条 buckets..] }
+        三槽含义与 breath_bundle 的 personal 完全一致：
+          当下进行 / 近期总结 / 当下感受。
+        自然浮现不会 touch。
+        """
+        pin_dyn_active, pin_dyn_rollup, pin_feel = await self._character_life_pins()
+        personal: list[OBBucket] = []
+        used_ids: set[str] = set()
+        if pin_dyn_active is not None:
+            personal.append(
+                self._with_fixed_slot_marker(pin_dyn_active, "personal_event_active", "【个人事件·当下进行】")
+            )
+            used_ids.add(pin_dyn_active.id)
+        if pin_dyn_rollup is not None and pin_dyn_rollup.id not in used_ids:
+            personal.append(
+                self._with_fixed_slot_marker(pin_dyn_rollup, "personal_event_rollup", "【个人事件·近期总结】")
+            )
+            used_ids.add(pin_dyn_rollup.id)
+        if pin_feel is not None and pin_feel.id not in used_ids:
+            personal.append(self._with_fixed_slot_marker(pin_feel, "current_feeling", "【当下感受】"))
+            used_ids.add(pin_feel.id)
+        return {"personal": self.format_buckets(personal)}
+
     async def breath_bundle(self, *, top_k: int = 8, feel_top_k: int = 3) -> dict[str, Any]:
-        ordinary = await self.breath(limit=top_k)
-        feel = await self.breath(domain="feel", limit=feel_top_k)
+        """Return the 13-slot startup breath bundle as three grouped lists.
+
+        Layout (固定 13 槽，三组结构)：
+          personal   (3)：
+            ① 1 条 character_life dynamic·当下进行（source_kind=environment_event_summary
+               的固定 bucket character_life_latest_event；缺则取其他 character_life dynamic）
+            ② 1 条 character_life dynamic·近期总结（source_kind=environment_life_rollup
+               的最近一条聚合事件叙述）
+            ③ 1 条 character_life feel·当下感受
+          relational (8)：4 条非 character_life dynamic + 4 条 feel（允许至多 2 条 character_life feel 渗透关系侧）
+          free       (2)：不限标签/类型的自然浮现；显式排除 pinned/protected/permanent；
+                          按 score 取 top 5 后随机 shuffle 取 2，避免高分 bucket 永久霸榜。
+
+        pinned/protected principles 由 get_current_state 注入，这里不重复出现。
+        ``top_k`` / ``feel_top_k`` 保留为兼容参数但不再生效（固定 3+8+2=13）。
+        """
+        pin_dyn_active, pin_dyn_rollup, pin_feel = await self._character_life_pins()
+        used_ids: set[str] = set()
+
+        personal: list[OBBucket] = []
+        if pin_dyn_active is not None:
+            personal.append(
+                self._with_fixed_slot_marker(pin_dyn_active, "personal_event_active", "【个人事件·当下进行】")
+            )
+            used_ids.add(pin_dyn_active.id)
+        if pin_dyn_rollup is not None and pin_dyn_rollup.id not in used_ids:
+            personal.append(
+                self._with_fixed_slot_marker(pin_dyn_rollup, "personal_event_rollup", "【个人事件·近期总结】")
+            )
+            used_ids.add(pin_dyn_rollup.id)
+        if pin_feel is not None and pin_feel.id not in used_ids:
+            personal.append(self._with_fixed_slot_marker(pin_feel, "current_feeling", "【当下感受】"))
+            used_ids.add(pin_feel.id)
+
+        # Relational dynamics: 4 条非 character_life dynamic。
+        # 直接走 _surface_breath 拉混合候选池（含 character_life），绕过 breath() 的
+        # 新默认行为（默认排除 character_life）——breath() 默认排除只针对外部关键词检索场景，
+        # breath_bundle 是内部启动包装，需要混合候选池供 free 池"自由联想"。
+        # relational_dyn 内循环自己会过滤 character_life，不受影响。
+        dyn_candidates = await self._surface_breath(
+            limit=30, domains=set(), include_core=False
+        )
+        relational_dyn: list[OBBucket] = []
+        for bucket in dyn_candidates:
+            if len(relational_dyn) >= 4:
+                break
+            if bucket.id in used_ids:
+                continue
+            if self._is_character_life_bucket(bucket):
+                continue
+            if self._is_raw_environment_life_fragment(bucket):
+                continue
+            relational_dyn.append(bucket)
+            used_ids.add(bucket.id)
+
+        # Relational feel: 4 条 feel。允许至多 2 条 character_life feel 渗透关系侧——
+        # personal 槽已经占了最新那条，再让 2 条更早的 character_life feel 进入关系侧浮现，
+        # 配合 _feel_breath 的一周保护窗，对 dream 已 crystallize 的近期感受也能再上来。
+        feel_pool = await self._feel_breath(limit=20, max_character_life=2)
+        relational_feel: list[OBBucket] = []
+        for bucket in feel_pool:
+            if len(relational_feel) >= 4:
+                break
+            if bucket.id in used_ids:
+                continue
+            relational_feel.append(bucket)
+            used_ids.add(bucket.id)
+
+        relational = relational_dyn + relational_feel
+
+        # Free: 2 条自由浮现；防御 pinned/protected/permanent；top 5 score 后 shuffle 取 2。
+        free_pool: list[OBBucket] = []
+        seen_pool_ids: set[str] = set()
+        for bucket in dyn_candidates:
+            if bucket.id in used_ids or bucket.id in seen_pool_ids:
+                continue
+            if self._is_raw_environment_life_fragment(bucket):
+                continue
+            if self._is_protected_or_permanent(bucket):
+                continue
+            free_pool.append(bucket)
+            seen_pool_ids.add(bucket.id)
+        feel_extra = await self._feel_breath(limit=12, max_character_life=1)
+        for bucket in feel_extra:
+            if bucket.id in used_ids or bucket.id in seen_pool_ids:
+                continue
+            if self._is_protected_or_permanent(bucket):
+                continue
+            free_pool.append(bucket)
+            seen_pool_ids.add(bucket.id)
+        free_pool.sort(key=lambda b: float(getattr(b, "score", 0.0) or 0.0), reverse=True)
+        top_pool = free_pool[:5]
+        random.shuffle(top_pool)
+        free: list[OBBucket] = []
+        for bucket in top_pool:
+            if len(free) >= 2:
+                break
+            free.append(bucket)
+            used_ids.add(bucket.id)
+
         return {
-            "ordinary": self.format_buckets(ordinary),
-            "feel": self.format_buckets(feel),
-            "guidance": (
-                "ordinary 显示仍在场的事件/核心准则；feel 显示近期第一人称沉淀。"
-                "启动阶段只需读取 breath_bundle，不默认 dream。"
-            ),
+            "personal":   self.format_buckets(personal),
+            "relational": self.format_buckets(relational),
+            "free":       self.format_buckets(free),
         }
+
+    def _is_protected_or_permanent(self, bucket: OBBucket) -> bool:
+        """Defense for breath_bundle free pool: never let pinned/protected/permanent buckets
+        compete in free's score-sort. They get 999 score and would霸榜——defeating the
+        "自由联想" purpose of the free slots. They belong to get_current_state, not breath.
+        """
+        meta = bucket.metadata or {}
+        if meta.get("pinned") or meta.get("protected"):
+            return True
+        return self._bucket_type(meta) == "permanent"
+
+    async def _character_life_pins(
+        self,
+    ) -> tuple[OBBucket | None, OBBucket | None, OBBucket | None]:
+        """Pick three personal-group pins for breath_bundle.
+
+        Returns (pin_dyn_active, pin_dyn_rollup, pin_feel)：
+          - pin_dyn_active: 当下进行 — 优先 source_kind=environment_event_summary
+            （即固定 bucket character_life_latest_event），缺失则回退到其他
+            character_life dynamic（排除 rollup 与 raw fragment）。
+          - pin_dyn_rollup: 近期总结 — source_kind=environment_life_rollup
+            的最新一条聚合事件叙述。
+          - pin_feel: 当下感受 — 最新一条 character_life feel（未 crystallized）。
+
+        pinned/protected 跳过——它们由 get_current_state 注入，非短期记忆。
+        raw fragment 始终排除——它们是线索碎片，不算"事件"。
+        """
+        buckets = await self.list_buckets(include_archive=False)
+        active_summary: list[OBBucket] = []   # source_kind=environment_event_summary
+        active_other: list[OBBucket] = []     # 其他 character_life dynamic（非 rollup、非 fragment）
+        rollup_candidates: list[OBBucket] = []
+        feel_candidates: list[OBBucket] = []
+        for bucket in buckets:
+            if not self._is_character_life_bucket(bucket):
+                continue
+            meta = bucket.metadata or {}
+            if meta.get("pinned") or meta.get("protected"):
+                continue
+            if self._is_raw_environment_life_fragment(bucket):
+                continue
+            btype = self._bucket_type(meta)
+            source_kind = str(meta.get("source_kind") or "").strip().lower()
+            if btype == "dynamic" and not meta.get("resolved"):
+                if source_kind == "environment_life_rollup":
+                    rollup_candidates.append(bucket)
+                elif source_kind == "environment_event_summary":
+                    active_summary.append(bucket)
+                else:
+                    active_other.append(bucket)
+            elif btype == "feel" and not meta.get("crystallized"):
+                feel_candidates.append(bucket)
+
+        def _latest(items: list[OBBucket]) -> OBBucket | None:
+            if not items:
+                return None
+            items.sort(key=lambda b: str((b.metadata or {}).get("created") or ""), reverse=True)
+            return items[0]
+
+        pin_dyn_active = _latest(active_summary) or _latest(active_other)
+        pin_dyn_rollup = _latest(rollup_candidates)
+        pin_feel = _latest(feel_candidates)
+        return pin_dyn_active, pin_dyn_rollup, pin_feel
+
+    @staticmethod
+    def _is_raw_environment_life_fragment(bucket: OBBucket) -> bool:
+        meta = bucket.metadata or {}
+        return str(meta.get("source_kind") or "").strip().lower() == "environment_life_fragment"
+
+    def _with_fixed_slot_marker(self, bucket: OBBucket, slot_role: str, marker: str) -> OBBucket:
+        """Tag a pinned-group bucket with a header marker.
+
+        Score is recomputed via calculate_score (i.e. natural decay score) — we do NOT
+        force 999. The fixed-slot positioning is provided by breath_bundle's list order,
+        not by score. This keeps the bucket's normal decay/activation semantics intact.
+
+        Speculative-about-user 警示：若该 bucket 的 metadata 标了
+        ``speculative_about_user=True``（说明 env 生成时 LLM 自评为 speculative，
+        含有对用户行为的虚构描写），在 marker 后追加一行 ⚠ 提示，让前台模型
+        在对话中主动与用户确认，不要把这段内容当作"已发生事实"使用。
+        """
+        meta = dict(bucket.metadata or {})
+        meta["slot_role"] = slot_role
+        display_marker = marker
+        if meta.get("speculative_about_user"):
+            display_marker = f"{marker} ⚠ 含关于泳琳的推测内容，请在对话中确认后再当作事实使用"
+        content = str(bucket.content or "").strip()
+        if content and not content.startswith(display_marker):
+            content = f"{display_marker}\n{content}"
+        natural_score = self.calculate_score(meta)
+        return OBBucket(
+            id=bucket.id,
+            content=content,
+            metadata=meta,
+            path=bucket.path,
+            score=round(float(natural_score or 0.0), 2),
+        )
+
+    async def recent_pinned(self, *, limit: int = 5, include_archive: bool = False) -> list[OBBucket]:
+        buckets = [
+            bucket for bucket in await self.list_buckets(include_archive=include_archive)
+            if bucket.metadata.get("pinned")
+        ]
+        buckets.sort(key=lambda b: str(b.metadata.get("created") or ""), reverse=True)
+        for bucket in buckets:
+            bucket.score = self.calculate_score(bucket.metadata)
+        return buckets[: max(1, min(50, int(limit or 5)))]
 
     async def _query_breath(
         self,
@@ -295,7 +676,10 @@ class OBClient:
         valence: float | None,
         arousal: float | None,
         include_archive: bool,
+        date_window: tuple[datetime | None, datetime | None] | None = None,
+        include_character_life: bool = True,
     ) -> list[OBBucket]:
+        window = date_window or (None, None)
         buckets = [
             b for b in await self.list_buckets(include_archive=include_archive)
             if self._bucket_type(b.metadata) != "feel"
@@ -304,6 +688,10 @@ class OBClient:
         ]
         if domains:
             buckets = [b for b in buckets if self._matches_domains(b, domains)]
+        if window != (None, None):
+            buckets = [b for b in buckets if self._bucket_in_date_window(b, window)]
+        if not include_character_life:
+            buckets = [b for b in buckets if not self._is_character_life_bucket(b)]
 
         vector_scores: dict[str, float] = {}
         if self.embedding_store is not None:
@@ -396,13 +784,18 @@ class OBClient:
         min_cluster_size: int = 3,
         min_similarity: float = 0.7,
         cursor: str = "",
+        include_crystallized: bool = False,
     ) -> dict[str, Any]:
         limit = max(1, min(20, int(limit or 3)))
         max_items = max(1, min(20, int(max_items_per_cluster or 5)))
         min_size = max(2, min(20, int(min_cluster_size or 3)))
         threshold = max(0.0, min(1.0, float(min_similarity or 0.7)))
         offset = self._cursor_offset(cursor)
-        clusters = await self._feel_clusters(min_cluster_size=min_size, min_similarity=threshold)
+        clusters = await self._feel_clusters(
+            min_cluster_size=min_size,
+            min_similarity=threshold,
+            include_crystallized=include_crystallized,
+        )
         page = clusters[offset : offset + limit]
         formatted = [
             self._format_feel_cluster(cluster, max_items_per_cluster=max_items)
@@ -418,6 +811,7 @@ class OBClient:
             "max_items_per_cluster": max_items,
             "min_cluster_size": min_size,
             "min_similarity": threshold,
+            "include_crystallized": bool(include_crystallized),
             "cursor": str(offset) if offset else "",
             "cursor_snapshot": str(offset) if offset else "",
             "next_cursor": str(next_offset) if has_more else "",
@@ -434,6 +828,9 @@ class OBClient:
         *,
         mode: str,
         principle_content: str = "",
+        principle_title: str = "",
+        principle_card: dict[str, Any] | None = None,
+        principle_injection: str = "",
         feel_content: str = "",
         domain: list[str] | None = None,
         feel_ids: list[str] | None = None,
@@ -460,36 +857,71 @@ class OBClient:
         sources = [bucket for bucket in sources if self._bucket_type(bucket.metadata) == "feel"]
         now = datetime.utcnow().isoformat()
         created_ids: dict[str, str] = {}
+        signature = self._crystal_signature(
+            mode=normalized_mode,
+            source_ids=[bucket.id for bucket in sources],
+            principle_content=principle_content,
+            principle_title=principle_title,
+            principle_card=principle_card or {},
+            principle_injection=principle_injection,
+            feel_content=feel_content,
+            domain=domain or [],
+        )
+        existing_by_kind = await self._find_existing_crystal_outputs(signature)
 
         if normalized_mode in {"principle", "both"}:
-            content = str(principle_content or "").strip()
-            if not content:
-                content = self._default_crystal_content(sources)
-            if content:
-                created_ids["principle_bucket_id"] = await self.hold(
-                    content,
-                    tags=["feel_crystal", "principle"],
-                    importance=10,
-                    domain=domain or ["core"],
-                    bucket_type="permanent",
-                    pinned=True,
-                    protected=False,
-                    name="feel crystal principle",
-                    extra_metadata={"source_kind": "feel_crystal"},
+            existing_id = existing_by_kind.get("principle_bucket_id")
+            if existing_id:
+                created_ids["principle_bucket_id"] = existing_id
+            else:
+                content = self._format_principle_card_content(
+                    principle_content=principle_content,
+                    principle_title=principle_title,
+                    principle_card=principle_card,
+                    principle_injection=principle_injection,
                 )
+                if not content:
+                    content = self._default_crystal_content(sources)
+                if content:
+                    created_ids["principle_bucket_id"] = await self.hold(
+                        content,
+                        tags=["feel_crystal", "principle"],
+                        importance=10,
+                        domain=domain or ["core"],
+                        bucket_type="permanent",
+                        pinned=True,
+                        protected=False,
+                        name=str(principle_title or "").strip() or "feel crystal principle",
+                        extra_metadata={
+                            "source_kind": "feel_crystal",
+                            "crystal_signature": signature,
+                            "crystal_output": "principle",
+                            "principle_title": str(principle_title or "").strip(),
+                            "principle_card": principle_card or {},
+                            "principle_injection": str(principle_injection or "").strip(),
+                        },
+                    )
 
         if normalized_mode == "feel":
-            content = str(feel_content or "").strip() or self._default_crystal_content(sources)
-            if content:
-                created_ids["feel_bucket_id"] = await self.hold(
-                    content,
-                    tags=["feel_crystal", "condensed"],
-                    importance=6,
-                    domain=[],
-                    bucket_type="feel",
-                    name="condensed feel",
-                    extra_metadata={"source_kind": "feel_crystal"},
-                )
+            existing_id = existing_by_kind.get("feel_bucket_id")
+            if existing_id:
+                created_ids["feel_bucket_id"] = existing_id
+            else:
+                content = str(feel_content or "").strip() or self._default_crystal_content(sources)
+                if content:
+                    created_ids["feel_bucket_id"] = await self.hold(
+                        content,
+                        tags=["feel_crystal", "condensed"],
+                        importance=6,
+                        domain=[],
+                        bucket_type="feel",
+                        name="condensed feel",
+                        extra_metadata={
+                            "source_kind": "feel_crystal",
+                            "crystal_signature": signature,
+                            "crystal_output": "feel",
+                        },
+                    )
 
         targets = [value for value in created_ids.values() if value]
         targets.extend(str(value) for value in (extra_targets or []) if str(value or "").strip())
@@ -504,13 +936,70 @@ class OBClient:
                 crystallized_mode=normalized_mode,
                 crystallized_into=targets,
                 crystallized_at=now,
+                crystal_signature=signature,
             )
         return {
             "mode": normalized_mode,
             "source_feel_ids": [bucket.id for bucket in sources],
             **created_ids,
             "marked_count": len(sources),
+            "deduped": bool(existing_by_kind),
         }
+
+    async def feel_cluster_sources(
+        self,
+        *,
+        cluster_id: str = "",
+        feel_ids: list[str] | None = None,
+        include_all: bool = False,
+        min_cluster_size: int = 3,
+        min_similarity: float = 0.7,
+        include_crystallized: bool = False,
+    ) -> list[OBBucket]:
+        source_ids = [self._safe_id(item) for item in (feel_ids or []) if str(item or "").strip()]
+        if cluster_id and include_all:
+            cluster = await self._get_feel_cluster_by_id(
+                cluster_id,
+                min_cluster_size=min_cluster_size,
+                min_similarity=min_similarity,
+                include_crystallized=include_crystallized,
+            )
+            if cluster:
+                source_ids = list(cluster["ids"])
+        source_ids = list(dict.fromkeys(source_ids))
+        sources = [bucket for bucket in [await self.get(bid) for bid in source_ids] if bucket]
+        return [bucket for bucket in sources if self._bucket_type(bucket.metadata) == "feel"]
+
+    async def uncrystallize_feel(
+        self,
+        *,
+        cluster_id: str = "",
+        feel_ids: list[str] | None = None,
+        include_all: bool = False,
+        min_cluster_size: int = 3,
+        min_similarity: float = 0.7,
+    ) -> dict[str, Any]:
+        sources = await self.feel_cluster_sources(
+            cluster_id=cluster_id,
+            feel_ids=feel_ids,
+            include_all=include_all,
+            min_cluster_size=min_cluster_size,
+            min_similarity=min_similarity,
+            include_crystallized=True,
+        )
+        restored: list[str] = []
+        for bucket in sources:
+            await self.update(
+                bucket.id,
+                crystallized=False,
+                digested=False,
+                crystallized_mode="",
+                crystallized_into=[],
+                crystallized_at="",
+                crystal_signature="",
+            )
+            restored.append(bucket.id)
+        return {"restored_count": len(restored), "source_feel_ids": restored}
 
     async def resolve(self, bucket_id: str, *, reason: str = "") -> bool:
         updates: dict[str, Any] = {
@@ -915,13 +1404,19 @@ class OBClient:
             logger.exception("OB dream crystal hint failed")
         return ""
 
-    async def _feel_clusters(self, *, min_cluster_size: int, min_similarity: float) -> list[dict[str, Any]]:
+    async def _feel_clusters(
+        self,
+        *,
+        min_cluster_size: int,
+        min_similarity: float,
+        include_crystallized: bool = False,
+    ) -> list[dict[str, Any]]:
         if self.embedding_store is None:
             return []
         feels = [
             bucket for bucket in await self.list_buckets(include_archive=False)
             if self._bucket_type(bucket.metadata) == "feel"
-            and not bucket.metadata.get("crystallized")
+            and (include_crystallized or not bucket.metadata.get("crystallized"))
         ]
         embeddings = {bucket.id: self.embedding_store.get(bucket.id) for bucket in feels}
         embeddings = {bid: emb for bid, emb in embeddings.items() if emb}
@@ -978,8 +1473,13 @@ class OBClient:
         *,
         min_cluster_size: int,
         min_similarity: float,
+        include_crystallized: bool = False,
     ) -> dict[str, Any] | None:
-        for cluster in await self._feel_clusters(min_cluster_size=min_cluster_size, min_similarity=min_similarity):
+        for cluster in await self._feel_clusters(
+            min_cluster_size=min_cluster_size,
+            min_similarity=min_similarity,
+            include_crystallized=include_crystallized,
+        ):
             if cluster.get("id") == cluster_id:
                 return cluster
         return None
@@ -1021,6 +1521,90 @@ class OBClient:
             return ""
         joined = " / ".join(snippet[:120] for snippet in snippets)
         return f"我反复留下的感受指向同一个核心：{joined}"
+
+    def _crystal_signature(
+        self,
+        *,
+        mode: str,
+        source_ids: list[str],
+        principle_content: str = "",
+        principle_title: str = "",
+        principle_card: dict[str, Any] | None = None,
+        principle_injection: str = "",
+        feel_content: str = "",
+        domain: list[str] | None = None,
+    ) -> str:
+        payload = {
+            "mode": str(mode or "").strip().lower(),
+            "source_ids": sorted(str(item) for item in source_ids if str(item or "").strip()),
+            "principle_content": str(principle_content or "").strip(),
+            "feel_content": str(feel_content or "").strip(),
+            "domain": sorted(str(item) for item in (domain or []) if str(item or "").strip()),
+        }
+        if str(principle_title or "").strip():
+            payload["principle_title"] = str(principle_title or "").strip()
+        if principle_card:
+            payload["principle_card"] = principle_card
+        if str(principle_injection or "").strip():
+            payload["principle_injection"] = str(principle_injection or "").strip()
+        raw = yaml.safe_dump(payload, allow_unicode=True, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _format_principle_card_content(
+        *,
+        principle_content: str = "",
+        principle_title: str = "",
+        principle_card: dict[str, Any] | None = None,
+        principle_injection: str = "",
+    ) -> str:
+        title = str(principle_title or "").strip()
+        card = principle_card if isinstance(principle_card, dict) else {}
+        principle = str(card.get("principle") or "").strip()
+        response_rule = str(card.get("response_rule") or "").strip()
+        avoid = str(card.get("avoid") or "").strip()
+        anchors = card.get("anchors") or []
+        if not isinstance(anchors, list):
+            anchors = []
+        anchors = [str(item).strip() for item in anchors if str(item).strip()]
+        injection = str(principle_injection or "").strip()
+        legacy = str(principle_content or "").strip()
+        if not any([title, principle, response_rule, avoid, anchors, injection]):
+            return legacy
+        lines: list[str] = []
+        if title:
+            lines.append(f"标题：{title}")
+            lines.append("")
+        if principle:
+            lines.append(f"核心原则：{principle}")
+        if response_rule:
+            lines.append(f"回应规则：{response_rule}")
+        if anchors:
+            lines.append("锚点：")
+            lines.extend(f"- {item}" for item in anchors[:5])
+        if avoid:
+            lines.append(f"避免：{avoid}")
+        if injection:
+            lines.append(f"注入摘要：{injection}")
+        if legacy and legacy not in "\n".join(lines):
+            lines.append("")
+            lines.append(f"原始沉淀：{legacy}")
+        return "\n".join(lines).strip()
+
+    async def _find_existing_crystal_outputs(self, signature: str) -> dict[str, str]:
+        if not signature:
+            return {}
+        outputs: dict[str, str] = {}
+        for bucket in await self.list_buckets(include_archive=False):
+            meta = bucket.metadata or {}
+            if meta.get("crystal_signature") != signature:
+                continue
+            output = str(meta.get("crystal_output") or "").strip()
+            if output == "principle" and self._bucket_type(meta) == "permanent":
+                outputs.setdefault("principle_bucket_id", bucket.id)
+            elif output == "feel" and self._bucket_type(meta) == "feel":
+                outputs.setdefault("feel_bucket_id", bucket.id)
+        return outputs
 
     @staticmethod
     def _cluster_id(ids: list[str]) -> str:

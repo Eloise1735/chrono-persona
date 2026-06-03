@@ -3,9 +3,22 @@ server:
   host: "0.0.0.0"
   port: 8001
 
+# Optional hardening: set this in the server environment, not in config.yaml:
+# KELSEY_ADMIN_TOKEN="change-me-long-random"
+# When set, /api, /mcp, and /mcp-http require X-Kelsey-Admin-Token
+# or Authorization: Bearer <token>.
+#
+# API keys are intentionally not stored in the database or edited from the Web UI.
+# Set only the keys you use as server environment variables:
+# KELSEY_LLM_API_KEY="..."
+# KELSEY_ENV_LLM_API_KEY="..."
+# KELSEY_SNAPSHOT_LLM_API_KEY="..."
+# KELSEY_VECTOR_EMBEDDING_API_KEY="..."
+# KELSEY_PLAN_WEB_SEARCH_API_KEY="..."
+
 llm:
   api_base: "https://your-api-provider.com/v1"
-  api_key: "your-api-key"
+  api_key: ""  # Use KELSEY_LLM_API_KEY in the server environment.
   model: "your-model-name"
 
 database:

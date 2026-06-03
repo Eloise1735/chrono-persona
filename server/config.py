@@ -112,13 +112,41 @@ def _dict_to_dataclass(cls, data: dict):
     return cls(**filtered)
 
 
+def _resolve_config_path(value: str | None, base_dir: Path) -> str | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return raw
+    path = Path(raw)
+    if path.is_absolute():
+        return str(path)
+    return str((base_dir / path).resolve())
+
+
+def _normalize_config_paths(cfg: AppConfig, base_dir: Path) -> AppConfig:
+    cfg.database.path = str(_resolve_config_path(cfg.database.path, base_dir) or cfg.database.path)
+    cfg.ob.buckets_dir = str(_resolve_config_path(cfg.ob.buckets_dir, base_dir) or cfg.ob.buckets_dir)
+    cfg.wechat.sync_state_path = str(
+        _resolve_config_path(cfg.wechat.sync_state_path, base_dir) or cfg.wechat.sync_state_path
+    )
+    cfg.wechat.session_state_path = str(
+        _resolve_config_path(cfg.wechat.session_state_path, base_dir) or cfg.wechat.session_state_path
+    )
+    cfg.environment.world_book_path = _resolve_config_path(cfg.environment.world_book_path, base_dir)
+    cfg.environment.prompt_template = _resolve_config_path(cfg.environment.prompt_template, base_dir)
+    cfg.character.system_prompt_file = _resolve_config_path(cfg.character.system_prompt_file, base_dir)
+    return cfg
+
+
 def load_config(config_path: str | None = None) -> AppConfig:
     if config_path is None:
         config_path = os.environ.get("KELSEY_CONFIG", "config.yaml")
 
     path = Path(config_path)
     if not path.exists():
-        return AppConfig()
+        return _normalize_config_paths(AppConfig(), Path.cwd())
+    base_dir = path.resolve().parent
 
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
@@ -153,4 +181,4 @@ def load_config(config_path: str | None = None) -> AppConfig:
     if "wechat" in raw:
         cfg.wechat = _dict_to_dataclass(WeChatConfig, raw["wechat"])
 
-    return cfg
+    return _normalize_config_paths(cfg, base_dir)

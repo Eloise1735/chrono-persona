@@ -45,6 +45,7 @@ from server.prompts import (
     KEY_PROMPT_EVENT_ANCHOR,
     KEY_PROMPT_EVENT_TRIGGER_JUDGE,
     KEY_PROMPT_EVENT_MATERIALIZE,
+    KEY_PROMPT_ENVIRONMENT_EVENT_ROLLUP,
     KEY_PROMPT_DISTURBANCE_JUDGE,
     KEY_PROMPT_DISTURBANCE_MATERIALIZE,
     KEY_PROMPT_KEY_RECORD_CANDIDATE_ROUTE,
@@ -74,8 +75,9 @@ class StateMachine:
     DEFAULT_RECENT_EVENTS_LIMIT = 5
     DEFAULT_SCHEDULER_INTERVAL_SEC = 60
     DEFAULT_CATCHUP_MAX_STEPS = 3
+    SCHEDULER_CATCHUP_MAX_STEPS = 3
     REQUEST_CATCHUP_MAX_STEPS = 1
-    CONVERSATION_CLAIM_IDLE_TIMEOUT_MINUTES = 120
+    CONVERSATION_CLAIM_IDLE_TIMEOUT_MINUTES = 300
     DISTURBANCE_EXTERNAL_TARGET_SHARE = 0.22
     DISTURBANCE_EXTERNAL_MAX_SHARE = 0.28
     DISTURBANCE_RECENT_LIMIT = 6
@@ -217,6 +219,9 @@ class StateMachine:
         meta = getattr(bucket, "metadata", {}) or {}
         tags = {str(tag).strip().lower() for tag in meta.get("tags", []) if str(tag).strip()}
         source = str(meta.get("source") or "").strip().lower()
+        source_kind = str(meta.get("source_kind") or "").strip().lower()
+        if source_kind in {"environment_life_fragment", "environment_life_rollup"}:
+            return False
         if source == "snapshot_scheduler":
             return True
         if meta.get("snapshot_id") or meta.get("checkpoint_cst"):
@@ -235,14 +240,24 @@ class StateMachine:
 
         async def _breath_once(search_query: str, cap: int) -> list:
             try:
+                # env 生成上下文必须包含 character_life buckets（fragment / rollup /
+                # event_summary 全是 character_life domain）。breath() 默认排除
+                # character_life 是为了对话场景下避免角色侧霸榜，但 env 生成是后台
+                # 链路、需要看到自己上轮的总结来维持连续性——必须显式打开。
                 return await self.ob_client.breath(
                     query=search_query,
                     domain=None,
                     limit=max(target, min(50, cap)),
+                    include_character_life=True,
                 )
             except Exception:
                 logger.exception("OB environment event breath failed.")
                 return []
+
+        # 前置注入：固定 character_life_latest_event + 最近 1-2 条 environment_life_rollup。
+        # 这两类是"已总结的历史背景"，必须始终在环境生成上下文里出现，
+        # 否则后台 LLM 看不到自己上轮的总结，每轮重新拼凑→连续性断裂。
+        prefix_buckets = await self._collect_environment_history_pins(max_rollups=2)
 
         buckets = await _breath_once(query, target * 5)
         if len(buckets) < target and str(query or "").strip():
@@ -253,6 +268,18 @@ class StateMachine:
 
         items: list[dict] = []
         seen: set[str] = set()
+
+        # 先把历史背景 pin 加进去（不计入 target 上限——它们是必给的上下文）
+        for bucket in prefix_buckets:
+            bucket_id = str(getattr(bucket, "id", "") or "").strip()
+            if not bucket_id or bucket_id in seen:
+                continue
+            item = self._bucket_to_environment_event_dict(bucket, history_pin=True)
+            if item is None:
+                continue
+            seen.add(bucket_id)
+            items.append(item)
+
         for bucket in buckets:
             bucket_id = str(getattr(bucket, "id", "") or "").strip()
             if bucket_id and bucket_id in seen:
@@ -261,26 +288,222 @@ class StateMachine:
             if self._is_snapshot_generated_ob_bucket(bucket):
                 continue
             meta = getattr(bucket, "metadata", {}) or {}
-            content = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
-            if not content:
+            source_kind = str(meta.get("source_kind") or "").strip().lower()
+            # Digested fragment 在 48h 窗口内仍允许进入上下文，维持跨日连续性；
+            # 超过 48h 才真正剔除——更久远的 fragment 即便保留也连不上当下。
+            if source_kind == "environment_life_fragment" and (
+                meta.get("digested") or meta.get("resolved")
+            ):
+                if self._fragment_age_hours(meta) > 48.0:
+                    continue
+            item = self._bucket_to_environment_event_dict(bucket, history_pin=False)
+            if item is None:
                 continue
-            created = str(meta.get("created") or meta.get("last_active") or "").strip()
-            tags = [str(tag).strip() for tag in meta.get("tags", []) if str(tag).strip()]
-            domains = [str(domain).strip() for domain in meta.get("domain", []) if str(domain).strip()]
-            items.append(
-                {
-                    "title": str(meta.get("name") or bucket_id or "OB event").strip(),
-                    "date": created.split("T")[0] if created else "",
-                    "description": content[:520],
-                    "open_loop": str(meta.get("open_loop") or "").strip(),
-                    "trigger_keywords": tags + domains,
-                    "source": "ob_breath",
-                    "bucket_id": bucket_id,
-                }
-            )
-            if len(items) >= target:
+            items.append(item)
+            if len(items) >= target + len(prefix_buckets):
                 break
         return items
+
+    async def _collect_environment_history_pins(self, *, max_rollups: int = 2) -> list:
+        """Always-inject 历史背景 buckets：character_life_latest_event + 最近 N 条 rollup。
+
+        这些 bucket 是"上一轮已经总结过的事件链"，必须给后台环境 LLM 看到，
+        否则它会重复拼凑、产生前后不连贯的生活流。
+        """
+        if self.ob_client is None:
+            return []
+        pins: list = []
+        seen_ids: set[str] = set()
+        # ① 固定的 character_life_latest_event（当下进行）
+        try:
+            latest_event = await self.ob_client.get("character_life_latest_event")
+        except Exception:
+            latest_event = None
+        if latest_event is not None:
+            pin_id = str(getattr(latest_event, "id", "") or "").strip()
+            if pin_id:
+                pins.append(latest_event)
+                seen_ids.add(pin_id)
+        # ② 最近 N 条 environment_life_rollup（近期总结）
+        try:
+            all_buckets = await self.ob_client.list_buckets(include_archive=False)
+        except Exception:
+            logger.exception("Failed to list buckets for environment history pins.")
+            return pins
+        rollups: list = []
+        for bucket in all_buckets:
+            meta = getattr(bucket, "metadata", {}) or {}
+            if str(meta.get("source_kind") or "").strip().lower() != "environment_life_rollup":
+                continue
+            if str(getattr(bucket, "id", "") or "") in seen_ids:
+                continue
+            rollups.append(bucket)
+        rollups.sort(
+            key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""),
+            reverse=True,
+        )
+        for bucket in rollups[: max(0, int(max_rollups or 0))]:
+            pins.append(bucket)
+            seen_ids.add(str(getattr(bucket, "id", "") or ""))
+        return pins
+
+    def _bucket_to_environment_event_dict(self, bucket, *, history_pin: bool) -> dict | None:
+        bucket_id = str(getattr(bucket, "id", "") or "").strip()
+        meta = getattr(bucket, "metadata", {}) or {}
+        content = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
+        if not content:
+            return None
+        source_kind = str(meta.get("source_kind") or "").strip().lower()
+        created = str(meta.get("created") or meta.get("last_active") or "").strip()
+        tags = [str(tag).strip() for tag in meta.get("tags", []) if str(tag).strip()]
+        domains = [str(domain).strip() for domain in meta.get("domain", []) if str(domain).strip()]
+        # 给后台 LLM 一个明确的前缀提示：这是"已总结的历史背景"，不要再当成新事件加工。
+        title = str(meta.get("name") or bucket_id or "OB event").strip()
+        if history_pin:
+            if source_kind == "environment_event_summary":
+                prefix = "[已总结·当下]"
+            elif source_kind == "environment_life_rollup":
+                prefix = "[已总结·近期]"
+            else:
+                prefix = "[已总结·历史]"
+            if not title.startswith(prefix):
+                title = f"{prefix} {title}".strip()
+        return {
+            "title": title,
+            "date": created.split("T")[0] if created else "",
+            "description": content[:520],
+            "open_loop": str(meta.get("open_loop") or "").strip(),
+            "trigger_keywords": tags + domains,
+            "source": "ob_breath_history_pin" if history_pin else "ob_breath",
+            "bucket_id": bucket_id,
+        }
+
+    # Threshold for switching env generation into "low activity mode"。
+    # 5h 与 env 调度周期对齐：错过一个完整周期即视为用户离线，让角色把焦点回归自己的生活。
+    LOW_ACTIVITY_OFFLINE_HOURS = 5.0
+
+    # disturbance_schedule_effect 取值中"不需要 replan"的子集：
+    #   - none / on_track：扰动未改变日程
+    #   - inward_digging：角色转入内向推进，无外部日程影响
+    #   - "" / 缺失：兜底
+    # 其他取值（interrupted / delayed / replaced_by_conversation / unexpected_insert）
+    # 都被视为强扰动，env 生成后应立即触发 maybe_replan 让 plan 反向响应。
+    _WEAK_DISTURBANCE_EFFECTS = frozenset({"", "none", "on_track", "inward_digging"})
+
+    def _env_has_strong_disturbance(self, env: dict | None) -> bool:
+        """Judge whether the just-generated env carries a disturbance strong enough to warrant replan."""
+        if not isinstance(env, dict):
+            return False
+        if not env.get("disturbance_id") and not env.get("disturbance_title"):
+            return False
+        effect = str(env.get("disturbance_schedule_effect") or "").strip().lower()
+        return effect not in self._WEAK_DISTURBANCE_EFFECTS
+
+    @staticmethod
+    def _format_disturbance_replan_context(env: dict) -> str:
+        """Build a compact replan context string from env's disturbance fields."""
+        title = str(env.get("disturbance_title") or "").strip()
+        effect = str(env.get("disturbance_schedule_effect") or "").strip()
+        context_text = str(env.get("disturbance_context") or "").strip()
+        # context 可能很长（环境正文摘要），裁短给 replan prompt 用即可。
+        if len(context_text) > 600:
+            context_text = context_text[:600].rstrip() + "…"
+        parts = [
+            f"env 注入扰动 [{title or '未命名扰动'}]，schedule_effect={effect or 'unknown'}。",
+        ]
+        if context_text:
+            parts.append(f"扰动上下文：{context_text}")
+        return "\n".join(parts)
+
+    def _compute_user_offline_for_checkpoint(
+        self,
+        checkpoint_time: datetime,
+        conversation_end_instant: datetime | None,
+    ) -> tuple[float, bool]:
+        """Compute (offline_hours, low_activity_mode) for an env-generation checkpoint。
+
+        - offline_hours：从最近一次前台 conversation_end 快照到本 checkpoint 的小时数。
+          找不到 conversation_end 时返回 0.0（视为始终在线，避免冷启动时假性触发）。
+        - low_activity_mode：offline_hours >= LOW_ACTIVITY_OFFLINE_HOURS。
+        """
+        if conversation_end_instant is None:
+            return 0.0, False
+        try:
+            delta_seconds = (checkpoint_time - conversation_end_instant).total_seconds()
+        except Exception:
+            return 0.0, False
+        offline_hours = max(0.0, delta_seconds / 3600.0)
+        return offline_hours, offline_hours >= self.LOW_ACTIVITY_OFFLINE_HOURS
+
+    async def _collect_open_loop_pool_text(
+        self,
+        *,
+        max_hours: float = 48.0,
+        max_items: int = 8,
+    ) -> str:
+        """Aggregate fragment.metadata.open_loop from the last N hours into a dedup'd pool.
+
+        Shared by both plan_engine (next-day planning) and env generation (current
+        environment continuity). Items are sorted newest-first, fragment metadata is
+        expected to carry the open_loop field set by `_build_environment_life_fragment`.
+        """
+        if self.ob_client is None:
+            return "(近 48h 无未完成线索)"
+        try:
+            buckets = await self.ob_client.list_buckets(include_archive=False)
+        except Exception:
+            logger.exception("Failed to list OB buckets for open-loop pool.")
+            return "(近 48h 无未完成线索)"
+        try:
+            now = shanghai_now()
+        except Exception:
+            now = datetime.utcnow()
+        cutoff_seconds = float(max_hours) * 3600.0
+        enriched: list[tuple[float, str]] = []
+        for bucket in buckets:
+            meta = getattr(bucket, "metadata", {}) or {}
+            if str(meta.get("source_kind") or "").strip().lower() != "environment_life_fragment":
+                continue
+            open_loop = str(meta.get("open_loop") or "").strip()
+            if not open_loop:
+                continue
+            ts_raw = str(meta.get("last_active") or meta.get("created") or "").strip()
+            if not ts_raw:
+                continue
+            try:
+                ts = self._parse_iso_datetime(ts_raw)
+                age_seconds = (now - ts).total_seconds()
+            except Exception:
+                continue
+            if age_seconds < 0 or age_seconds > cutoff_seconds:
+                continue
+            enriched.append((age_seconds, open_loop))
+        enriched.sort(key=lambda row: row[0])  # newest first
+        seen: set[str] = set()
+        items: list[str] = []
+        for _, open_loop in enriched:
+            key = re.sub(r"\s+", "", open_loop)[:48].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(open_loop[:180])
+            if len(items) >= int(max_items or 0):
+                break
+        return "\n".join(f"- {item}" for item in items) if items else "(近 48h 无未完成线索)"
+
+    def _fragment_age_hours(self, meta: dict) -> float:
+        ts = str(meta.get("last_active") or meta.get("created") or "").strip()
+        if not ts:
+            return 0.0
+        try:
+            dt = self._parse_iso_datetime(ts)
+        except Exception:
+            return 0.0
+        try:
+            delta = shanghai_now() - dt
+        except Exception:
+            return 0.0
+        return max(0.0, delta.total_seconds() / 3600.0)
 
     async def _ob_hold_snapshot_feel(
         self,
@@ -347,6 +570,166 @@ class StateMachine:
             logger.exception("OB environment trace hold failed.")
             return ""
 
+    async def _ob_hold_environment_life_fragment(
+        self,
+        *,
+        title: str,
+        content: str,
+        tags: list[str] | None = None,
+        importance: int = 5,
+        valence: float = 0.5,
+        arousal: float = 0.36,
+        created: str | None = None,
+        extra_metadata: dict | None = None,
+    ) -> str:
+        if self.ob_client is None:
+            return ""
+        body = str(content or "").strip()
+        if not body:
+            return ""
+        try:
+            return await self.ob_client.hold(
+                body,
+                tags=tags or ["environment_life_fragment", "character_life"],
+                importance=importance,
+                domain=["character_life"],
+                valence=valence,
+                arousal=arousal,
+                bucket_type="dynamic",
+                name=title,
+                created=created,
+                extra_metadata=extra_metadata,
+            )
+        except Exception:
+            logger.exception("OB environment life fragment hold failed.")
+            return ""
+
+    async def _ob_upsert_environment_event_summary(
+        self,
+        *,
+        env: dict | None,
+        title: str,
+        created: str | None = None,
+        extra_metadata: dict | None = None,
+    ) -> str:
+        if self.ob_client is None:
+            return ""
+        incoming = self._build_environment_event_summary_content(env)
+        if not incoming:
+            return ""
+        bucket_id = "character_life_latest_event"
+        existing = None
+        try:
+            existing = await self.ob_client.get(bucket_id)
+        except Exception:
+            existing = None
+        existing_content = str(getattr(existing, "content", "") or "").strip() if existing else ""
+        content = await self._merge_environment_event_summary(existing_content, incoming)
+        user_reference_mode = "unknown"
+        if isinstance(env, dict):
+            user_reference_mode = str(env.get("user_reference_mode") or "unknown").strip().lower()
+        metadata = {
+            "source": "snapshot_scheduler",
+            "source_kind": "environment_event_summary",
+            "memory_role": "fixed_latest_life_event",
+            "life_scope": "character_life",
+            "user_reference_mode": user_reference_mode,
+            "speculative_about_user": user_reference_mode == "speculative",
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        try:
+            if existing is not None:
+                await self.ob_client.update(
+                    bucket_id,
+                    content=content,
+                    name=title,
+                    tags=["environment_event_summary", "character_life"],
+                    domain=["character_life"],
+                    importance=7,
+                    valence=0.5,
+                    arousal=0.36,
+                    created=created,
+                    last_active=created,
+                    **metadata,
+                )
+                return bucket_id
+            return await self.ob_client.hold(
+                content,
+                tags=["environment_event_summary", "character_life"],
+                importance=7,
+                domain=["character_life"],
+                valence=0.5,
+                arousal=0.36,
+                bucket_type="dynamic",
+                name=title,
+                created=created,
+                bucket_id=bucket_id,
+                extra_metadata=metadata,
+            )
+        except Exception:
+            logger.exception("OB environment event summary upsert failed.")
+            return ""
+
+    def _build_environment_event_summary_content(self, env: dict | None) -> str:
+        if not env or not isinstance(env, dict):
+            return ""
+        raw = str(env.get("event_summary") or "").strip()
+        if not raw:
+            return ""
+        lines: list[str] = []
+        for raw_line in raw.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if lowered in {"[event summary]", "event summary"} or line in {"## 事件总结", "事件总结"}:
+                continue
+            if not line.startswith(("-", "*", "•")):
+                line = f"- {line}"
+            lines.append(line)
+            if len(lines) >= 6:
+                break
+        return "\n".join(lines).strip()[:1200]
+
+    async def _merge_environment_event_summary(self, existing: str, incoming: str) -> str:
+        incoming = self._build_event_summary_from_text(incoming)
+        existing = self._build_event_summary_from_text(existing)
+        if not incoming:
+            return existing
+        if not existing:
+            return incoming
+        llm = getattr(self, "snapshot_llm", None)
+        if llm is None:
+            return incoming
+        prompt = (
+            "你是固定生活事件槽位的压缩器。请把旧槽位与新事件总结合并为“当前仍有效”的事件状态。\n"
+            "规则：新旧重复时用新表述覆盖；过时事项丢弃；只保留仍影响当前处境、行动、未完成事项或关系状态的内容；输出 1-6 条短 bullet，不要解释。\n\n"
+            f"【旧槽位】\n{existing}\n\n【新事件总结】\n{incoming}"
+        )
+        try:
+            merged = await llm.chat([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=800)
+        except Exception:
+            logger.exception("Environment event summary merge failed; using latest incoming summary.")
+            return incoming
+        return self._build_event_summary_from_text(str(merged or "").strip()) or incoming
+
+    @staticmethod
+    def _build_event_summary_from_text(text: str) -> str:
+        lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line in {"【最新生活事件】", "[Event Summary]", "Event Summary", "## 事件总结", "事件总结"}:
+                continue
+            if not line.startswith(("-", "*", "•")):
+                line = f"- {line}"
+            lines.append(line)
+            if len(lines) >= 6:
+                break
+        return "\n".join(lines).strip()[:1200]
+
     def _build_environment_trace_content(self, env: dict | None) -> str:
         if not env or not isinstance(env, dict):
             return ""
@@ -367,6 +750,520 @@ class StateMachine:
         if recent_disturbances and recent_disturbances != "(no recent disturbances)":
             lines.append(f"Recent disturbances: {recent_disturbances[:240]}")
         return "\n".join(lines).strip()[:1400]
+
+    def _build_environment_life_fragment(
+        self,
+        env: dict | None,
+        *,
+        checkpoint_cst: str = "",
+        snapshot_id: int | None = None,
+    ) -> dict:
+        if not env or not isinstance(env, dict):
+            return {}
+        summary = self._compact_structured_memory_text(str(env.get("summary") or "").strip())
+        retrieval = self._compact_structured_memory_text(str(env.get("retrieval_summary") or "").strip())
+        event_summary = self._build_environment_event_summary_content(env)
+        activity = self._compact_structured_memory_text(str(env.get("activity") or "").strip())
+        plan_delta = self._compact_structured_memory_text(str(env.get("plan_delta") or "").strip())
+        disturbance = self._compact_structured_memory_text(str(env.get("disturbance_context") or "").strip())
+        recent_disturbances = self._compact_structured_memory_text(str(env.get("recent_disturbances") or "").strip())
+        source_text = event_summary or retrieval or summary or activity
+        source_text = self._strip_environment_context_labels(source_text)
+        if not source_text:
+            return {}
+
+        open_loop = (
+            self._extract_labeled_env_summary_value(str(env.get("summary") or ""), "Open loop")
+            or self._extract_open_loop_from_disturbance(disturbance)
+            or self._extract_open_loop_from_disturbance(recent_disturbances)
+        )
+        detail_hook = self._environment_detail_hooks_text(env)
+        life_theme = self._infer_environment_life_theme(
+            "\n".join([source_text, disturbance, plan_delta])
+        ) or self._infer_life_flow_theme(
+            "\n".join([source_text, disturbance, plan_delta]),
+            {
+                "plan_delta": plan_delta,
+                "disturbance": disturbance,
+                "recent_disturbances": recent_disturbances,
+            },
+            source="environment",
+        )
+        group_key = self._environment_life_group_key(life_theme, disturbance)
+        content_parts = [self._truncate_text(source_text, 480)]
+        if open_loop and open_loop not in source_text:
+            content_parts.append(f"未完成线索：{self._truncate_text(open_loop, 140)}")
+        if detail_hook and detail_hook not in source_text:
+            content_parts.append(f"细节：{self._truncate_text(detail_hook, 80)}")
+        content = " ".join(part for part in content_parts if part).strip()
+        content = self._truncate_text(content, 720)
+        if len(content) < 20:
+            return {}
+        user_reference_mode = str(env.get("user_reference_mode") or "unknown").strip().lower()
+        speculative_about_user = user_reference_mode == "speculative"
+        return {
+            "content": content,
+            "life_theme": life_theme or "general",
+            "group_key": group_key,
+            "open_loop": self._truncate_text(open_loop, 180),
+            "plan_effect": self._classify_environment_plan_effect(plan_delta, disturbance),
+            "has_disturbance": bool(disturbance and disturbance != "(no active disturbance)"),
+            "disturbance_excerpt": self._truncate_text(disturbance, 220),
+            "recent_disturbances_excerpt": self._truncate_text(recent_disturbances, 220),
+            "checkpoint_cst": checkpoint_cst,
+            "snapshot_id": int(snapshot_id or 0),
+            "user_reference_mode": user_reference_mode,
+            "speculative_about_user": speculative_about_user,
+        }
+
+    @staticmethod
+    def _strip_environment_context_labels(text: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+        for marker in ("Plan delta:", "Disturbance:", "Recent disturbances:"):
+            idx = cleaned.find(marker)
+            if idx >= 0:
+                cleaned = cleaned[:idx].strip()
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _extract_open_loop_from_disturbance(text: str) -> str:
+        raw = str(text or "")
+        for marker in ("Open thread:", "Open loop:", "未完成线索：", "未完成线索:"):
+            idx = raw.find(marker)
+            if idx >= 0:
+                return re.split(r"(?:Detail hook:|Recent disturbances:|Visible:|Immediate pressure:)", raw[idx + len(marker):], maxsplit=1)[0].strip()
+        return ""
+
+    @staticmethod
+    def _classify_environment_plan_effect(plan_delta: str, disturbance: str) -> str:
+        blob = f"{plan_delta}\n{disturbance}".lower()
+        if any(token in blob for token in ("interrupted", "中断", "打断")):
+            return "interrupted"
+        if any(token in blob for token in ("delayed", "推迟", "延后", "拖延")):
+            return "delayed"
+        if any(token in blob for token in ("unexpected", "计划外", "新增", "变更")):
+            return "unexpected_inserted"
+        if any(token in blob for token in ("replaced_by_conversation", "对话占用")):
+            return "replaced_by_conversation"
+        return "on_track"
+
+    @staticmethod
+    def _infer_environment_life_theme(text: str) -> str:
+        blob = str(text or "").lower()
+        checks = [
+            ("medical", ("医疗", "临床", "复测", "炎症", "鼻炎", "哮喘", "呼吸", "症状", "用药", "病区", "观察方案")),
+            ("work", ("任务", "反馈", "交接", "项目", "会议", "外勤", "办公室", "指令", "优先级", "上游")),
+            ("routine", ("晨间", "睡眠", "起床", "吃饭", "洗漱", "日程", "节律", "待办", "休息")),
+            ("mobility", ("出行", "通勤", "外出", "路上", "返回", "抵达", "移动")),
+            ("study", ("阅读", "课程", "论文", "学习", "复习", "文本", "笔记")),
+            ("relationship", ("消息", "等待", "回应", "承诺", "对话", "关系", "泳琳")),
+        ]
+        for theme, tokens in checks:
+            if any(token.lower() in blob for token in tokens):
+                return theme
+        return ""
+
+    @staticmethod
+    def _environment_life_group_key(life_theme: str, disturbance: str = "") -> str:
+        theme = re.sub(r"[^a-zA-Z0-9_\-\u4e00-\u9fff]+", "_", str(life_theme or "general").strip().lower()).strip("_")
+        if not theme:
+            theme = "general"
+        disturbance_text = str(disturbance or "")
+        kind_match = re.search(r"\[([^\]]{3,60})\]", disturbance_text)
+        if kind_match:
+            kind = re.sub(r"[^a-zA-Z0-9_\-/]+", "_", kind_match.group(1).strip().lower()).strip("_")
+            if kind:
+                return f"environment_life:{theme}:{kind}"
+        return f"environment_life:{theme}"
+
+    async def _process_pending_environment_life_rollups(
+        self,
+        *,
+        group_key: str | None = None,
+        reason: str = "auto",
+    ) -> list[dict]:
+        if self.ob_client is None:
+            return []
+        try:
+            buckets = await self.ob_client.list_buckets(include_archive=False)
+        except Exception:
+            logger.exception("Failed to list OB buckets for environment life rollup.")
+            return []
+        groups: dict[str, list] = {}
+        for bucket in buckets:
+            meta = getattr(bucket, "metadata", {}) or {}
+            if str(meta.get("source_kind") or "").strip() != "environment_life_fragment":
+                continue
+            if meta.get("digested") or meta.get("resolved"):
+                continue
+            key = str(meta.get("group_key") or "").strip()
+            if not key:
+                continue
+            if group_key and key != group_key:
+                continue
+            groups.setdefault(key, []).append(bucket)
+
+        results: list[dict] = []
+        for key, items in groups.items():
+            items.sort(key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""))
+            if not self._should_rollup_environment_life_group(items):
+                continue
+            try:
+                result = await self._create_environment_life_rollup(key, items, reason=reason)
+                if result:
+                    results.append(result)
+            except Exception:
+                logger.exception("Environment life rollup failed for group=%s", key)
+        return results
+
+    def _should_rollup_environment_life_group(self, fragments: list) -> bool:
+        if len(fragments) >= 3:
+            return True
+        if len(fragments) < 2:
+            return False
+        combined_len = sum(len(str(getattr(item, "content", "") or "")) for item in fragments)
+        if combined_len >= 700:
+            return True
+        has_pressure = False
+        for item in fragments:
+            meta = getattr(item, "metadata", {}) or {}
+            if (
+                str(meta.get("open_loop") or "").strip()
+                or str(meta.get("plan_effect") or "").strip() not in {"", "on_track"}
+                or meta.get("has_disturbance")
+                or str(meta.get("disturbance_excerpt") or "").strip()
+            ):
+                has_pressure = True
+                break
+        if has_pressure:
+            return True
+        first_created = str((getattr(fragments[0], "metadata", {}) or {}).get("created") or "")
+        try:
+            first_dt = self._parse_iso_datetime(first_created)
+            return (shanghai_now() - first_dt).total_seconds() >= 12 * 3600
+        except Exception:
+            return False
+
+    async def _create_environment_life_rollup(
+        self,
+        group_key: str,
+        fragments: list,
+        *,
+        reason: str,
+    ) -> dict | None:
+        source_ids = [str(getattr(item, "id", "") or "").strip() for item in fragments if str(getattr(item, "id", "") or "").strip()]
+        if not source_ids:
+            return None
+        signature = self._environment_life_rollup_signature(group_key, source_ids)
+        existing = await self._find_environment_life_rollup(signature)
+        if existing:
+            await self._mark_environment_life_fragments_digested(
+                fragments,
+                linked_event_id=existing.get("event_id"),
+                rollup_bucket_id=existing.get("bucket_id", ""),
+                reason="duplicate_rollup_signature",
+            )
+            return {"status": "deduped", "group_key": group_key, "signature": signature, **existing}
+
+        payload = await self._build_environment_life_rollup_payload(group_key, fragments, signature)
+        if not payload:
+            return None
+        life_theme = str((getattr(fragments[-1], "metadata", {}) or {}).get("life_theme") or "general").strip() or "general"
+        keywords = self._parse_json_list(payload.get("keywords"))
+        categories = self._parse_json_list(payload.get("categories")) or classify_event(
+            str(payload.get("objective") or payload.get("rollup_content") or ""),
+            keywords,
+        )
+        title = str(payload.get("title") or "").strip() or make_event_title(
+            str(payload.get("objective") or payload.get("rollup_content") or ""),
+            keywords,
+            categories,
+        )
+        objective = self._truncate_text(str(payload.get("objective") or payload.get("rollup_content") or ""), 520)
+        impression = self._truncate_text(str(payload.get("impression") or "这组生活碎片形成了对凯尔希当前节奏的可回溯改变。"), 260)
+        detail_hooks = "; ".join(self._parse_json_list(payload.get("detail_hooks")))[:240]
+        open_loop = self._truncate_text(str(payload.get("open_loop") or ""), 220)
+        event_date = self._environment_life_event_date(fragments)
+        meta_json = {
+            "source_kind": "environment_life_rollup",
+            "group_key": group_key,
+            "life_theme": life_theme,
+            "source_bucket_ids": source_ids,
+            "rollup_signature": signature,
+            "created_by": "environment_life_auto_rollup",
+            "rollup_reason": reason,
+        }
+        event = EventAnchor(
+            date=event_date,
+            title=title[:80],
+            description=self._compose_event_description(objective, impression, detail_hooks, open_loop),
+            source="generated",
+            created_at=format_utc_instant_z(shanghai_time_to_utc_naive(shanghai_now())),
+            trigger_keywords=json.dumps(keywords, ensure_ascii=False),
+            categories=json.dumps(categories, ensure_ascii=False),
+            meta_json=json.dumps(meta_json, ensure_ascii=False),
+            importance_score=0.55,
+            impression_depth=0.45,
+        )
+        event_id = await self.db.insert_event(event)
+        rollup_content = str(payload.get("rollup_content") or "").strip()
+        if not rollup_content:
+            rollup_content = self._compose_environment_life_rollup_text(title, objective, impression, detail_hooks, open_loop)
+        rollup_bucket_id = ""
+        if self.ob_client is not None:
+            rollup_bucket_id = await self.ob_client.hold(
+                self._truncate_text(rollup_content, 700),
+                tags=["environment_life_rollup", "character_life"],
+                importance=6,
+                domain=["character_life", life_theme],
+                valence=0.5,
+                arousal=0.38,
+                bucket_type="dynamic",
+                name=f"{event_date} 环境事件聚合",
+                extra_metadata={
+                    "source_kind": "environment_life_rollup",
+                    "memory_role": "recent_life_event_rollup",
+                    "life_scope": "character_life",
+                    "life_theme": life_theme,
+                    "group_key": group_key,
+                    "rollup_signature": signature,
+                    "linked_event_id": int(event_id or 0),
+                    "source_bucket_ids": source_ids,
+                },
+            )
+        await self._mark_environment_life_fragments_digested(
+            fragments,
+            linked_event_id=int(event_id or 0),
+            rollup_bucket_id=rollup_bucket_id,
+            reason="environment_life_rollup_created",
+        )
+        upsert_event_vector = getattr(self.memory, "upsert_event_vector", None)
+        if callable(upsert_event_vector):
+            try:
+                await upsert_event_vector(int(event_id))
+            except Exception as exc:
+                logger.warning("Event vector upsert skipped for #%d: %s", int(event_id), exc)
+        created = await self.db.get_event_by_id(int(event_id))
+        if created is not None:
+            try:
+                await self._refresh_related_slowline_from_event(created)
+            except Exception:
+                logger.exception("Failed to refresh slowline after environment life rollup event: %s", event_id)
+        logger.info("Environment life rollup created event=%s bucket=%s group=%s", event_id, rollup_bucket_id, group_key)
+        return {
+            "status": "created",
+            "event_id": int(event_id or 0),
+            "bucket_id": rollup_bucket_id,
+            "group_key": group_key,
+            "signature": signature,
+        }
+
+    @staticmethod
+    def _environment_life_rollup_signature(group_key: str, source_ids: list[str]) -> str:
+        raw = f"{group_key}|" + "|".join(sorted(str(item) for item in source_ids if str(item).strip()))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    async def _find_environment_life_rollup(self, signature: str) -> dict | None:
+        if not signature:
+            return None
+        try:
+            events = await self.db.get_all_events(offset=0, limit=500, include_archived=True)
+            for event in events:
+                payload = self._parse_json_object(getattr(event, "meta_json", None))
+                if payload.get("rollup_signature") == signature:
+                    return {"event_id": int(event.id or 0)}
+        except Exception:
+            logger.exception("Failed to inspect event rollup signatures.")
+        if self.ob_client is not None:
+            try:
+                for bucket in await self.ob_client.list_buckets(include_archive=True):
+                    meta = getattr(bucket, "metadata", {}) or {}
+                    if meta.get("rollup_signature") == signature:
+                        return {"bucket_id": str(getattr(bucket, "id", "") or "")}
+            except Exception:
+                logger.exception("Failed to inspect OB rollup signatures.")
+        return None
+
+    async def _build_environment_life_rollup_payload(self, group_key: str, fragments: list, signature: str) -> dict | None:
+        max_attempts = max(int((getattr(item, "metadata", {}) or {}).get("rollup_attempts", 0) or 0) for item in fragments)
+        try:
+            system_prompt = await self.prompt_manager.get_system_prompt()
+            template = await self.prompt_manager.get_prompt(KEY_PROMPT_ENVIRONMENT_EVENT_ROLLUP)
+            if not template.strip() or self.snapshot_llm is None:
+                raise RuntimeError("environment rollup prompt or llm is unavailable")
+            response = await self.snapshot_llm.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": template.format(
+                            group_meta=json.dumps(self._environment_life_group_meta(group_key, fragments, signature), ensure_ascii=False),
+                            fragments_text=self._format_environment_life_fragments_for_rollup(fragments),
+                            dedup_context=await self._environment_life_rollup_dedup_context(),
+                        ),
+                    },
+                ],
+                max_tokens=900,
+            )
+            parsed = self._extract_json_object(response)
+            if not str(parsed.get("objective") or parsed.get("rollup_content") or "").strip():
+                raise ValueError("rollup llm returned empty objective")
+            return parsed
+        except Exception as exc:
+            if max_attempts < 1:
+                await self._mark_environment_life_rollup_attempt(fragments, str(exc))
+                logger.warning("Environment life rollup deferred for retry: %s", exc)
+                return None
+            logger.warning("Environment life rollup using fallback after retry failure: %s", exc)
+            return self._fallback_environment_life_rollup_payload(group_key, fragments)
+
+    def _environment_life_group_meta(self, group_key: str, fragments: list, signature: str) -> dict:
+        themes = [
+            str((getattr(item, "metadata", {}) or {}).get("life_theme") or "").strip()
+            for item in fragments
+            if str((getattr(item, "metadata", {}) or {}).get("life_theme") or "").strip()
+        ]
+        return {
+            "group_key": group_key,
+            "rollup_signature": signature,
+            "fragment_count": len(fragments),
+            "life_theme": themes[-1] if themes else "general",
+            "source_bucket_ids": [str(getattr(item, "id", "") or "") for item in fragments],
+        }
+
+    def _format_environment_life_fragments_for_rollup(self, fragments: list) -> str:
+        """Format fragments for rollup prompt.
+
+        Each line is prefixed with HH:MM (extracted from checkpoint_cst) so the LLM
+        can reconstruct a clear timeline + causal chain instead of producing散点拼接.
+        Fragments are sorted ascending by checkpoint time before formatting.
+        """
+        enriched: list[tuple[str, str, str, str]] = []
+        for item in fragments:
+            meta = getattr(item, "metadata", {}) or {}
+            checkpoint_raw = str(meta.get("checkpoint_cst") or meta.get("created") or "").strip()
+            hhmm = self._extract_hhmm(checkpoint_raw)
+            content = self._compact_structured_memory_text(str(getattr(item, "content", "") or "").strip())
+            open_loop = str(meta.get("open_loop") or "").strip()
+            enriched.append((checkpoint_raw, hhmm, content[:640], open_loop[:160]))
+        # 按 checkpoint_raw 升序：早 → 晚，让 LLM 看到自然时间流。
+        enriched.sort(key=lambda row: row[0])
+        lines: list[str] = []
+        for checkpoint_raw, hhmm, content, open_loop in enriched:
+            time_label = hhmm if hhmm else checkpoint_raw or "时刻未知"
+            line = f"- [{time_label}] {content}"
+            if open_loop:
+                line += f" | 未完成线索: {open_loop}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_hhmm(checkpoint_raw: str) -> str:
+        if not checkpoint_raw:
+            return ""
+        match = re.search(r"T(\d{2}):(\d{2})", checkpoint_raw)
+        if match:
+            return f"{match.group(1)}:{match.group(2)}"
+        match = re.search(r"(\d{2}):(\d{2})", checkpoint_raw)
+        if match:
+            return f"{match.group(1)}:{match.group(2)}"
+        return ""
+
+    async def _environment_life_rollup_dedup_context(self) -> str:
+        try:
+            events = await self.db.get_all_events(offset=0, limit=8, include_archived=False)
+        except Exception:
+            events = []
+        lines: list[str] = []
+        for event in events[:8]:
+            lines.append(f"- [{event.date}] {event.title}: {self._compact_structured_memory_text(event.description)[:160]}")
+        return "\n".join(lines) if lines else "(no recent event dedup context)"
+
+    def _fallback_environment_life_rollup_payload(self, group_key: str, fragments: list) -> dict:
+        first = fragments[0]
+        last = fragments[-1]
+        first_content = self._compact_structured_memory_text(str(getattr(first, "content", "") or ""))
+        last_content = self._compact_structured_memory_text(str(getattr(last, "content", "") or ""))
+        meta = getattr(last, "metadata", {}) or {}
+        life_theme = str(meta.get("life_theme") or "生活推进").strip()
+        open_loop = str(meta.get("open_loop") or "").strip()
+        objective = self._truncate_text("；".join(part for part in [first_content, last_content] if part), 360)
+        impression = f"这一组{life_theme}碎片显示凯尔希的生活节奏已经形成可回溯的连续变化。"
+        return {
+            "title": make_event_title(objective, [life_theme], None),
+            "objective": objective,
+            "impression": impression,
+            "detail_hooks": [],
+            "open_loop": open_loop,
+            "keywords": [life_theme, "character_life", "环境推进"],
+            "categories": classify_event(objective, [life_theme]),
+            "rollup_content": self._compose_environment_life_rollup_text(life_theme, objective, impression, "", open_loop),
+        }
+
+    @staticmethod
+    def _compose_environment_life_rollup_text(title: str, objective: str, impression: str, detail_hooks: str, open_loop: str) -> str:
+        parts = [str(title or "").strip(), str(objective or "").strip(), str(impression or "").strip()]
+        if detail_hooks:
+            parts.append(f"细节：{detail_hooks}")
+        if open_loop:
+            parts.append(f"未完成线索：{open_loop}")
+        return " ".join(part for part in parts if part)
+
+    async def _mark_environment_life_rollup_attempt(self, fragments: list, error: str) -> None:
+        now = datetime.utcnow().isoformat()
+        for item in fragments:
+            meta = getattr(item, "metadata", {}) or {}
+            attempts = int(meta.get("rollup_attempts", 0) or 0) + 1
+            try:
+                await self.ob_client.update(
+                    item.id,
+                    rollup_attempts=attempts,
+                    rollup_last_error=self._truncate_text(error, 180),
+                    rollup_last_attempt_at=now,
+                )
+            except Exception:
+                logger.exception("Failed to mark environment life rollup attempt for bucket=%s", getattr(item, "id", None))
+
+    async def _mark_environment_life_fragments_digested(
+        self,
+        fragments: list,
+        *,
+        linked_event_id: int | None,
+        rollup_bucket_id: str = "",
+        reason: str,
+    ) -> None:
+        if self.ob_client is None:
+            return
+        now = datetime.utcnow().isoformat()
+        for item in fragments:
+            try:
+                await self.ob_client.update(
+                    item.id,
+                    digested=True,
+                    resolved=True,
+                    digested_at=now,
+                    resolved_at=now,
+                    resolved_reason=reason,
+                    linked_event_id=linked_event_id or 0,
+                    rollup_bucket_id=rollup_bucket_id,
+                )
+            except Exception:
+                logger.exception("Failed to mark environment life fragment digested: %s", getattr(item, "id", None))
+
+    @staticmethod
+    def _environment_life_event_date(fragments: list) -> str:
+        for item in fragments:
+            meta = getattr(item, "metadata", {}) or {}
+            checkpoint = str(meta.get("checkpoint_cst") or "").strip()
+            if len(checkpoint) >= 10:
+                return checkpoint[:10]
+            created = str(meta.get("created") or "").strip()
+            if len(created) >= 10:
+                return created[:10]
+        return shanghai_now().date().isoformat()
 
     async def _ensure_active_conversation_time_claim(
         self,
@@ -1449,23 +2346,30 @@ class StateMachine:
                 previous_content = (
                     latest_snapshot.content if latest_snapshot else "（尚无历史状态记录）"
                 )
-                previous_env = self._snapshot_environment_dict(latest_snapshot)
-                catchup_max_steps = self.REQUEST_CATCHUP_MAX_STEPS
-
-                advance_result = await self._advance_until_locked(
-                    baseline_time=baseline_time,
-                    target_time=now,
-                    current_content=previous_content,
-                    previous_env=previous_env,
-                    max_steps=catchup_max_steps,
-                    trigger="get_current_state",
-                    snapshot_anchor_for_tail=snapshot_instant,
-                    enforce_tail_min_gap_rule=True,
-                    defer_maintenance=True,
-                    diagnostic=tracer,
-                )
-                current_content = str(advance_result["content"] or previous_content)
-                schedule_meta = dict(advance_result["schedule"])
+                current_content = str(previous_content or "")
+                raw_interval_seconds = (now - baseline_time).total_seconds()
+                interval_seconds = max(0.0, raw_interval_seconds)
+                schedule_meta = {
+                    "trigger": "get_current_state",
+                    "interval_hours": interval_seconds / 3600.0,
+                    "conversation_to_snapshot_gap_hours": (
+                        max(0.0, (now - snapshot_instant).total_seconds() / 3600.0)
+                        if snapshot_instant is not None
+                        else 0.0
+                    ),
+                    "n_full_intervals": 0,
+                    "remainder_hours": 0.0,
+                    "tail_allowed": False,
+                    "tail_appended": False,
+                    "equal_split_fallback": False,
+                    "note": "get_current_state returns latest snapshot only; request-time snapshot generation disabled",
+                    "baseline_time_cst": utc_naive_to_shanghai_iso(baseline_time),
+                    "target_time_cst": utc_naive_to_shanghai_iso(now),
+                    "planned_checkpoint_count": 0,
+                    "checkpoint_count": 0,
+                    "checkpoint_times_cst": [],
+                    "generated_snapshots": [],
+                }
                 schedule_meta["baseline_source"] = (
                     "latest_snapshot"
                     if snapshot_instant is not None
@@ -1497,15 +2401,11 @@ class StateMachine:
                     if effective_last_interaction is not None
                     else None
                 )
-                schedule_meta["returned_content_mode"] = (
-                    "latest_only"
-                    if not schedule_meta.get("generated_snapshots")
-                    else "catchup"
-                )
-                schedule_meta["request_checkpoint_cap"] = catchup_max_steps
-                schedule_meta["memory_search_mode"] = "per_checkpoint"
-                schedule_meta["event_anchor_mode"] = "per_checkpoint"
-                schedule_meta["maintenance_mode"] = "deferred"
+                schedule_meta["returned_content_mode"] = "latest_only"
+                schedule_meta["request_checkpoint_cap"] = 0
+                schedule_meta["memory_search_mode"] = "disabled_for_get_current_state"
+                schedule_meta["event_anchor_mode"] = "disabled_for_get_current_state"
+                schedule_meta["maintenance_mode"] = "not_scheduled"
                 logger.info(
                     "get_current_state schedule: %s",
                     json.dumps(schedule_meta, ensure_ascii=False),
@@ -1674,7 +2574,11 @@ class StateMachine:
                 }
 
             # 与 get_current_state 共用上限：单次 tick 只推进多格，避免大缺口靠「轮询次数 × 1 步」慢慢磨
-            catchup_max_steps = await self._get_snapshot_catchup_max_steps()
+            configured_catchup_max_steps = await self._get_snapshot_catchup_max_steps()
+            catchup_max_steps = min(
+                configured_catchup_max_steps,
+                self.SCHEDULER_CATCHUP_MAX_STEPS,
+            )
             self.snapshot_llm.begin_usage_tracking()
             report: dict | None = None
             try:
@@ -1686,6 +2590,7 @@ class StateMachine:
                     max_steps=catchup_max_steps,
                     trigger="snapshot_scheduler",
                     allow_tail_checkpoint=False,
+                    checkpoint_limit_mode="latest",
                 )
                 if advance_result["schedule"].get("generated_snapshots"):
                     report = await self._run_automation(trigger="snapshot_scheduler")
@@ -1700,8 +2605,10 @@ class StateMachine:
                     "status": "advanced" if gen else "idle",
                     "interval_sec": interval_sec,
                     "lag_hours": round(lag_seconds / 3600.0, 4),
+                    "interruption_hours": round(lag_seconds / 3600.0, 4),
                     "llm_usage": llm_usage,
                     "catchup_max_steps_per_tick": catchup_max_steps,
+                    "configured_catchup_max_steps_per_tick": configured_catchup_max_steps,
                 }
             )
             if not gen:
@@ -4240,24 +5147,62 @@ class StateMachine:
                 lines.append(f"- [{record_type}] {title}{suffix}")
         return "\n".join(lines)
 
+    async def _build_pinned_principles_context(self, limit: int = 5) -> str:
+        if self.ob_client is None:
+            return "（暂无稳定原则结晶）"
+        try:
+            if hasattr(self.ob_client, "recent_pinned"):
+                buckets = await self.ob_client.recent_pinned(limit=max(1, int(limit or 5)))
+            else:
+                all_buckets = await self.ob_client.list_buckets(include_archive=False)
+                buckets = [bucket for bucket in all_buckets if (getattr(bucket, "metadata", {}) or {}).get("pinned")]
+                buckets.sort(key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""), reverse=True)
+                buckets = buckets[: max(1, int(limit or 5))]
+        except Exception:
+            logger.exception("Failed to load pinned OB principles for injectable context.")
+            return "（稳定原则结晶暂时无法读取）"
+        if not buckets:
+            return "（暂无稳定原则结晶）"
+
+        lines: list[str] = []
+        for bucket in buckets[: max(1, int(limit or 5))]:
+            meta = getattr(bucket, "metadata", {}) or {}
+            bucket_id = str(meta.get("id") or getattr(bucket, "id", "") or "").strip()
+            title = (
+                str(meta.get("principle_title") or "").strip()
+                or str(meta.get("name") or "").strip()
+                or bucket_id
+                or "pinned principle"
+            )
+            domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip())
+            tags = ", ".join(str(t) for t in meta.get("tags", [])[:4] if str(t).strip())
+            created = str(meta.get("created") or "").strip()[:16]
+            label_parts = [part for part in [f"id={bucket_id}" if bucket_id else "", created, domains, f"tags={tags}" if tags else ""] if part]
+            label = f"（{' | '.join(label_parts)}）" if label_parts else ""
+            injection = str(meta.get("principle_injection") or "").strip()
+            if not injection:
+                card = meta.get("principle_card") if isinstance(meta.get("principle_card"), dict) else {}
+                principle = str(card.get("principle") or "").strip()
+                response_rule = str(card.get("response_rule") or "").strip()
+                avoid = str(card.get("avoid") or "").strip()
+                injection = "；".join(part for part in [principle, response_rule, f"避免：{avoid}" if avoid else ""] if part)
+            if not injection:
+                injection = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
+            injection = self._compact_structured_memory_text(injection)[:260]
+            if injection:
+                lines.append(f"- {title}{label}: {injection}")
+            else:
+                lines.append(f"- {title}{label}")
+        return "\n".join(lines)
+
     async def _build_injectable_context(self, snapshot_text: str) -> str:
         key_records_text = await self._build_recent_key_records_context(limit=5)
-        feel_text = await self._ob_feel_context_text(character_life_limit=1, other_limit=2)
-        plan_summary = "（今日尚无计划）"
-        if self.plan_engine is not None:
-            try:
-                plan_summary = await self.plan_engine.get_plan_summary_text()
-            except Exception:
-                logger.exception("Failed to load plan summary for injectable context.")
-        schedule_block = plan_summary.strip() or "（今日尚无计划）"
-        feel_block = feel_text.strip() or "（暂无可注入的 feel）"
+        pinned_principles_text = await self._build_pinned_principles_context(limit=5)
         return (
             "【近期关键记录】\n"
             f"{key_records_text}\n\n"
-            "【当前日程主条目】\n"
-            f"{schedule_block}\n\n"
-            "【近期 feel】\n"
-            f"{feel_block}"
+            "【稳定原则结晶】\n"
+            f"{pinned_principles_text}"
         )
 
     async def _build_recent_events_text(self, limit: int = 2) -> str:
@@ -4992,6 +5937,44 @@ class StateMachine:
 
     # --- Internal helpers ---
 
+    @staticmethod
+    def _limit_checkpoints(
+        checkpoints: list[datetime],
+        *,
+        max_steps: int | None,
+        mode: str = "oldest",
+    ) -> tuple[list[datetime], dict]:
+        normalized_mode = str(mode or "oldest").strip().lower()
+        if normalized_mode not in {"oldest", "latest"}:
+            normalized_mode = "oldest"
+
+        planned_count = len(checkpoints)
+        if max_steps is None or max_steps <= 0 or planned_count <= max_steps:
+            return list(checkpoints), {
+                "checkpoint_limit_mode": normalized_mode,
+                "checkpoint_max_steps": max_steps,
+                "skipped_older_checkpoint_count": 0,
+                "remaining_checkpoint_count": 0,
+                "limited_by_max_steps": False,
+            }
+
+        if normalized_mode == "latest":
+            limited = list(checkpoints[-max_steps:])
+            skipped_older = planned_count - len(limited)
+            remaining = 0
+        else:
+            limited = list(checkpoints[:max_steps])
+            skipped_older = 0
+            remaining = planned_count - len(limited)
+
+        return limited, {
+            "checkpoint_limit_mode": normalized_mode,
+            "checkpoint_max_steps": max_steps,
+            "skipped_older_checkpoint_count": skipped_older,
+            "remaining_checkpoint_count": remaining,
+            "limited_by_max_steps": True,
+        }
+
     async def _advance_until_locked(
         self,
         *,
@@ -5004,6 +5987,7 @@ class StateMachine:
         allow_tail_checkpoint: bool = True,
         snapshot_anchor_for_tail: datetime | None = None,
         enforce_tail_min_gap_rule: bool = False,
+        checkpoint_limit_mode: str = "oldest",
         defer_maintenance: bool = False,
         diagnostic: OperationTracer | None = None,
     ) -> dict:
@@ -5021,12 +6005,15 @@ class StateMachine:
             enforce_tail_min_gap_rule=enforce_tail_min_gap_rule,
             tail_min_gap_hours=self.TAIL_ONLY_SNAPSHOT_MIN_GAP_HOURS,
         )
-        due_checkpoints = list(planned_checkpoints)
-        if max_steps is not None and max_steps > 0:
-            due_checkpoints = due_checkpoints[:max_steps]
+        due_checkpoints, limit_meta = self._limit_checkpoints(
+            planned_checkpoints,
+            max_steps=max_steps,
+            mode=checkpoint_limit_mode,
+        )
 
         schedule_meta = {
             **base_meta,
+            **limit_meta,
             "trigger": trigger,
             "min_time_unit_hours": min_time_unit.total_seconds() / 3600.0,
             "baseline_time_cst": utc_naive_to_shanghai_iso(baseline_time),
@@ -5034,8 +6021,6 @@ class StateMachine:
             "planned_checkpoint_count": len(planned_checkpoints),
             "checkpoint_count": len(due_checkpoints),
             "checkpoint_times_cst": [utc_naive_to_shanghai_iso(t) for t in due_checkpoints],
-            "remaining_checkpoint_count": max(0, len(planned_checkpoints) - len(due_checkpoints)),
-            "limited_by_max_steps": len(due_checkpoints) < len(planned_checkpoints),
             "generated_snapshots": [],
         }
         if snapshot_anchor_for_tail is not None:
@@ -5090,6 +6075,16 @@ class StateMachine:
             )
             relationship_dynamics = "（关系动态已迁入 OB 记忆主干；此处不再注入计算出的关系结论。）"
             life_status = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
+
+        # Fetch the most recent conversation_end snapshot once per advance loop. Each
+        # checkpoint inside the loop will compute its own offline-hours relative to its own
+        # checkpoint_time (catch-up runs may process historical checkpoints).
+        try:
+            _latest_conv_end = await self.db.get_latest_snapshot_by_type("conversation_end")
+            conversation_end_instant_for_offline = self._snapshot_created_instant(_latest_conv_end)
+        except Exception:
+            logger.exception("Failed to fetch latest conversation_end snapshot for offline-hours calc.")
+            conversation_end_instant_for_offline = None
 
         for i, checkpoint_time in enumerate(due_checkpoints):
             checkpoint_index = i + 1
@@ -5187,6 +6182,13 @@ class StateMachine:
                 environment_context_details["disturbance_context"] = ""
                 environment_context_details["disturbance_schedule_effect"] = "none"
 
+            user_offline_hours_value, low_activity_mode_value = self._compute_user_offline_for_checkpoint(
+                checkpoint_time, conversation_end_instant_for_offline
+            )
+            open_loop_pool_text = await self._collect_open_loop_pool_text(
+                max_hours=48.0, max_items=8
+            )
+
             env = await self._trace_await(
                 diagnostic,
                 f"{trigger}.checkpoint_{checkpoint_index}.generate_environment",
@@ -5207,6 +6209,9 @@ class StateMachine:
                         "ob_life_context": environment_context_details.get("ob_life_context", ""),
                         "disturbance_context": environment_context_details.get("disturbance_context", ""),
                         "disturbance_schedule_effect": environment_context_details.get("disturbance_schedule_effect", "none"),
+                        "user_offline_hours": user_offline_hours_value,
+                        "low_activity_mode": low_activity_mode_value,
+                        "open_loop_pool": open_loop_pool_text,
                     },
                 ),
                 checkpoint_time_cst=checkpoint_cst,
@@ -5221,6 +6226,29 @@ class StateMachine:
                 env["disturbance_schedule_effect"] = str(
                     disturbance_result.get("disturbance_schedule_effect") or "none"
                 ).strip()
+
+            # 偶然性反推日程：若本 checkpoint 注入了强扰动（disturbance 改变了
+            # 后续日程走向），立即触发 maybe_replan，让 plan 反向响应 env 的偶然事件。
+            # 仅在循环的"最后一个 checkpoint"（即最接近 now 的那次生成）触发——
+            # catch-up 模式下的历史 checkpoint 不做回溯性 replan。
+            is_last_checkpoint = (i == len(due_checkpoints) - 1)
+            if (
+                is_last_checkpoint
+                and self.plan_engine is not None
+                and self._env_has_strong_disturbance(env)
+            ):
+                try:
+                    replan_context = self._format_disturbance_replan_context(env)
+                    await self.plan_engine.maybe_replan(
+                        trigger="disturbance_injected",
+                        context=replan_context,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Plan replan triggered by env disturbance failed (checkpoint=%s).",
+                        checkpoint_cst,
+                    )
+
             environment_text = environment_text_for_prompt(env)
             environment_retrieval_text = environment_text_for_retrieval(env)
             memory_results = await self._trace_await(
@@ -5327,14 +6355,18 @@ class StateMachine:
                 ),
                 checkpoint_time_cst=checkpoint_cst,
             )
-            environment_trace_body = self._build_environment_trace_content(env)
-            environment_trace_bucket_id = await self._trace_await(
+            environment_fragment = self._build_environment_life_fragment(
+                env,
+                checkpoint_cst=checkpoint_cst,
+                snapshot_id=int(snap_id or 0),
+            )
+            environment_fragment_bucket_id = await self._trace_await(
                 diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_environment_trace",
-                self._ob_hold_environment_trace(
-                    title=f"{checkpoint_cst} 环境推进",
-                    content=environment_trace_body,
-                    tags=["environment_trace", "character_life", trigger],
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_environment_life_fragment",
+                self._ob_hold_environment_life_fragment(
+                    title=f"{checkpoint_cst} 生活碎片",
+                    content=str(environment_fragment.get("content") or ""),
+                    tags=["environment_life_fragment", "character_life", trigger],
                     importance=5,
                     valence=0.5,
                     arousal=0.36,
@@ -5343,12 +6375,47 @@ class StateMachine:
                         "snapshot_id": int(snap_id or 0),
                         "checkpoint_cst": checkpoint_cst,
                         "source": "snapshot_scheduler",
-                        "source_kind": "environment_trace",
+                        "source_kind": "environment_life_fragment",
+                        "memory_role": "recent_life_event_candidate",
+                        "life_scope": "character_life",
+                        "life_theme": environment_fragment.get("life_theme", "general"),
+                        "group_key": environment_fragment.get("group_key", "environment_life:general"),
+                        "open_loop": environment_fragment.get("open_loop", ""),
+                        "plan_effect": environment_fragment.get("plan_effect", "on_track"),
+                        "has_disturbance": bool(environment_fragment.get("has_disturbance")),
+                        "disturbance_excerpt": environment_fragment.get("disturbance_excerpt", ""),
+                        "recent_disturbances_excerpt": environment_fragment.get("recent_disturbances_excerpt", ""),
                     },
                 ),
                 checkpoint_time_cst=checkpoint_cst,
-                trace_chars=len(environment_trace_body or ""),
+                fragment_chars=len(str(environment_fragment.get("content") or "")),
             )
+            environment_event_summary_bucket_id = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.ob_upsert_environment_event_summary",
+                self._ob_upsert_environment_event_summary(
+                    env=env,
+                    title="最新生活事件槽位",
+                    created=snap.created_at,
+                    extra_metadata={
+                        "snapshot_id": int(snap_id or 0),
+                        "checkpoint_cst": checkpoint_cst,
+                    },
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            environment_rollups = []
+            if environment_fragment_bucket_id:
+                environment_rollups = await self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.environment_life_rollup_scan",
+                    self._process_pending_environment_life_rollups(
+                        group_key=str(environment_fragment.get("group_key") or ""),
+                        reason=f"{trigger}.checkpoint",
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
+                    source_bucket_id=environment_fragment_bucket_id,
+                )
             await self._trace_await(
                 diagnostic,
                 f"{trigger}.checkpoint_{checkpoint_index}.append_relationship_thought",
@@ -5374,7 +6441,9 @@ class StateMachine:
                     "content": current_content,
                     "referenced_event_count": len(checkpoint_events),
                     "ob_life_bucket_id": ob_life_bucket_id,
-                    "environment_trace_bucket_id": environment_trace_bucket_id,
+                    "environment_fragment_bucket_id": environment_fragment_bucket_id,
+                    "environment_event_summary_bucket_id": environment_event_summary_bucket_id,
+                    "environment_rollups": environment_rollups,
                 }
             )
 
@@ -5986,6 +7055,7 @@ class StateMachine:
                 async with self._maintenance_lock:
                     await self._enforce_snapshot_limit()
                 report = await self._run_automation(trigger)
+                await self._process_pending_environment_life_rollups(reason=f"{trigger}.maintenance")
                 await self._persist_automation_report(report, llm_usage)
                 logger.info("Deferred maintenance completed for trigger=%s", trigger)
             except Exception:
@@ -6845,14 +7915,30 @@ class StateMachine:
             )
             events_text = self._format_checkpoint_event_dicts(environment_recent_events)
 
+            try:
+                _latest_conv_end = await self.db.get_latest_snapshot_by_type("conversation_end")
+                _conv_end_instant = self._snapshot_created_instant(_latest_conv_end)
+            except Exception:
+                _conv_end_instant = None
+            retry_offline_hours, retry_low_activity = self._compute_user_offline_for_checkpoint(
+                checkpoint_time, _conv_end_instant
+            )
+            retry_open_loop_pool = await self._collect_open_loop_pool_text(
+                max_hours=48.0, max_items=8
+            )
+
             env = await self.env_gen.generate(
                 time_point=checkpoint_time,
                 previous_env=previous_env if isinstance(previous_env, dict) else None,
                 context={
-                    "latest_snapshot": previous_snapshot_content,
+                    # latest_snapshot 不再注入：状态快照只服务前端，不进后台生活流。
+                    "latest_snapshot": "",
                     "time_delta_hours": 0.0,
                     "recent_events": environment_recent_events,
                     "current_plan_activity": current_plan_activity,
+                    "user_offline_hours": retry_offline_hours,
+                    "low_activity_mode": retry_low_activity,
+                    "open_loop_pool": retry_open_loop_pool,
                 },
                 allow_retry_fallback=False,
             )
@@ -6902,6 +7988,50 @@ class StateMachine:
                 content=new_content,
                 environment=json.dumps(env, ensure_ascii=False),
             )
+            checkpoint_cst = utc_naive_to_shanghai_iso(checkpoint_time)
+            environment_fragment = self._build_environment_life_fragment(
+                env,
+                checkpoint_cst=checkpoint_cst,
+                snapshot_id=snapshot_id,
+            )
+            fragment_id = await self._ob_hold_environment_life_fragment(
+                title=f"{checkpoint_cst} 生活碎片",
+                content=str(environment_fragment.get("content") or ""),
+                tags=["environment_life_fragment", "character_life", "env_retry"],
+                importance=5,
+                valence=0.5,
+                arousal=0.36,
+                created=snapshot.created_at,
+                extra_metadata={
+                    "snapshot_id": snapshot_id,
+                    "checkpoint_cst": checkpoint_cst,
+                    "source": "snapshot_scheduler",
+                    "source_kind": "environment_life_fragment",
+                    "memory_role": "recent_life_event_candidate",
+                    "life_scope": "character_life",
+                    "life_theme": environment_fragment.get("life_theme", "general"),
+                    "group_key": environment_fragment.get("group_key", "environment_life:general"),
+                    "open_loop": environment_fragment.get("open_loop", ""),
+                    "plan_effect": environment_fragment.get("plan_effect", "on_track"),
+                    "has_disturbance": bool(environment_fragment.get("has_disturbance")),
+                    "disturbance_excerpt": environment_fragment.get("disturbance_excerpt", ""),
+                    "recent_disturbances_excerpt": environment_fragment.get("recent_disturbances_excerpt", ""),
+                },
+            )
+            await self._ob_upsert_environment_event_summary(
+                env=env,
+                title="最新生活事件槽位",
+                created=snapshot.created_at,
+                extra_metadata={
+                    "snapshot_id": snapshot_id,
+                    "checkpoint_cst": checkpoint_cst,
+                },
+            )
+            if fragment_id:
+                await self._process_pending_environment_life_rollups(
+                    group_key=str(environment_fragment.get("group_key") or ""),
+                    reason="env_retry",
+                )
 
             logger.info("Deferred environment retry refreshed snapshot=%d", snapshot_id)
 
