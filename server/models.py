@@ -51,6 +51,11 @@ class StateSnapshot(BaseModel):
     environment: str = "{}"
     referenced_events: str = "[]"
     embedding_vector_id: str | None = None
+    # B2 in-flight idempotency barrier
+    status: Literal["in_flight", "done", "failed"] = "done"
+    prompt_hash: str | None = None
+    attempt_count: int = 0
+    started_at: str | None = None
 
     @computed_field
     @property

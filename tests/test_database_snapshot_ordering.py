@@ -31,7 +31,11 @@ def test_snapshot_ordering_uses_actual_instant_for_mixed_timezone_strings():
                     content TEXT NOT NULL DEFAULT '',
                     environment TEXT NOT NULL DEFAULT '{}',
                     referenced_events TEXT NOT NULL DEFAULT '[]',
-                    embedding_vector_id TEXT
+                    embedding_vector_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'done',
+                    prompt_hash TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT
                 )"""
             )
             older = await conn.execute(
@@ -80,7 +84,11 @@ def test_insert_snapshot_normalizes_created_at_to_utc_z():
                     content TEXT NOT NULL DEFAULT '',
                     environment TEXT NOT NULL DEFAULT '{}',
                     referenced_events TEXT NOT NULL DEFAULT '[]',
-                    embedding_vector_id TEXT
+                    embedding_vector_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'done',
+                    prompt_hash TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT
                 )"""
             )
             snap_id = await db.insert_snapshot(
@@ -114,7 +122,11 @@ def test_snapshot_keyword_search_uses_actual_instant_order_for_mixed_timezones()
                     content TEXT NOT NULL DEFAULT '',
                     environment TEXT NOT NULL DEFAULT '{}',
                     referenced_events TEXT NOT NULL DEFAULT '[]',
-                    embedding_vector_id TEXT
+                    embedding_vector_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'done',
+                    prompt_hash TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT
                 )"""
             )
             older = await conn.execute(
