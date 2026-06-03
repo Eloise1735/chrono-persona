@@ -33,6 +33,9 @@ def environment_text_for_prompt(env: dict | None) -> str:
     )
     body = str(env.get("activity") or "").strip()
     synopsis = str(env.get("summary") or "").strip()
+    event_summary = str(env.get("event_summary") or "").strip()
+    if event_summary:
+        synopsis = f"{synopsis}\n\nEvent summary:\n{event_summary}".strip() if synopsis else f"Event summary:\n{event_summary}"
     plan_delta = str(env.get("plan_delta") or "").strip()
     if plan_delta:
         synopsis = f"{synopsis}\n\nPlan delta: {plan_delta}".strip() if synopsis else f"Plan delta: {plan_delta}"
@@ -50,6 +53,9 @@ def environment_text_for_prompt(env: dict | None) -> str:
 def environment_text_for_retrieval(env: dict | None) -> str:
     if not env or not isinstance(env, dict):
         return ""
+    event_summary = str(env.get("event_summary") or "").strip()
+    if event_summary:
+        return event_summary
     retrieval = str(env.get("retrieval_summary") or "").strip()
     if retrieval:
         return retrieval
@@ -73,7 +79,10 @@ class EnvironmentGenerator(ABC):
 
 
 class TemplateEnvironmentGenerator(EnvironmentGenerator):
-    MAX_CHARACTER_STATE_CHARS = 10000
+    # NOTE: MAX_CHARACTER_STATE_CHARS was used by _clip_character_state in the V1
+    # era when snapshot content was injected into env generation. That injection
+    # has been removed (state-snapshot is frontend-only by design), so both the
+    # constant and the helper are gone.
     MAX_WORLD_BOOK_ITEMS = 3
     MAX_WORLD_BOOK_ITEM_CHARS = 200
     MAX_RECENT_EVENTS = 5
@@ -90,7 +99,7 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
     }
     WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     ENV_LLM_SYSTEM_PROMPT = (
-        "You are the environment generator. Output exactly three sections: [Environment Body], [Summary], [Retrieval Summary]. "
+        "You are the environment generator. Output exactly four sections: [Environment Body], [Summary], [Retrieval Summary], [Event Summary]. "
         "Do not output chatty prefaces, JSON, or code blocks."
     )
 
@@ -112,23 +121,54 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 break
         return s.strip()
 
+    # 与 [Summary] 中合法的 User reference mode 取值。
+    # speculative 表示 LLM 自评本段对泳琳的处理出现了违规——会被下游标 speculative_about_user=True。
+    VALID_USER_REFERENCE_MODES = {"none", "signal_only", "anticipation", "memory_recall", "speculative"}
+
     @classmethod
-    def parse_environment_llm_output(cls, raw: str) -> tuple[str, str, str]:
+    def _extract_user_reference_mode(cls, summary_text: str) -> str:
+        """从 [Summary] 段提取 `User reference mode:` 自评字段。
+
+        缺失或不可识别时返回 "unknown"。
+        """
+        text = str(summary_text or "").strip()
+        if not text:
+            return "unknown"
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            lowered = line.lower()
+            if lowered.startswith("user reference mode:"):
+                value = line.split(":", 1)[1].strip().lower()
+                # 截到第一个空白或括号前，避免把解释文字混进取值
+                value = re.split(r"[\s（(]", value, maxsplit=1)[0].strip()
+                if value in cls.VALID_USER_REFERENCE_MODES:
+                    return value
+                return "unknown"
+        return "unknown"
+
+    @classmethod
+    def parse_environment_llm_output(cls, raw: str) -> tuple[str, str, str, str]:
         text = (raw or "").strip()
         if not text:
-            return "", "", ""
+            return "", "", "", ""
         parts = [p.strip() for p in re.split(r"\n\s*(?:-{3,}|\*{3,})\s*\n", text) if p.strip()]
+        event_summary = ""
         if len(parts) >= 3:
             body = cls._strip_env_section_header(parts[0], ("[????]", "????", "[Environment Body]", "Environment Body"))
             summary = cls._strip_env_section_header(parts[1], ("[????]", "????", "[Summary]", "Summary"))
             retrieval = cls._strip_env_section_header(parts[2], ("[????]", "????", "[Retrieval Summary]", "Retrieval Summary"))
-            return body.strip(), summary.strip(), retrieval.strip()
+            if len(parts) >= 4:
+                event_summary = cls._strip_env_section_header(
+                    parts[3],
+                    ("[Event Summary]", "Event Summary", "## 事件总结", "事件总结"),
+                )
+            return body.strip(), summary.strip(), retrieval.strip(), event_summary.strip()
         if len(parts) == 2:
             body = cls._strip_env_section_header(parts[0], ("[????]", "????", "[Environment Body]", "Environment Body"))
             summary = cls._strip_env_section_header(parts[1], ("[????]", "????", "[Summary]", "Summary"))
-            return body.strip(), summary.strip(), ""
+            return body.strip(), summary.strip(), "", ""
         body = cls._strip_env_section_header(text, ("[????]", "????", "[Environment Body]", "Environment Body"))
-        return body.strip(), "", ""
+        return body.strip(), "", "", ""
 
     @staticmethod
     def _narrative_local_time(time_point: datetime) -> datetime:
@@ -137,13 +177,6 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         else:
             utc_naive = time_point
         return utc_naive.replace(tzinfo=timezone.utc).astimezone(DISPLAY_TZ)
-
-    @classmethod
-    def _clip_character_state(cls, text: str) -> str:
-        t = (text or "").strip()
-        if len(t) <= cls.MAX_CHARACTER_STATE_CHARS:
-            return t
-        return t[: cls.MAX_CHARACTER_STATE_CHARS].rstrip() + "\n...(truncated previous state for continuity)"
 
     async def generate(self, time_point: datetime, previous_env: dict | None, context: dict, *, allow_retry_fallback: bool = True) -> dict:
         leak_key = "ob_" "relationship_context"
@@ -156,10 +189,9 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         narr = self._narrative_local_time(time_point)
         period = self._get_period(narr.hour)
         weekday = self.WEEKDAY_NAMES[narr.weekday()]
-        latest_snapshot = str(context.get("latest_snapshot", "") or "")
-        character_state = self._clip_character_state(latest_snapshot)
-        if not character_state:
-            character_state = "（状态快照不注入后台生活流；请依据 OB feel 与环境连续性推进。）"
+        # latest_snapshot / character_state 已彻底从 env 生成上下文移除——
+        # 状态快照只服务前端当下展示，不进入后台生活流。这里保留 context.get 兼容旧调用，
+        # 但不再用于 prompt 渲染。
         time_delta_hours = float(context.get("time_delta_hours", 0.0) or 0.0)
         recent_events = context.get("recent_events") or []
         current_plan_activity = str(context.get("current_plan_activity") or "").strip()
@@ -172,6 +204,19 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
         disturbance_context = str(context.get("disturbance_context") or "").strip()
         recent_disturbances = str(context.get("recent_disturbances") or "").strip()
         disturbance_schedule_effect = str(context.get("disturbance_schedule_effect") or "").strip()
+        # 用户离线信号：由 state_machine 上层根据 conversation_end_instant 计算并注入。
+        # 阈值 5h 与 env 调度周期对齐——错过一个完整周期即视为离线，触发低活动模式，
+        # 让角色把焦点回归自己的生活，而不是围着用户转。
+        try:
+            user_offline_hours = float(context.get("user_offline_hours") or 0.0)
+        except (TypeError, ValueError):
+            user_offline_hours = 0.0
+        low_activity_mode = bool(context.get("low_activity_mode"))
+        # 未完成线索池：来自 state_machine._collect_open_loop_pool_text，
+        # 给 env 自然呼应 / 推进 / 淡化的入口；不在 context 里就退化为空提示。
+        open_loop_pool = str(context.get("open_loop_pool") or "").strip()
+        if not open_loop_pool:
+            open_loop_pool = "(近 48h 无未完成线索)"
         recent_events_text = self._format_recent_events(recent_events)
         time_elapsed = self._format_time_elapsed(time_delta_hours)
         continuity = self._build_continuity(previous_env)
@@ -188,7 +233,7 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "Recent OB feel surfacing: {ob_life_context}\n"
                 "Recent OB breath events (snapshot buckets excluded): {recent_events}\nDisturbance context: {disturbance_context}\n"
                 "Recent disturbances: {recent_disturbances}\n\n"
-                "Output exactly three sections split by --- :\n"
+                "Output exactly four sections split by --- :\n"
                 "[Environment Body]\n...\n---\n[Summary]\n"
                 "Core focus: ...\n"
                 "Immediate changes: ...\n"
@@ -198,9 +243,20 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "Open loop: ...\n"
                 "Plan delta: on_track / interrupted / delayed / replaced_by_conversation / unexpected_insert / inward_digging.\n"
                 "---\n[Retrieval Summary]\n1-3 sentences with high-density searchable entities, places, actions, state changes, and unresolved items."
+                "\n---\n[Event Summary]\n- 1-5 foreground-readable bullets with compressed event progress."
             )
         elif "Retrieval Summary" not in template and "????" not in template:
             template += "\n\nOutput exactly three sections split by --- :\n[Environment Body]\n...\n---\n[Summary]\n...\n---\n[Retrieval Summary]\n1-2 sentences with searchable entities, places, actions, and state lines."
+        if "Event Summary" not in template and "事件总结" not in template:
+            template += (
+                "\n\n[Event summary requirement]\n"
+                "Output a fourth section split by --- after [Retrieval Summary]:\n"
+                "[Event Summary]\n"
+                "- 1-5 short bullet points, readable by the foreground model.\n"
+                "- Extract only compressed event progress from the current environment.\n"
+                "- Do not repeat clue-like sensory fragments unless they changed the situation.\n"
+                "- This is not the next-environment continuity clue; it is a point-form event record."
+            )
         if "disturbance_context" not in template:
             template += (
                 "\n\n[Disturbance bridge]\n"
@@ -214,6 +270,9 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "{ob_life_context}\n"
                 "Use these first-person feel entries as the continuity source for Kelsey's own life. Do not inject or paraphrase the latest snapshot separately."
             )
+        # latest_snapshot / character_state 仍以空串显式传入——
+        # 兼容仍持有旧 {character_state} / {latest_snapshot} 占位符的 DB 模板，
+        # 防止 KeyError；V2 prompt 已经移除这两个占位符。
         rendered_prompt = template.format(
             time=narr.isoformat(timespec="seconds"),
             date=narr.strftime("%Y-%m-%d"),
@@ -221,10 +280,11 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             time_period=period,
             previous_env=json.dumps(previous_env or {}, ensure_ascii=False),
             continuity=continuity,
-            latest_snapshot=character_state,
+            latest_snapshot="",
             time_elapsed=time_elapsed,
-            character_state=character_state,
+            character_state="",
             recent_events=recent_events_text,
+            open_loop_pool=open_loop_pool,
             current_plan_summary=current_plan_summary or "(no schedule skeleton today)",
             current_conversation_state=current_conversation_state or "(no active conversation time claim)",
             recent_trace_summary=recent_trace_summary,
@@ -234,6 +294,8 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             disturbance_context=disturbance_context or "(no active disturbance)",
             recent_disturbances=recent_disturbances or "(no recent disturbances)",
             disturbance_schedule_effect=disturbance_schedule_effect or "none",
+            user_offline_hours=f"{user_offline_hours:.1f}",
+            low_activity_mode="true" if low_activity_mode else "false",
             location="",
             weather="",
             activity=current_plan_activity,
@@ -258,10 +320,11 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 {"role": "system", "content": self.ENV_LLM_SYSTEM_PROMPT},
                 {"role": "user", "content": rendered_prompt},
             ], temperature=0.8, max_tokens=8192)
-            body, summary, retrieval = self.parse_environment_llm_output((raw or "").strip())
+            body, summary, retrieval, event_summary = self.parse_environment_llm_output((raw or "").strip())
             activity_text = body or (raw or "").strip()
             summary_text = summary
             retrieval_summary = retrieval or self._build_retrieval_summary(summary_text=summary_text, activity_text=activity_text, recent_events_text=recent_events_text)
+            user_reference_mode = self._extract_user_reference_mode(summary_text)
             return {
                 "time": narr.isoformat(timespec="seconds"),
                 "time_period": period,
@@ -273,6 +336,8 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
                 "continuity": continuity,
                 "summary": summary_text,
                 "retrieval_summary": retrieval_summary,
+                "event_summary": event_summary,
+                "user_reference_mode": user_reference_mode,
                 "current_plan_summary": current_plan_summary,
                 "current_conversation_state": current_conversation_state,
                 "recent_trace_summary": recent_trace_summary,
@@ -305,6 +370,8 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             "activity": activity,
             "summary": summary,
             "retrieval_summary": retrieval,
+            "event_summary": str(previous_env.get("event_summary") or "").strip(),
+            "user_reference_mode": str(previous_env.get("user_reference_mode") or "unknown").strip(),
             "disturbance_context": str(previous_env.get("disturbance_context") or "").strip(),
             "recent_disturbances": str(previous_env.get("recent_disturbances") or "").strip(),
             "disturbance_schedule_effect": str(previous_env.get("disturbance_schedule_effect") or "").strip(),
@@ -327,6 +394,8 @@ class TemplateEnvironmentGenerator(EnvironmentGenerator):
             "continuity": continuity,
             "summary": summary,
             "retrieval_summary": retrieval,
+            "event_summary": str(previous_env.get("event_summary") or "").strip(),
+            "user_reference_mode": str(previous_env.get("user_reference_mode") or "unknown").strip(),
             "disturbance_context": str(previous_env.get("disturbance_context") or "").strip(),
             "recent_disturbances": str(previous_env.get("recent_disturbances") or "").strip(),
             "disturbance_schedule_effect": str(previous_env.get("disturbance_schedule_effect") or "").strip(),

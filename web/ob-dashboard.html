@@ -271,6 +271,14 @@
                 <option value="true">包含归档</option>
               </select>
             </div>
+            <div class="ob-field">
+              <label>侧别</label>
+              <select class="ob-select" id="life-scope" title="角色侧 = 自动生成的 character_life buckets（fragment / rollup / 当下事件总结等）；用户侧 = 你自己入库的关系侧 / 跨域内容">
+                <option value="user" selected>仅用户侧（默认）</option>
+                <option value="character">仅角色侧</option>
+                <option value="all">全部</option>
+              </select>
+            </div>
           </div>
           <div class="ob-bulk-bar">
             <button class="ob-btn secondary" id="select-visible" type="button">选择当前显示</button>
@@ -371,6 +379,9 @@
               <button class="ob-btn" id="run-feel-crystals" type="button">扫描结晶</button>
             </div>
           </div>
+          <div class="ob-checks">
+            <label><input type="checkbox" id="crystal-include-processed" /> 包含已结晶 feel（用于恢复/复查）</label>
+          </div>
           <div class="ob-status" id="crystal-status"></div>
           <div class="ob-grid" id="crystal-results" style="margin-top:12px"></div>
         </section>
@@ -447,6 +458,13 @@
           <label><input type="checkbox" id="bucket-pinned" /> pinned</label>
           <label><input type="checkbox" id="bucket-protected" /> protected</label>
           <label><input type="checkbox" id="bucket-resolved" /> resolved</label>
+          <label><input type="checkbox" id="bucket-crystallized" /> crystallized</label>
+          <label><input type="checkbox" id="bucket-digested" /> digested</label>
+        </div>
+        <div class="ob-status" id="bucket-lifecycle-summary"></div>
+        <div class="ob-field">
+          <label>Crystal targets</label>
+          <input class="ob-input" id="bucket-crystallized-into" readonly />
         </div>
         <div class="ob-field">
           <label>Content</label>
@@ -467,6 +485,22 @@
   <button class="ob-btn secondary ob-back-top" id="back-to-top" type="button">回到顶部</button>
 
   <script>
+    const ADMIN_TOKEN_STORAGE_KEY = 'kelsey_admin_token';
+    const ADMIN_TOKEN_QUERY_PARAM = 'kelsey_token';
+
+    function bootstrapAdminTokenFromUrl() {
+      const params = new URLSearchParams(window.location.search || '');
+      const token = (params.get(ADMIN_TOKEN_QUERY_PARAM) || '').trim();
+      if (!token) return;
+      localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+      params.delete(ADMIN_TOKEN_QUERY_PARAM);
+      const nextQuery = params.toString();
+      const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash || ''}`;
+      window.history.replaceState({}, '', nextUrl);
+    }
+
+    bootstrapAdminTokenFromUrl();
+
     const state = { buckets: [], breath: [], dream: [], crystals: [], selected: null, typeFilter: 'all', selectedIds: new Set() };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -484,9 +518,12 @@
       .replace(/[\s"'“”‘’`《》〈〉「」『』【】\[\]（）()，,。.!！?？:：;；、\-—_·]/g, '');
 
     async function api(path, options = {}) {
+      const token = localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '';
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      if (token) headers['X-Kelsey-Admin-Token'] = token;
       const res = await fetch(path, {
         ...options,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
+        headers,
       });
       const text = await res.text();
       const data = text ? JSON.parse(text) : {};
@@ -722,24 +759,51 @@
           ${esc(item.excerpt || item.content || '')}
         </div>
       `).join('');
-      const suggested = cluster.suggested_content || cluster.suggested_core || '';
+      const preview = cluster.preview || {};
+      const previewError = cluster.preview_error || '';
+      const busy = !!cluster.crystallizing;
+      const done = !!cluster.crystallized;
+      const sourceSummary = preview.source_summary || '';
+      const principle = preview.principle_preview || cluster.suggested_content || cluster.suggested_core || '';
+      const keyRecord = preview.key_record_preview || principle;
+      const feel = preview.feel_preview || principle;
       return `
         <article class="ob-card crystal-card" data-index="${index}">
           <h3>${esc(cluster.cluster_id || `cluster-${index + 1}`)}</h3>
           <div class="ob-meta">
             <span class="ob-pill">${esc((cluster.feel_ids || []).length)} feel</span>
             ${hidden ? `<span class="ob-pill">${hidden} hidden</span>` : ''}
+            ${preview.generated_by ? `<span class="ob-pill">${esc(preview.generated_by)}</span>` : ''}
+            ${preview.copy_score !== undefined ? `<span class="ob-pill">copy ${esc(preview.copy_score)}</span>` : ''}
           </div>
-          ${excerpts || '<div class="ob-empty">没有可展示摘录。</div>'}
+          ${previewError ? `<div class="ob-status" style="margin-top:8px;color:#9f2d2d">${esc(previewError)}</div>` : ''}
+          ${sourceSummary ? `<div class="ob-detail-content" style="margin-top:8px">${esc(sourceSummary)}</div>` : ''}
+          ${done ? `<div class="ob-status" style="margin-top:8px">已写入：${esc(cluster.crystal_result || '')}</div>` : ''}
+          <details style="margin-top:8px">
+            <summary class="ob-muted">源 feel 摘录</summary>
+            ${excerpts || '<div class="ob-empty">没有可展示摘录。</div>'}
+          </details>
           <div class="ob-field" style="margin-top:10px">
-            <label>结晶预览</label>
-            <textarea class="ob-textarea crystal-preview" data-index="${index}">${esc(suggested)}</textarea>
+            <label>OB principle 预览</label>
+            <textarea class="ob-textarea crystal-preview-principle" data-index="${index}">${esc(principle)}</textarea>
+          </div>
+          <div class="ob-field" style="margin-top:10px">
+            <label>key_record 预览</label>
+            <textarea class="ob-textarea crystal-preview-key" data-index="${index}">${esc(keyRecord)}</textarea>
+          </div>
+          <div class="ob-field" style="margin-top:10px">
+            <label>普通 feel 浓缩预览</label>
+            <textarea class="ob-textarea crystal-preview-feel" data-index="${index}">${esc(feel)}</textarea>
+          </div>
+          <div class="ob-checks" style="margin-top:10px">
+            <label><input type="checkbox" class="crystal-target-principle" data-index="${index}" checked /> OB principle</label>
+            <label><input type="checkbox" class="crystal-target-key" data-index="${index}" /> key_record</label>
+            <label><input type="checkbox" class="crystal-target-feel" data-index="${index}" /> 普通 feel 浓缩</label>
+            <label><input type="checkbox" class="crystal-include-all" data-index="${index}" ${hidden ? 'checked' : ''} /> ${hidden ? `处理整个 cluster（共 ${(cluster.feel_ids || []).length} 条）` : '处理当前 cluster'}</label>
           </div>
           <div class="ob-actions">
-            <button class="ob-btn crystal-write" type="button" data-index="${index}" data-mode="principle">OB principle</button>
-            <button class="ob-btn secondary crystal-write" type="button" data-index="${index}" data-mode="thread">key_record</button>
-            <button class="ob-btn secondary crystal-write" type="button" data-index="${index}" data-mode="both">both</button>
-            <button class="ob-btn secondary crystal-write" type="button" data-index="${index}" data-mode="feel">普通 feel 浓缩</button>
+            <button class="ob-btn crystal-write-selected" type="button" data-index="${index}" ${busy || done ? 'disabled' : ''}>写入勾选项</button>
+            <button class="ob-btn secondary crystal-restore" type="button" data-index="${index}" ${busy ? 'disabled' : ''}>撤销结晶标记</button>
           </div>
         </article>
       `;
@@ -749,8 +813,16 @@
       $('crystal-results').innerHTML = state.crystals.length
         ? state.crystals.map(crystalCardHtml).join('')
         : '<div class="ob-empty">没有发现可结晶的 feel cluster。</div>';
-      $('crystal-results').querySelectorAll('.crystal-write').forEach(btn => {
-        btn.addEventListener('click', () => crystallizeCluster(Number(btn.dataset.index), btn.dataset.mode)
+      $('crystal-results').querySelectorAll('.crystal-write-selected').forEach(btn => {
+        const cluster = state.crystals[Number(btn.dataset.index)];
+        if (cluster?.crystallizing) btn.disabled = true;
+        btn.addEventListener('click', () => crystallizeCluster(Number(btn.dataset.index))
+          .catch(err => setStatus('crystal-status', err.message)));
+      });
+      $('crystal-results').querySelectorAll('.crystal-restore').forEach(btn => {
+        const cluster = state.crystals[Number(btn.dataset.index)];
+        if (cluster?.crystallizing) btn.disabled = true;
+        btn.addEventListener('click', () => restoreCrystalCluster(Number(btn.dataset.index))
           .catch(err => setStatus('crystal-status', err.message)));
       });
     }
@@ -776,6 +848,19 @@
       $('bucket-pinned').checked = !!meta.pinned;
       $('bucket-protected').checked = !!meta.protected;
       $('bucket-resolved').checked = !!meta.resolved;
+      $('bucket-crystallized').checked = !!meta.crystallized;
+      $('bucket-digested').checked = !!meta.digested;
+      $('bucket-crystallized-into').value = Array.isArray(meta.crystallized_into)
+        ? meta.crystallized_into.join(', ')
+        : String(meta.crystallized_into || '');
+      const lifecycle = [];
+      lifecycle.push(`type=${typeOf(item)}`);
+      if (meta.source_bucket) lifecycle.push(`source=${meta.source_bucket}`);
+      if (meta.crystallized) lifecycle.push(`crystallized=${meta.crystallized_mode || 'true'}`);
+      if (meta.crystallized_at) lifecycle.push(`at=${meta.crystallized_at}`);
+      if (meta.digested) lifecycle.push('digested=true');
+      if (meta.resolved) lifecycle.push('resolved=true');
+      $('bucket-lifecycle-summary').textContent = lifecycle.join(' | ');
       $('bucket-content').value = item.content || '';
       $('make-dynamic-selected').disabled = false;
       $('make-permanent-selected').disabled = false;
@@ -802,7 +887,9 @@
       $('bucket-importance').value = 5;
       $('bucket-valence').value = 0.5;
       $('bucket-arousal').value = 0.3;
-      ['bucket-pinned', 'bucket-protected', 'bucket-resolved'].forEach(id => $(id).checked = false);
+      ['bucket-pinned', 'bucket-protected', 'bucket-resolved', 'bucket-crystallized', 'bucket-digested'].forEach(id => $(id).checked = false);
+      $('bucket-crystallized-into').value = '';
+      $('bucket-lifecycle-summary').textContent = '';
       ['make-dynamic-selected', 'make-permanent-selected', 'archive-selected', 'restore-selected'].forEach(id => $(id).disabled = true);
       setStatus('edit-status', '');
     }
@@ -819,6 +906,8 @@
         pinned: $('bucket-pinned').checked,
         protected: $('bucket-protected').checked,
         resolved: $('bucket-resolved').checked,
+        crystallized: $('bucket-crystallized').checked,
+        digested: $('bucket-digested').checked,
         source_bucket: $('source-bucket').value.trim(),
         content: $('bucket-content').value.trim()
       };
@@ -832,7 +921,11 @@
     async function loadBuckets() {
       setStatus('list-status', '正在加载 bucket...');
       const includeArchive = $('include-archive').value === 'true';
-      const data = await api(`/api/ob/buckets?include_archive=${includeArchive}&limit=500`);
+      const lifeScopeEl = $('life-scope');
+      const lifeScope = lifeScopeEl ? lifeScopeEl.value : 'user';
+      const data = await api(
+        `/api/ob/buckets?include_archive=${includeArchive}&limit=500&life_scope=${encodeURIComponent(lifeScope)}`
+      );
       state.buckets = data.items || [];
       const knownIds = new Set(state.buckets.map(item => item.id));
       [...state.selectedIds].forEach(id => {
@@ -973,29 +1066,69 @@
         method: 'POST',
         body: JSON.stringify({
           limit: Number($('crystal-limit').value || 3),
-          max_items_per_cluster: Number($('crystal-max-items').value || 5)
+          max_items_per_cluster: Number($('crystal-max-items').value || 5),
+          include_crystallized: $('crystal-include-processed').checked
         })
       });
       state.crystals = data.clusters || [];
+      setStatus('crystal-status', `返回 ${state.crystals.length} 个 cluster，正在生成综合预览...`);
+      for (let i = 0; i < state.crystals.length; i += 1) {
+        const cluster = state.crystals[i];
+        try {
+          const previewData = await api('/api/ob/feel-crystals/preview', {
+            method: 'POST',
+            body: JSON.stringify({
+              cluster_id: cluster.cluster_id,
+              include_all: true,
+              min_cluster_size: 3,
+              min_similarity: 0.7,
+              include_crystallized: $('crystal-include-processed').checked
+            })
+          });
+          cluster.preview = previewData.preview || {};
+          cluster.preview_error = '';
+          cluster.preview_source_count = previewData.source_count || 0;
+          renderCrystalResults();
+          setStatus('crystal-status', `综合预览 ${i + 1}/${state.crystals.length} 完成`);
+        } catch (err) {
+          cluster.preview = {};
+          cluster.preview_error = err.message || String(err);
+          renderCrystalResults();
+        }
+      }
       setStatus('crystal-status', `返回 ${state.crystals.length} 个 cluster${data.has_more ? '，还有下一页' : ''}`);
       renderCrystalResults();
     }
 
-    async function crystallizeCluster(index, mode) {
+    async function crystallizeCluster(index) {
       const cluster = state.crystals[index];
       if (!cluster) return;
-      const textarea = $('crystal-results').querySelector(`.crystal-preview[data-index="${index}"]`);
-      const content = (textarea?.value || '').trim();
-      if (!content) {
-        setStatus('crystal-status', '请先填写结晶预览内容。');
+      if (cluster.crystallizing) return;
+      const principleText = ($('crystal-results').querySelector(`.crystal-preview-principle[data-index="${index}"]`)?.value || '').trim();
+      const keyText = ($('crystal-results').querySelector(`.crystal-preview-key[data-index="${index}"]`)?.value || '').trim();
+      const feelText = ($('crystal-results').querySelector(`.crystal-preview-feel[data-index="${index}"]`)?.value || '').trim();
+      const wantsPrinciple = !!$('crystal-results').querySelector(`.crystal-target-principle[data-index="${index}"]`)?.checked;
+      const wantsKey = !!$('crystal-results').querySelector(`.crystal-target-key[data-index="${index}"]`)?.checked;
+      const wantsFeel = !!$('crystal-results').querySelector(`.crystal-target-feel[data-index="${index}"]`)?.checked;
+      if (!wantsPrinciple && !wantsKey && !wantsFeel) {
+        setStatus('crystal-status', '请先勾选至少一个写入目标。');
+        return;
+      }
+      if (wantsPrinciple && !principleText) {
+        setStatus('crystal-status', '请先填写 OB principle 预览内容。');
+        return;
+      }
+      if (wantsKey && !keyText) {
+        setStatus('crystal-status', '请先填写 key_record 预览内容。');
+        return;
+      }
+      if (wantsFeel && !feelText) {
+        setStatus('crystal-status', '请先填写普通 feel 浓缩预览内容。');
         return;
       }
       const hidden = Number(cluster.hidden_count || 0);
-      const includeAll = hidden > 0
-        ? confirm(`这个 cluster 还有 ${hidden} 条未展示 feel。确定处理整个 cluster？取消则只处理当前显示项。`)
-        : true;
-      const payload = {
-        mode,
+      const includeAll = !!$('crystal-results').querySelector(`.crystal-include-all[data-index="${index}"]`)?.checked;
+      const basePayload = {
         cluster_id: cluster.cluster_id,
         include_all: includeAll,
         feel_ids: includeAll ? [] : (cluster.items || []).map(item => item.id).filter(Boolean),
@@ -1004,22 +1137,70 @@
         key_record_type: 'auto',
         key_record_title: 'Feel crystal'
       };
-      if (mode === 'principle') payload.principle_content = content;
-      if (mode === 'thread') payload.key_record_content = content;
-      if (mode === 'both') {
-        payload.principle_content = content;
-        payload.key_record_content = content;
+      const writes = [];
+      if (wantsPrinciple || wantsKey) {
+        const mode = wantsPrinciple && wantsKey ? 'both' : (wantsPrinciple ? 'principle' : 'thread');
+        const payload = { ...basePayload, mode };
+        if (wantsPrinciple) payload.principle_content = principleText;
+        if (wantsKey) payload.key_record_content = keyText;
+        writes.push({ label: mode, payload });
       }
-      if (mode === 'feel') payload.feel_content = content;
-      setStatus('crystal-status', `正在写入 ${mode}...`);
-      const data = await api('/api/ob/crystallize-feel', {
-        method: 'POST',
-        body: JSON.stringify(payload)
-      });
-      setStatus('crystal-status', `结晶完成：标记 ${(data.ob && data.ob.marked_count) || 0} 条 feel`);
-      await loadStats();
-      await loadBuckets();
-      await runFeelCrystals();
+      if (wantsFeel) {
+        writes.push({ label: 'feel', payload: { ...basePayload, mode: 'feel', feel_content: feelText } });
+      }
+      cluster.crystallizing = writes.map(item => item.label).join('+');
+      renderCrystalResults();
+      try {
+        const results = [];
+        for (const write of writes) {
+          setStatus('crystal-status', `正在写入 ${write.label}...`);
+          const data = await api('/api/ob/crystallize-feel', {
+            method: 'POST',
+            body: JSON.stringify(write.payload)
+          });
+          results.push(`${write.label}: ${(data.ob && data.ob.marked_count) || 0}${data.ob?.deduped ? ' deduped' : ''}`);
+        }
+        cluster.crystallized = true;
+        cluster.crystal_result = results.join(' · ');
+        setStatus('crystal-status', `结晶完成：${cluster.crystal_result}`);
+        await loadStats();
+        await loadBuckets();
+      } finally {
+        cluster.crystallizing = '';
+        renderCrystalResults();
+      }
+    }
+
+    async function restoreCrystalCluster(index) {
+      const cluster = state.crystals[index];
+      if (!cluster || cluster.crystallizing) return;
+      const includeAll = !!$('crystal-results').querySelector(`.crystal-include-all[data-index="${index}"]`)?.checked;
+      if (!confirm(includeAll
+        ? `确认撤销整个 cluster 的结晶标记？共 ${(cluster.feel_ids || []).length} 条。`
+        : `确认只撤销当前展示项的结晶标记？共 ${(cluster.items || []).length} 条。`
+      )) return;
+      cluster.crystallizing = 'restore';
+      renderCrystalResults();
+      try {
+        const data = await api('/api/ob/uncrystallize-feel', {
+          method: 'POST',
+          body: JSON.stringify({
+            cluster_id: cluster.cluster_id,
+            include_all: includeAll,
+            feel_ids: includeAll ? [] : (cluster.items || []).map(item => item.id).filter(Boolean),
+            min_cluster_size: 3,
+            min_similarity: 0.7
+          })
+        });
+        cluster.crystallized = false;
+        cluster.crystal_result = `已恢复 ${data.restored_count || 0} 条`;
+        setStatus('crystal-status', cluster.crystal_result);
+        await loadStats();
+        await loadBuckets();
+      } finally {
+        cluster.crystallizing = '';
+        renderCrystalResults();
+      }
     }
 
     function loadDreamAsFeel(id) {
@@ -1163,6 +1344,7 @@
     $('clear-selection').addEventListener('click', clearBulkSelection);
     $('apply-bulk-type').addEventListener('click', () => applyBulkType().catch(err => setStatus('list-status', err.message)));
     $('include-archive').addEventListener('change', loadBuckets);
+    $('life-scope').addEventListener('change', loadBuckets);
     $('local-filter').addEventListener('input', renderBuckets);
     $('back-to-top').addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
 

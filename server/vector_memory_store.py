@@ -10,6 +10,7 @@ import httpx
 
 from server.database import Database
 from server.memory_store import MemoryEntry, MemoryStore
+from server.security import get_secret_from_env, validate_api_base
 
 
 KEY_VECTOR_EMBEDDING_API_BASE = "vector_embedding_api_base"
@@ -117,7 +118,7 @@ class VectorMemoryStore(MemoryStore):
     async def get_runtime_config(self) -> dict:
         return {
             "embedding_api_base": await self._get_setting(KEY_VECTOR_EMBEDDING_API_BASE, ""),
-            "embedding_api_key": await self._get_setting(KEY_VECTOR_EMBEDDING_API_KEY, ""),
+            "embedding_api_key": get_secret_from_env(KEY_VECTOR_EMBEDDING_API_KEY, ""),
             "embedding_model": await self._get_setting(KEY_VECTOR_EMBEDDING_MODEL, "text-embedding-3-small"),
             "embedding_dim": int(await self._get_setting(KEY_VECTOR_EMBEDDING_DIM, "256")),
             "timeout_sec": float(await self._get_setting(KEY_VECTOR_EMBEDDING_TIMEOUT, "15")),
@@ -145,6 +146,10 @@ class VectorMemoryStore(MemoryStore):
         }
         for key, value in payload.items():
             if key not in allowed or value is None:
+                continue
+            if key == KEY_VECTOR_EMBEDDING_API_BASE:
+                value = validate_api_base(value, key)
+            elif key == KEY_VECTOR_EMBEDDING_API_KEY:
                 continue
             await self._db.set_setting(
                 key=key,

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import uuid
 
 from server.ob_client import OBClient
 from server.ob_decay import OBDecayEngine, OBDecaySettings
+from server.environment import TemplateEnvironmentGenerator
+from server.models import EventAnchor, StateSnapshot
 from server.state_machine import StateMachine
 
 
@@ -26,10 +29,200 @@ class FakeEmbeddingStore:
         return True
 
 
+class FakeMemory:
+    async def upsert_event_vector(self, event_id: int):
+        return True
+
+
+class FakePromptManager:
+    async def get_system_prompt(self):
+        return "system"
+
+    async def get_prompt(self, key: str):
+        return (
+            "meta={group_meta}\nfragments={fragments_text}\ndedup={dedup_context}\n"
+            "Return JSON."
+        )
+
+
+class FakeRollupLLM:
+    async def chat(self, messages, **kwargs):
+        return json.dumps(
+            {
+                "title": "晨间节奏债务聚合",
+                "objective": "凯尔希连续处理晨间观察、任务反馈和身体延迟信号，将悬置事项推进为可记录的生活节点。",
+                "impression": "这组碎片显示她的判断节奏被未完成事项持续牵引。",
+                "detail_hooks": ["未发出的短消息", "右腕延迟复测"],
+                "open_loop": "后续仍需确认复测结果与任务反馈。",
+                "keywords": ["晨间观察", "右腕延迟", "任务反馈"],
+                "categories": ["生活", "工作"],
+                "rollup_content": "凯尔希连续面对晨间观察、任务反馈和右腕延迟信号，将原本散落的待办推进成一个清晰的生活事件。她开始重新排序任务，并把复测与反馈保留为后续观察线索。",
+            },
+            ensure_ascii=False,
+        )
+
+
+class FailingRollupLLM:
+    async def chat(self, messages, **kwargs):
+        raise RuntimeError("simulated rollup failure")
+
+
+class FakeEventDB:
+    def __init__(self):
+        self.events: list[EventAnchor] = []
+
+    async def get_all_events(self, *args, **kwargs):
+        return list(self.events)
+
+    async def insert_event(self, event: EventAnchor):
+        event.id = len(self.events) + 1
+        self.events.append(event)
+        return event.id
+
+    async def get_event_by_id(self, event_id: int):
+        for event in self.events:
+            if event.id == event_id:
+                return event
+        return None
+
+
+class FakeSnapshotLLM:
+    def begin_usage_tracking(self):
+        return None
+
+    def end_usage_tracking(self):
+        return {"requests": 0}
+
+
 async def _client(name: str):
     root = Path("data") / "ob_unit_tests" / f"{name}_{uuid.uuid4().hex[:8]}"
     root.mkdir(parents=True, exist_ok=True)
     return OBClient(root / "ob")
+
+
+def test_checkpoint_limit_latest_keeps_recent_three():
+    start = datetime(2026, 1, 1, 0, 0, 0)
+    checkpoints = [start + timedelta(days=i) for i in range(10)]
+
+    limited, meta = StateMachine._limit_checkpoints(
+        checkpoints,
+        max_steps=3,
+        mode="latest",
+    )
+
+    assert limited == checkpoints[-3:]
+    assert meta["checkpoint_limit_mode"] == "latest"
+    assert meta["skipped_older_checkpoint_count"] == 7
+    assert meta["remaining_checkpoint_count"] == 0
+    assert meta["limited_by_max_steps"] is True
+
+
+def test_checkpoint_limit_latest_keeps_all_when_under_limit():
+    start = datetime(2026, 1, 1, 0, 0, 0)
+    checkpoints = [start + timedelta(days=i) for i in range(2)]
+
+    limited, meta = StateMachine._limit_checkpoints(
+        checkpoints,
+        max_steps=3,
+        mode="latest",
+    )
+
+    assert limited == checkpoints
+    assert meta["skipped_older_checkpoint_count"] == 0
+    assert meta["remaining_checkpoint_count"] == 0
+    assert meta["limited_by_max_steps"] is False
+
+
+def test_checkpoint_limit_oldest_preserves_existing_behavior():
+    start = datetime(2026, 1, 1, 0, 0, 0)
+    checkpoints = [start + timedelta(days=i) for i in range(10)]
+
+    limited, meta = StateMachine._limit_checkpoints(
+        checkpoints,
+        max_steps=3,
+        mode="oldest",
+    )
+
+    assert limited == checkpoints[:3]
+    assert meta["checkpoint_limit_mode"] == "oldest"
+    assert meta["skipped_older_checkpoint_count"] == 0
+    assert meta["remaining_checkpoint_count"] == 7
+    assert meta["limited_by_max_steps"] is True
+
+
+def test_snapshot_scheduler_tick_limits_catchup_to_latest_three(monkeypatch):
+    async def scenario():
+        sm = StateMachine.__new__(StateMachine)
+        sm._advance_lock = asyncio.Lock()
+        sm.snapshot_llm = FakeSnapshotLLM()
+
+        now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+        latest_time = now - timedelta(days=10)
+        latest_snapshot = StateSnapshot(
+            id=1,
+            created_at="2026-05-15T04:00:00Z",
+            content="previous snapshot",
+            environment="{}",
+        )
+        captured = {}
+
+        class FakeDB:
+            async def get_latest_snapshot(self):
+                return latest_snapshot
+
+        async def fake_advance_until_locked(**kwargs):
+            captured.update(kwargs)
+            planned = [latest_time + timedelta(days=i) for i in range(1, 11)]
+            due, meta = StateMachine._limit_checkpoints(
+                planned,
+                max_steps=kwargs.get("max_steps"),
+                mode=kwargs.get("checkpoint_limit_mode", "oldest"),
+            )
+            return {
+                "content": "advanced snapshot",
+                "schedule": {
+                    **meta,
+                    "planned_checkpoint_count": len(planned),
+                    "checkpoint_count": len(due),
+                    "checkpoint_times_cst": [t.isoformat() for t in due],
+                    "generated_snapshots": [{"id": 10}],
+                },
+            }
+
+        sm.db = FakeDB()
+        sm._get_snapshot_scheduler_enabled = lambda: _async_value(True)
+        sm._get_snapshot_scheduler_interval_sec = lambda: _async_value(60)
+        sm._get_snapshot_scheduler_night_pause_state = lambda: _async_value(None)
+        sm._get_effective_active_conversation_time_claim = lambda: _async_value(None)
+        sm._refresh_slowlines = lambda: _async_value(None)
+        sm._resolve_progress_baseline = lambda snapshot, fallback: latest_time
+        sm._get_min_time_unit_timedelta = lambda: _async_value(timedelta(days=1))
+        sm._get_snapshot_catchup_max_steps = lambda: _async_value(99)
+        sm._snapshot_environment_dict = lambda snapshot: {}
+        sm._advance_until_locked = fake_advance_until_locked
+        sm._run_automation = lambda trigger: _async_value({"ran": True, "trigger": trigger})
+        sm._persist_automation_report = lambda report, llm_usage: _async_value(None)
+
+        monkeypatch.setattr("server.state_machine.shanghai_now", lambda: now)
+
+        result = await sm.run_snapshot_scheduler_tick()
+
+        assert captured["checkpoint_limit_mode"] == "latest"
+        assert captured["max_steps"] == 3
+        assert result["checkpoint_limit_mode"] == "latest"
+        assert result["planned_checkpoint_count"] == 10
+        assert result["checkpoint_count"] == 3
+        assert result["remaining_checkpoint_count"] == 0
+        assert result["skipped_older_checkpoint_count"] == 7
+        assert result["catchup_max_steps_per_tick"] == 3
+        assert result["configured_catchup_max_steps_per_tick"] == 99
+        assert result["interruption_hours"] == result["lag_hours"]
+
+    run(scenario())
+
+
+async def _async_value(value):
+    return value
 
 
 def test_natural_breath_does_not_touch():
@@ -121,7 +314,9 @@ def test_feel_channel_caps_character_life_to_one():
             domain=[],
             created="2026-01-04T00:00:00",
         )
-        results = await client.breath(domain="feel", limit=5)
+        # 显式 include_character_life=True 才能验证 max_character_life=1 的 cap 机制；
+        # 否则 breath 默认排除 character_life，这条测试断言的 cap 行为根本无法触发。
+        results = await client.breath(domain="feel", limit=5, include_character_life=True)
         ids = [b.id for b in results]
         assert char_new in ids
         assert char_old not in ids
@@ -186,22 +381,686 @@ def test_surface_breath_uses_new_quotas():
     run(scenario())
 
 
-def test_breath_bundle_returns_ordinary_and_feel_without_touch():
+def test_breath_bundle_returns_three_grouped_lists_without_touch():
     async def scenario():
         client = await _client("bundle")
         dynamic_id = await client.hold("dynamic one", importance=7, created="2026-01-01T00:00:00")
+        pinned_id = await client.hold(
+            "pinned principle",
+            bucket_type="permanent",
+            pinned=True,
+            created="2026-01-03T00:00:00",
+        )
         feel_id = await client.hold("feel one", bucket_type="feel", created="2026-01-02T00:00:00")
         before_dynamic = await client.get(dynamic_id)
         before_feel = await client.get(feel_id)
         result = await client.breath_bundle()
         after_dynamic = await client.get(dynamic_id)
         after_feel = await client.get(feel_id)
-        assert result["ordinary"]
-        assert result["feel"]
+        # New structure: three keys, no ordinary/feel/guidance.
+        assert set(result.keys()) == {"personal", "relational", "free"}
+        all_ids = [
+            item["id"]
+            for group in ("personal", "relational", "free")
+            for item in result[group]
+        ]
+        # pinned principles never leak into any group — they go through get_current_state.
+        assert pinned_id not in all_ids
+        # Natural surfacing must not touch buckets (no last_active bump).
         assert after_dynamic.metadata["last_active"] == before_dynamic.metadata["last_active"]
         assert after_feel.metadata["last_active"] == before_feel.metadata["last_active"]
 
     run(scenario())
+
+
+def test_breath_bundle_personal_group_has_three_slots_active_rollup_feel():
+    async def scenario():
+        client = await _client("bundle_personal_pins")
+        # ① 当下进行：environment_event_summary 固定 bucket
+        active_id = await client.hold(
+            "- 华法琳会议结束\n- 行政复核完成",
+            domain=["character_life"],
+            tags=["environment_event_summary", "character_life"],
+            importance=7,
+            created="2026-01-04T00:00:00",
+            extra_metadata={"source_kind": "environment_event_summary"},
+        )
+        # ② 近期总结：environment_life_rollup 聚合事件
+        rollup_id = await client.hold(
+            "上午华法琳会议结束后，凯尔希复盘行政流程，随后……（聚合事件叙述）",
+            domain=["character_life", "work"],
+            tags=["environment_life_rollup", "character_life"],
+            importance=6,
+            created="2026-01-04T06:00:00",
+            extra_metadata={"source_kind": "environment_life_rollup"},
+        )
+        # ③ 当下感受：character_life feel
+        feel_id = await client.hold(
+            "握笔时右腕的钝感再次浮现，像被什么东西按住。",
+            bucket_type="feel",
+            domain=["character_life"],
+            tags=["snapshot", "feel"],
+            created="2026-01-03T00:00:00",
+            extra_metadata={"source_kind": "state_snapshot"},
+        )
+        # 干扰项：pinned principle + raw fragment 都不能进 personal
+        principle_id = await client.hold(
+            "stable principle bound to character_life",
+            bucket_type="permanent",
+            domain=["character_life"],
+            pinned=True,
+            created="2026-01-05T00:00:00",
+        )
+        fragment_id = await client.hold(
+            "raw environment fragment should not surface",
+            domain=["character_life"],
+            tags=["environment_life_fragment", "character_life"],
+            importance=10,
+            created="2026-01-06T00:00:00",
+            extra_metadata={"source_kind": "environment_life_fragment"},
+        )
+        # 关系侧填充
+        await client.hold("relational dynamic A", importance=8, created="2026-01-02T00:00:00")
+        await client.hold("relational dynamic B", importance=7, created="2026-01-02T01:00:00")
+        await client.hold("relational feel A", bucket_type="feel", created="2026-01-02T02:00:00")
+
+        result = await client.breath_bundle()
+        personal = result["personal"]
+        all_ids = {
+            item["id"]
+            for group in ("personal", "relational", "free")
+            for item in result[group]
+        }
+
+        # 三槽并列，顺序固定：当下进行 / 近期总结 / 当下感受
+        assert len(personal) == 3
+        assert personal[0]["id"] == active_id
+        assert personal[0]["metadata"]["slot_role"] == "personal_event_active"
+        assert personal[0]["content"].startswith("【个人事件·当下进行】")
+        assert personal[1]["id"] == rollup_id
+        assert personal[1]["metadata"]["slot_role"] == "personal_event_rollup"
+        assert personal[1]["content"].startswith("【个人事件·近期总结】")
+        assert personal[2]["id"] == feel_id
+        assert personal[2]["metadata"]["slot_role"] == "current_feeling"
+        assert personal[2]["content"].startswith("【当下感受】")
+        # 干扰项不进任何组
+        assert principle_id not in all_ids
+        assert fragment_id not in all_ids
+        # marker 不再伪造 score=999
+        for item in personal:
+            assert item["score"] != 999.0
+
+    run(scenario())
+
+
+def test_breath_personal_returns_only_personal_three_slots():
+    """breath_personal() 是 breath_bundle 的第一层切片，只返回 personal 三槽。"""
+    async def scenario():
+        client = await _client("breath_personal")
+        active_id = await client.hold(
+            "- 华法琳会议结束\n- 行政复核完成",
+            domain=["character_life"],
+            tags=["environment_event_summary", "character_life"],
+            importance=7,
+            created="2026-01-04T00:00:00",
+            extra_metadata={"source_kind": "environment_event_summary"},
+        )
+        rollup_id = await client.hold(
+            "上午华法琳会议结束后，凯尔希复盘行政流程……",
+            domain=["character_life", "work"],
+            tags=["environment_life_rollup", "character_life"],
+            importance=6,
+            created="2026-01-04T06:00:00",
+            extra_metadata={"source_kind": "environment_life_rollup"},
+        )
+        feel_id = await client.hold(
+            "握笔时右腕的钝感再次浮现。",
+            bucket_type="feel",
+            domain=["character_life"],
+            tags=["snapshot", "feel"],
+            created="2026-01-03T00:00:00",
+            extra_metadata={"source_kind": "state_snapshot"},
+        )
+        # 关系侧 + free 侧的内容不应出现在 personal-only 返回里
+        relational_id = await client.hold(
+            "relational dynamic should not surface",
+            importance=8,
+            created="2026-01-02T00:00:00",
+        )
+
+        result = await client.breath_personal()
+        # 顶层只有 personal 一个字段
+        assert set(result.keys()) == {"personal"}
+        personal = result["personal"]
+        ids = [item["id"] for item in personal]
+        assert ids == [active_id, rollup_id, feel_id]
+        assert relational_id not in ids
+        # marker 仍然不污染 score
+        for item in personal:
+            assert item["score"] != 999.0
+        # 不 touch
+        before = await client.get(active_id)
+        await client.breath_personal()
+        after = await client.get(active_id)
+        assert before.metadata["last_active"] == after.metadata["last_active"]
+
+    run(scenario())
+
+
+def test_breath_personal_marker_warns_when_speculative_about_user():
+    """speculative_about_user=True 的 bucket 在 personal 槽要带 ⚠ 提示。"""
+    async def scenario():
+        client = await _client("bundle_speculative_warning")
+        await client.hold(
+            "- 凯尔希预计泳琳此时仍在书房（推测违规：实际写成了'泳琳走到书桌前'）",
+            domain=["character_life"],
+            tags=["environment_event_summary", "character_life"],
+            importance=7,
+            created="2026-01-04T00:00:00",
+            extra_metadata={
+                "source_kind": "environment_event_summary",
+                "user_reference_mode": "speculative",
+                "speculative_about_user": True,
+            },
+        )
+        # 对照组：非 speculative 不应出现 ⚠
+        await client.hold(
+            "凯尔希聚合事件叙述（不涉及泳琳）",
+            domain=["character_life"],
+            tags=["environment_life_rollup", "character_life"],
+            importance=6,
+            created="2026-01-04T06:00:00",
+            extra_metadata={
+                "source_kind": "environment_life_rollup",
+                "user_reference_mode": "none",
+                "speculative_about_user": False,
+            },
+        )
+        result = await client.breath_personal()
+        personal = result["personal"]
+        active_slot = next(item for item in personal if item["metadata"]["slot_role"] == "personal_event_active")
+        rollup_slot = next(item for item in personal if item["metadata"]["slot_role"] == "personal_event_rollup")
+        assert "⚠" in active_slot["content"]
+        assert "请在对话中确认" in active_slot["content"]
+        assert "⚠" not in rollup_slot["content"]
+
+    run(scenario())
+
+
+def test_plan_engine_open_loop_pool_dedup_and_age_window():
+    """plan_engine._build_open_loop_pool_text 应聚合最近 48h fragment.open_loop、去重、按时间排序。"""
+    from server.plan_engine import PlanEngine
+    from datetime import datetime as _dt, timedelta as _td
+
+    async def scenario():
+        client = await _client("plan_open_loop_pool")
+        now = _dt.utcnow()
+        # 新鲜 fragment（2h 前），含 open_loop
+        await client.hold(
+            "fragment recent",
+            tags=["environment_life_fragment", "character_life"],
+            domain=["character_life"],
+            created=(now - _td(hours=2)).isoformat(),
+            extra_metadata={
+                "source_kind": "environment_life_fragment",
+                "open_loop": "阿米娅尚未回复 X 报告",
+                "last_active": (now - _td(hours=2)).isoformat(),
+            },
+        )
+        # 重复内容，更旧（10h 前）— 应被去重剔除
+        await client.hold(
+            "fragment dup",
+            tags=["environment_life_fragment", "character_life"],
+            domain=["character_life"],
+            created=(now - _td(hours=10)).isoformat(),
+            extra_metadata={
+                "source_kind": "environment_life_fragment",
+                "open_loop": "阿米娅尚未回复 X 报告",
+                "last_active": (now - _td(hours=10)).isoformat(),
+            },
+        )
+        # 不同的新 open_loop
+        await client.hold(
+            "fragment other",
+            tags=["environment_life_fragment", "character_life"],
+            domain=["character_life"],
+            created=(now - _td(hours=5)).isoformat(),
+            extra_metadata={
+                "source_kind": "environment_life_fragment",
+                "open_loop": "右腕复测仍未完成",
+                "last_active": (now - _td(hours=5)).isoformat(),
+            },
+        )
+        # 超过 48h 窗口 — 应被剔除
+        await client.hold(
+            "fragment stale",
+            tags=["environment_life_fragment", "character_life"],
+            domain=["character_life"],
+            created=(now - _td(hours=72)).isoformat(),
+            extra_metadata={
+                "source_kind": "environment_life_fragment",
+                "open_loop": "三天前的某线索",
+                "last_active": (now - _td(hours=72)).isoformat(),
+            },
+        )
+        # 非 fragment 的 character_life bucket — 不应进入
+        await client.hold(
+            "not a fragment",
+            tags=["environment_event_summary", "character_life"],
+            domain=["character_life"],
+            created=now.isoformat(),
+            extra_metadata={
+                "source_kind": "environment_event_summary",
+                "open_loop": "不应该被池子收集",
+            },
+        )
+
+        machine = object.__new__(StateMachine)
+        machine.ob_client = client
+        engine = object.__new__(PlanEngine)
+        engine.state_machine = machine
+        text = await engine._build_open_loop_pool_text(max_hours=48.0, max_items=8)
+        assert "阿米娅尚未回复 X 报告" in text
+        assert "右腕复测仍未完成" in text
+        assert "三天前的某线索" not in text
+        assert "不应该被池子收集" not in text
+        # 去重：阿米娅那条只出现一次
+        assert text.count("阿米娅尚未回复 X 报告") == 1
+
+    run(scenario())
+
+
+def test_render_previous_plan_reference_includes_thread_step():
+    """续接判断依赖 thread/step——必须在昨日 plan 摘要里显式输出。"""
+    from server.plan_engine import _render_previous_plan_reference, PLAN_SCHEMA_VERSION
+    from server.models import PlanItem
+    item = PlanItem(
+        plan_id=1,
+        hour_start=9,
+        hour_end=10,
+        activity="内务复盘",
+        action_type="internal",
+        reason="thread continuity",
+        action_payload=json.dumps({
+            "intended_objective": "推完上周遗留的内务整理",
+            "progress_status": "advancing",
+            "thread_id": "admin_review",
+            "current_step": 3,
+            "expected_steps": 4,
+        }),
+        status="done",
+    )
+    rendered = _render_previous_plan_reference(item, schema_version=PLAN_SCHEMA_VERSION)
+    assert "thread=admin_review" in rendered
+    assert "step=3/4" in rendered
+    assert "progress=advancing" in rendered
+    assert "[done]" in rendered
+
+    # 没有 thread_id 的旧条目应优雅退化（不写 thread= 段）
+    item_legacy = PlanItem(
+        plan_id=1,
+        hour_start=14,
+        hour_end=15,
+        activity="X",
+        action_type="internal",
+        reason="legacy",
+        action_payload=json.dumps({"intended_objective": "legacy item"}),
+        status="skipped",
+    )
+    rendered_legacy = _render_previous_plan_reference(item_legacy, schema_version=PLAN_SCHEMA_VERSION)
+    assert "thread=" not in rendered_legacy
+    assert "[skipped]" in rendered_legacy
+
+
+def test_feel_breath_one_week_crystallization_protection():
+    """dream 把昨天的 feel 标 crystallized 后，一周内仍应能浮现，超过一周才剔除。"""
+    async def scenario():
+        client = await _client("feel_crystal_window")
+        now = datetime.utcnow()
+        recent_id = await client.hold(
+            "昨晚 crystallize 的 feel，今天仍应可浮现",
+            bucket_type="feel",
+            created=(now - timedelta(hours=12)).isoformat(),
+            extra_metadata={
+                "crystallized": True,
+                "crystallized_at": (now - timedelta(hours=10)).isoformat(),
+            },
+        )
+        old_id = await client.hold(
+            "10 天前 crystallize 的 feel，应被剔除",
+            bucket_type="feel",
+            created=(now - timedelta(days=12)).isoformat(),
+            extra_metadata={
+                "crystallized": True,
+                "crystallized_at": (now - timedelta(days=10)).isoformat(),
+            },
+        )
+        # 控制组：未 crystallize 的旧 feel，应永远可浮现
+        plain_id = await client.hold(
+            "未 crystallize 的旧 feel",
+            bucket_type="feel",
+            created=(now - timedelta(days=30)).isoformat(),
+        )
+        result = await client._feel_breath(limit=10)
+        ids = {b.id for b in result}
+        assert recent_id in ids, "一周保护窗内的 crystallized feel 应仍浮现"
+        assert old_id not in ids, "超过一周的 crystallized feel 应被剔除"
+        assert plain_id in ids, "非 crystallized feel 应不受影响"
+
+    run(scenario())
+
+
+def test_breath_bundle_free_pool_excludes_pinned_and_protected_and_permanent():
+    """free 池显式过滤 pinned/protected/permanent，避免 999 分霸榜。"""
+    async def scenario():
+        client = await _client("free_pool_defense")
+        # 注入 pinned 和 permanent 类型 bucket
+        pinned_id = await client.hold(
+            "pinned principle",
+            bucket_type="permanent",
+            pinned=True,
+            importance=10,
+            created="2026-05-26T00:00:00",
+        )
+        # 普通低分 dynamic，应该有机会进 free
+        for i in range(6):
+            await client.hold(
+                f"ordinary dynamic {i}",
+                importance=3,
+                created=f"2026-05-2{i % 9}T00:00:00",
+            )
+        result = await client.breath_bundle()
+        all_ids = {
+            item["id"]
+            for group in ("personal", "relational", "free")
+            for item in result[group]
+        }
+        assert pinned_id not in all_ids, "pinned/permanent 不应出现在 free 池（也不该霸榜）"
+
+    run(scenario())
+
+
+def test_breath_default_excludes_character_life_unless_explicitly_requested():
+    """breath() 默认排除 character_life；显式传 domain 或 include_character_life=True 才包含。"""
+    async def scenario():
+        client = await _client("breath_default_excludes_char_life")
+        char_id = await client.hold(
+            "凯尔希自身生活流：今晨晨练",
+            domain=["character_life"],
+            importance=6,
+            created="2026-05-25T08:00:00",
+        )
+        rel_id = await client.hold(
+            "关系侧：与阿米娅的协作",
+            importance=6,
+            created="2026-05-25T08:00:00",
+        )
+
+        # 默认：仅出关系侧
+        default_breath = await client.breath()
+        ids = {b.id for b in default_breath}
+        assert rel_id in ids
+        assert char_id not in ids, "默认 breath 不应返回 character_life"
+
+        # 显式 include_character_life=True：两者都出
+        mixed = await client.breath(include_character_life=True)
+        ids = {b.id for b in mixed}
+        assert rel_id in ids
+        assert char_id in ids
+
+        # 显式 domain="character_life"：只出 character_life
+        char_only = await client.breath(domain="character_life")
+        ids = {b.id for b in char_only}
+        assert char_id in ids
+        assert rel_id not in ids, "domain=character_life 应只返回 character_life"
+
+        # query 模式同样默认排除
+        char_id2 = await client.hold(
+            "凯尔希在书桌前整理笔记",
+            domain=["character_life"],
+            importance=6,
+            created="2026-05-25T09:00:00",
+        )
+        rel_id2 = await client.hold(
+            "罗德岛会议记录关于书桌整理",
+            importance=6,
+            created="2026-05-25T09:00:00",
+        )
+        q_default = await client.breath(query="书桌")
+        ids = {b.id for b in q_default}
+        assert rel_id2 in ids
+        assert char_id2 not in ids, "query 检索默认也应排除 character_life"
+
+    run(scenario())
+
+
+def test_breath_date_window_filter_inclusive_bounds():
+    """breath date_from/date_to 应按 metadata.created 过滤，YYYY-MM-DD 单日窗口能包含当天 23:59。"""
+    async def scenario():
+        client = await _client("breath_date_window")
+        await client.hold("old 2026-05-20", importance=5, created="2026-05-20T10:00:00")
+        await client.hold("target 2026-05-25 morning", importance=5, created="2026-05-25T08:00:00")
+        await client.hold("target 2026-05-25 night", importance=5, created="2026-05-25T22:00:00")
+        await client.hold("after 2026-05-26", importance=5, created="2026-05-26T05:00:00")
+
+        # 单日窗口（date_to 自动延展到 23:59:59）
+        same_day = await client.breath(date_from="2026-05-25", date_to="2026-05-25")
+        contents = [b.content for b in same_day]
+        assert any("morning" in c for c in contents)
+        assert any("night" in c for c in contents)
+        assert all("2026-05-20" not in c and "2026-05-26" not in c for c in contents)
+
+        # 单边：只 date_from
+        from_only = await client.breath(date_from="2026-05-25")
+        contents = [b.content for b in from_only]
+        assert all("2026-05-20" not in c for c in contents)
+
+        # 单边：只 date_to
+        to_only = await client.breath(date_to="2026-05-25")
+        contents = [b.content for b in to_only]
+        assert all("2026-05-26" not in c for c in contents)
+
+    run(scenario())
+
+
+def test_stamp_patch_with_replaced_info_preserves_original_activity_and_thread():
+    """replan 时旧条目被丢弃前，其 activity/objective/thread_id 必须落到新 patch.action_payload。"""
+    from server.plan_engine import PlanEngine
+    from server.models import PlanItem
+    old = PlanItem(
+        plan_id=1,
+        hour_start=14,
+        hour_end=16,
+        activity="内务复盘",
+        action_type="internal",
+        action_payload=json.dumps({
+            "intended_objective": "推完上周遗留的内务整理",
+            "thread_id": "admin_review",
+            "current_step": 2,
+            "expected_steps": 4,
+        }),
+        status="pending",
+    )
+    new_patch = PlanItem(
+        plan_id=1,
+        hour_start=14,
+        hour_end=16,
+        activity="急诊配合",
+        action_type="internal",
+        action_payload=json.dumps({
+            "intended_objective": "顶上突发急诊调度",
+        }),
+        status="pending",
+        source_kind="replan",
+    )
+    PlanEngine._stamp_patch_with_replaced_info(new_patch, [old])
+    payload = json.loads(new_patch.action_payload)
+    replaces = payload["replan_replaces"]
+    assert isinstance(replaces, list)
+    assert len(replaces) == 1
+    r = replaces[0]
+    assert r["activity"] == "内务复盘"
+    assert r["objective"] == "推完上周遗留的内务整理"
+    assert r["thread_id"] == "admin_review"
+    assert r["hour_start"] == 14 and r["hour_end"] == 16
+    # 原 patch 的字段不应被破坏
+    assert payload["intended_objective"] == "顶上突发急诊调度"
+
+
+def test_stamp_patch_with_replaced_info_handles_multiple_old_items():
+    """新 patch 跨过多个旧 pending（例如 13-17 替代三段），全部摘要进入 replan_replaces。"""
+    from server.plan_engine import PlanEngine
+    from server.models import PlanItem
+    olds = [
+        PlanItem(plan_id=1, hour_start=h, hour_end=h+1, activity=f"任务{h}",
+                 action_type="internal",
+                 action_payload=json.dumps({"intended_objective": f"obj{h}", "thread_id": f"t{h}"}),
+                 status="pending")
+        for h in (13, 14, 15)
+    ]
+    patch = PlanItem(plan_id=1, hour_start=13, hour_end=17, activity="临时大块",
+                     action_type="internal", action_payload="{}", status="pending",
+                     source_kind="replan")
+    PlanEngine._stamp_patch_with_replaced_info(patch, olds)
+    payload = json.loads(patch.action_payload)
+    assert len(payload["replan_replaces"]) == 3
+    activities = [r["activity"] for r in payload["replan_replaces"]]
+    assert activities == ["任务13", "任务14", "任务15"]
+
+
+def test_env_strong_disturbance_judgement_for_auto_replan():
+    """env 强扰动判定：决定是否在 _advance_until_locked 末尾触发 maybe_replan。"""
+    machine = object.__new__(StateMachine)
+    # 无扰动 → False
+    assert machine._env_has_strong_disturbance(None) is False
+    assert machine._env_has_strong_disturbance({}) is False
+    assert machine._env_has_strong_disturbance({"disturbance_title": "", "disturbance_id": 0}) is False
+    # 有扰动但 effect 是弱 → False
+    for weak in ["none", "on_track", "inward_digging", "", "  ON_TRACK  "]:
+        env = {"disturbance_id": 7, "disturbance_title": "X", "disturbance_schedule_effect": weak}
+        assert machine._env_has_strong_disturbance(env) is False, f"weak={weak!r}"
+    # 强扰动 → True
+    for strong in ["interrupted", "delayed", "replaced_by_conversation", "unexpected_insert"]:
+        env = {"disturbance_id": 7, "disturbance_title": "X", "disturbance_schedule_effect": strong}
+        assert machine._env_has_strong_disturbance(env) is True, f"strong={strong!r}"
+
+
+def test_format_disturbance_replan_context_includes_title_effect_and_truncates_context():
+    long_ctx = "X" * 1000
+    env = {
+        "disturbance_title": "急诊紧急会诊",
+        "disturbance_schedule_effect": "interrupted",
+        "disturbance_context": long_ctx,
+    }
+    text = StateMachine._format_disturbance_replan_context(env)
+    assert "急诊紧急会诊" in text
+    assert "schedule_effect=interrupted" in text
+    # context 被裁到 600 字 + 省略号
+    assert "X" * 600 in text
+    assert "X" * 700 not in text
+    assert text.endswith("…")
+    # 空扰动也能优雅退化
+    text2 = StateMachine._format_disturbance_replan_context({})
+    assert "未命名扰动" in text2
+
+
+def test_compute_user_offline_for_checkpoint_low_activity_threshold():
+    """offline_hours 计算 + low_activity_mode 阈值（默认 5h）判定。"""
+    from datetime import datetime as _dt, timedelta as _td
+    from server.state_machine import StateMachine
+    machine = object.__new__(StateMachine)
+    checkpoint = _dt(2026, 5, 27, 17, 0, 0)
+    # 无 conversation_end_instant → 视为始终在线
+    assert machine._compute_user_offline_for_checkpoint(checkpoint, None) == (0.0, False)
+    # 离线 3h → normal
+    offline, low = machine._compute_user_offline_for_checkpoint(checkpoint, checkpoint - _td(hours=3))
+    assert offline == 3.0
+    assert low is False
+    # 刚好达到 5h 阈值 → 触发 low_activity
+    offline, low = machine._compute_user_offline_for_checkpoint(checkpoint, checkpoint - _td(hours=5))
+    assert offline == 5.0
+    assert low is True
+    # 离线 10h → 仍为 low_activity
+    offline, low = machine._compute_user_offline_for_checkpoint(checkpoint, checkpoint - _td(hours=10))
+    assert offline == 10.0
+    assert low is True
+    # 时序异常（checkpoint 早于 conversation_end）→ 不为负
+    offline, low = machine._compute_user_offline_for_checkpoint(checkpoint, checkpoint + _td(hours=1))
+    assert offline == 0.0
+    assert low is False
+
+
+def test_environment_parser_extracts_user_reference_mode():
+    """parser 应从 [Summary] 段提取 User reference mode 自评字段。"""
+    from server.environment import TemplateEnvironmentGenerator
+    summary_with_mode = (
+        "Core focus: 凯尔希复盘巡诊路线\n"
+        "Open loop: 阿米娅尚未回复\n"
+        "Plan delta: on_track\n"
+        "User reference mode: anticipation （凯尔希猜测泳琳此时仍在写作）"
+    )
+    assert TemplateEnvironmentGenerator._extract_user_reference_mode(summary_with_mode) == "anticipation"
+
+    # speculative 自评应被识别
+    summary_speculative = "Core focus: x\nUser reference mode: speculative"
+    assert TemplateEnvironmentGenerator._extract_user_reference_mode(summary_speculative) == "speculative"
+
+    # 缺失或不合法值返回 unknown
+    assert TemplateEnvironmentGenerator._extract_user_reference_mode("") == "unknown"
+    assert TemplateEnvironmentGenerator._extract_user_reference_mode("Core focus: x") == "unknown"
+    assert TemplateEnvironmentGenerator._extract_user_reference_mode("User reference mode: bogus_value") == "unknown"
+
+
+def test_breath_bundle_personal_active_slot_falls_back_when_no_summary_bucket():
+    """当没有 environment_event_summary 时，当下进行槽回退到其他 character_life dynamic。"""
+    async def scenario():
+        client = await _client("bundle_personal_fallback")
+        fallback_id = await client.hold(
+            "凯尔希手记：今晨复盘巡诊路线。",
+            domain=["character_life"],
+            tags=["character_life"],
+            importance=6,
+            created="2026-01-04T00:00:00",
+        )
+        rollup_id = await client.hold(
+            "聚合事件叙述：晨间巡诊→午后复核……",
+            domain=["character_life"],
+            tags=["environment_life_rollup", "character_life"],
+            importance=6,
+            created="2026-01-04T06:00:00",
+            extra_metadata={"source_kind": "environment_life_rollup"},
+        )
+        result = await client.breath_bundle()
+        personal = result["personal"]
+        assert personal[0]["id"] == fallback_id
+        assert personal[0]["metadata"]["slot_role"] == "personal_event_active"
+        assert personal[1]["id"] == rollup_id
+        assert personal[1]["metadata"]["slot_role"] == "personal_event_rollup"
+
+    run(scenario())
+
+
+def test_environment_parser_accepts_event_summary_section():
+    raw = """[Environment Body]
+body
+
+---
+[Summary]
+Core focus: focus
+
+---
+[Retrieval Summary]
+retrieval
+
+---
+[Event Summary]
+- meeting ended
+- review completed"""
+    body, summary, retrieval, event_summary = TemplateEnvironmentGenerator.parse_environment_llm_output(raw)
+    assert body == "body"
+    assert "Core focus" in summary
+    assert retrieval == "retrieval"
+    assert "- meeting ended" in event_summary
 
 
 def test_hold_feel_source_digest_contract():
@@ -250,7 +1109,184 @@ def test_snapshot_feel_hold_preserves_first_person_content():
     run(scenario())
 
 
-def test_injectable_context_uses_recent_feel_not_snapshot_text():
+def test_environment_life_fragment_compacts_environment_context():
+    machine = object.__new__(StateMachine)
+    env = {
+        "summary": (
+            "09:52，凯尔希在医疗部走廊面对晨间观察与鼻炎药提醒两项过期计划项，"
+            "与华法琳完成简短临床讨论，随后主动发出短消息打破等待；右腕神经延迟持续，十一点复测不可再推。"
+        ),
+        "retrieval_summary": "",
+        "activity": "不应优先使用的长正文",
+        "plan_delta": "Plan delta: 这是一段很长的旧日程与对话上下文，不应该进入碎片正文。",
+        "disturbance_context": (
+            "[endogenous_reveal/task] 晨间观察的节奏债务显形 "
+            "Open thread: 要继续拖延，还是正式调整计划，必须尽快决定。"
+        ),
+        "recent_disturbances": "Recent disturbances: 旧扰动列表不应该进入正文。",
+    }
+    fragment = machine._build_environment_life_fragment(
+        env,
+        checkpoint_cst="2026-05-22T09:52:51+08:00",
+        snapshot_id=442,
+    )
+    assert fragment["content"]
+    assert len(fragment["content"]) <= 320
+    assert "Plan delta:" not in fragment["content"]
+    assert "Recent disturbances:" not in fragment["content"]
+    assert fragment["snapshot_id"] == 442
+    assert fragment["checkpoint_cst"] == "2026-05-22T09:52:51+08:00"
+    assert fragment["group_key"].startswith("environment_life:")
+    assert fragment["open_loop"]
+
+
+def test_environment_life_fragment_is_recent_event_candidate_with_snapshot_id():
+    async def scenario():
+        client = await _client("fragment_candidate")
+        fragment_id = await client.hold(
+            "凯尔希处理晨间观察并安排右腕复测。",
+            name="fragment",
+            tags=["environment_life_fragment", "character_life"],
+            domain=["character_life"],
+            extra_metadata={
+                "source": "snapshot_scheduler",
+                "source_kind": "environment_life_fragment",
+                "snapshot_id": 1,
+                "checkpoint_cst": "2026-05-22T09:00:00+08:00",
+            },
+        )
+        snapshot_id = await client.hold(
+            "凯尔希状态快照不应进入近期事件候选。",
+            name="snapshot",
+            tags=["snapshot", "environment"],
+            domain=["character_life"],
+            extra_metadata={
+                "source": "snapshot_scheduler",
+                "source_kind": "state_snapshot",
+                "snapshot_id": 2,
+                "checkpoint_cst": "2026-05-22T09:00:00+08:00",
+            },
+        )
+        machine = object.__new__(StateMachine)
+        machine.ob_client = client
+        items = await machine._ob_breath_event_dicts_for_environment(
+            query="凯尔希 晨间观察 右腕复测",
+            limit=5,
+        )
+        ids = {item["bucket_id"] for item in items}
+        assert fragment_id in ids
+        assert snapshot_id not in ids
+
+    run(scenario())
+
+
+def test_environment_life_rollup_auto_creates_event_and_bucket():
+    async def scenario():
+        client = await _client("fragment_rollup")
+        group_key = "environment_life:medical"
+        source_ids = []
+        for idx in range(3):
+            source_ids.append(
+                await client.hold(
+                    f"凯尔希第{idx}次处理晨间观察、任务反馈和右腕复测线索。",
+                    name=f"fragment {idx}",
+                    tags=["environment_life_fragment", "character_life"],
+                    domain=["character_life"],
+                    extra_metadata={
+                        "source_kind": "environment_life_fragment",
+                        "memory_role": "recent_life_event_candidate",
+                        "life_scope": "character_life",
+                        "life_theme": "medical",
+                        "group_key": group_key,
+                        "open_loop": "右腕复测仍未完成",
+                        "plan_effect": "delayed",
+                    },
+                )
+            )
+        machine = object.__new__(StateMachine)
+        machine.ob_client = client
+        machine.db = FakeEventDB()
+        machine.memory = FakeMemory()
+        machine.prompt_manager = FakePromptManager()
+        machine.snapshot_llm = FakeRollupLLM()
+
+        async def noop_refresh(event):
+            return None
+
+        machine._refresh_related_slowline_from_event = noop_refresh
+        result = await machine._process_pending_environment_life_rollups(
+            group_key=group_key,
+            reason="test",
+        )
+        assert result and result[0]["status"] == "created"
+        assert len(machine.db.events) == 1
+        buckets = await client.list_buckets(include_archive=False)
+        rollups = [
+            bucket for bucket in buckets
+            if bucket.metadata.get("source_kind") == "environment_life_rollup"
+        ]
+        assert len(rollups) == 1
+        for source_id in source_ids:
+            source = await client.get(source_id)
+            assert source.metadata["digested"] is True
+            assert source.metadata["resolved"] is True
+            assert source.metadata["linked_event_id"] == 1
+            assert source.metadata["rollup_bucket_id"] == rollups[0].id
+
+    run(scenario())
+
+
+def test_environment_life_rollup_failure_retries_then_falls_back():
+    async def scenario():
+        client = await _client("fragment_rollup_retry")
+        group_key = "environment_life:work"
+        source_ids = []
+        for idx in range(3):
+            source_ids.append(
+                await client.hold(
+                    f"凯尔希第{idx}次处理上游任务反馈，仍需等待阿米娅确认。",
+                    name=f"fragment retry {idx}",
+                    tags=["environment_life_fragment", "character_life"],
+                    domain=["character_life"],
+                    extra_metadata={
+                        "source_kind": "environment_life_fragment",
+                        "life_theme": "work",
+                        "group_key": group_key,
+                        "open_loop": "阿米娅确认仍未到账",
+                        "plan_effect": "delayed",
+                    },
+                )
+            )
+        machine = object.__new__(StateMachine)
+        machine.ob_client = client
+        machine.db = FakeEventDB()
+        machine.memory = FakeMemory()
+        machine.prompt_manager = FakePromptManager()
+        machine.snapshot_llm = FailingRollupLLM()
+
+        async def noop_refresh(event):
+            return None
+
+        machine._refresh_related_slowline_from_event = noop_refresh
+        first = await machine._process_pending_environment_life_rollups(group_key=group_key, reason="test")
+        assert first == []
+        assert len(machine.db.events) == 0
+        source = await client.get(source_ids[0])
+        assert source.metadata["rollup_attempts"] == 1
+        assert not source.metadata.get("digested")
+
+        second = await machine._process_pending_environment_life_rollups(group_key=group_key, reason="test")
+        assert second and second[0]["status"] == "created"
+        assert len(machine.db.events) == 1
+        for source_id in source_ids:
+            source = await client.get(source_id)
+            assert source.metadata["digested"] is True
+            assert source.metadata["resolved"] is True
+
+    run(scenario())
+
+
+def test_injectable_context_omits_feel_because_breath_bundle_handles_it():
     async def scenario():
         client = await _client("injectable_feel")
         await client.hold(
@@ -267,10 +1303,55 @@ def test_injectable_context_uses_recent_feel_not_snapshot_text():
 
         machine._build_recent_key_records_context = key_records_context
         injectable = await machine._build_injectable_context("不应进入注入的当前快照。")
-        assert "【近期 feel】" in injectable
-        assert "我留下来的第一人称 feel。" in injectable
+        assert "【近期 feel】" not in injectable
+        assert "我留下来的第一人称 feel。" not in injectable
         assert "【当前状态快照】" not in injectable
+        assert "【当前日程主条目】" not in injectable
+        assert "【稳定原则结晶】" in injectable
+        assert "（暂无稳定原则结晶）" in injectable
         assert "不应进入注入的当前快照。" not in injectable
+
+    run(scenario())
+
+
+def test_injectable_context_includes_recent_pinned_principles():
+    async def scenario():
+        client = await _client("injectable_pinned")
+        await client.hold(
+            "旧原则",
+            bucket_type="permanent",
+            pinned=True,
+            name="旧原则",
+            created="2026-01-01T00:00:00",
+            extra_metadata={
+                "principle_title": "旧原则",
+                "principle_injection": "旧原则注入。",
+            },
+        )
+        await client.hold(
+            "标题：在场原则\n核心原则：计算与在场可以同时存在。",
+            bucket_type="permanent",
+            pinned=True,
+            name="在场原则",
+            created="2026-01-02T00:00:00",
+            extra_metadata={
+                "principle_title": "在场不是任务",
+                "principle_injection": "照护中的计算仍然必要，但它可以和身体层面的在场同时发生。",
+            },
+        )
+        machine = object.__new__(StateMachine)
+        machine.ob_client = client
+        machine.plan_engine = None
+
+        async def key_records_context(limit: int = 5):
+            return "（暂无近期关键记录）"
+
+        machine._build_recent_key_records_context = key_records_context
+        injectable = await machine._build_injectable_context("ignored")
+        assert "【稳定原则结晶】" in injectable
+        assert "在场不是任务" in injectable
+        assert "照护中的计算仍然必要" in injectable
+        assert "旧原则注入" in injectable
 
     run(scenario())
 
@@ -338,7 +1419,9 @@ def test_environment_trace_hold_is_dynamic_character_life_memory():
         assert bucket.metadata["domain"] == ["character_life"]
         assert bucket.metadata["source_kind"] == "environment_trace"
         assert "environment_trace" in bucket.metadata["tags"]
-        surfaced = await client.breath(limit=5)
+        # environment_trace 是 character_life domain；breath 默认排除 character_life，
+        # 此处显式 include_character_life=True 验证它能被浮现的能力。
+        surfaced = await client.breath(limit=5, include_character_life=True)
         assert bid in [item.id for item in surfaced]
 
     run(scenario())
@@ -396,6 +1479,14 @@ def test_feel_crystals_paginates_clusters_and_crystallize_principle_marks_source
         result = await client.crystallize_feel(
             mode="principle",
             principle_content="A stable principle from repeated feel.",
+            principle_title="Stable principle",
+            principle_card={
+                "principle": "The repeated feeling should become a stable stance.",
+                "response_rule": "When the pattern returns, answer from the stance first.",
+                "anchors": ["first anchor", "second anchor"],
+                "avoid": "Do not flatten the feeling into analysis.",
+            },
+            principle_injection="Remember the stable stance before reacting.",
             cluster_id=cluster_id,
             include_all=True,
             min_cluster_size=3,
@@ -406,6 +1497,11 @@ def test_feel_crystals_paginates_clusters_and_crystallize_principle_marks_source
         principle = await client.get(result["principle_bucket_id"])
         assert principle.metadata["pinned"] is True
         assert principle.metadata.get("protected") in (None, False)
+        assert principle.metadata["principle_title"] == "Stable principle"
+        assert principle.metadata["principle_injection"] == "Remember the stable stance before reacting."
+        assert principle.metadata["principle_card"]["principle"].startswith("The repeated feeling")
+        assert "标题：Stable principle" in principle.content
+        assert "回应规则：" in principle.content
         for source_id in result["source_feel_ids"]:
             source = await client.get(source_id)
             assert source.metadata["crystallized"] is True
@@ -432,6 +1528,41 @@ def test_crystallize_feel_mode_creates_condensed_feel_only():
         assert condensed.metadata["type"] == "feel"
         assert not condensed.metadata.get("pinned")
         assert result["marked_count"] == 2
+
+    run(scenario())
+
+
+def test_crystallize_principle_does_not_create_feel_and_is_idempotent():
+    async def scenario():
+        client = await _client("principle_idempotent")
+        ids = [
+            await client.hold("first source feel", bucket_type="feel"),
+            await client.hold("second source feel", bucket_type="feel"),
+        ]
+        kwargs = {
+            "mode": "principle",
+            "principle_content": "A stable principle from these sources.",
+            "feel_ids": ids,
+        }
+        first = await client.crystallize_feel(**kwargs)
+        second = await client.crystallize_feel(**kwargs)
+        assert first["principle_bucket_id"] == second["principle_bucket_id"]
+        assert "feel_bucket_id" not in first
+        assert "feel_bucket_id" not in second
+        buckets = await client.list_buckets(include_archive=False)
+        crystal_principles = [
+            bucket for bucket in buckets
+            if bucket.metadata.get("source_kind") == "feel_crystal"
+            and bucket.metadata.get("crystal_output") == "principle"
+        ]
+        crystal_feels = [
+            bucket for bucket in buckets
+            if bucket.metadata.get("source_kind") == "feel_crystal"
+            and bucket.metadata.get("crystal_output") == "feel"
+        ]
+        assert len(crystal_principles) == 1
+        assert crystal_feels == []
+        assert second["deduped"] is True
 
     run(scenario())
 

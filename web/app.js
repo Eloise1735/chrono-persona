@@ -1,4 +1,20 @@
 const API = '/api';
+const ADMIN_TOKEN_STORAGE_KEY = 'kelsey_admin_token';
+const ADMIN_TOKEN_QUERY_PARAM = 'kelsey_token';
+
+function bootstrapAdminTokenFromUrl() {
+  const params = new URLSearchParams(window.location.search || '');
+  const token = (params.get(ADMIN_TOKEN_QUERY_PARAM) || '').trim();
+  if (!token) return;
+  localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  params.delete(ADMIN_TOKEN_QUERY_PARAM);
+  const nextQuery = params.toString();
+  const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash || ''}`;
+  window.history.replaceState({}, '', nextUrl);
+}
+
+bootstrapAdminTokenFromUrl();
+
 /**
  * 本项目所有面向用户的时间展示默认东八区（UTC+8）。
  * 与后端 server/time_display 一致；勿用浏览器本机时区代替。
@@ -36,10 +52,23 @@ function calendarDateStringShanghai(date = new Date()) {
 // ── Utility ──
 
 async function apiFetch(path, options = {}) {
-  const resp = await fetch(`${API}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+  const token = localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '';
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(options.headers || {}),
+  };
+  if (token) headers['X-Kelsey-Admin-Token'] = token;
+  let resp = await fetch(`${API}${path}`, {
     ...options,
+    headers,
   });
+  if (resp.status === 401 && !options._retriedAuth) {
+    const nextToken = prompt('Admin token required');
+    if (nextToken) {
+      localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, nextToken.trim());
+      return apiFetch(path, { ...options, _retriedAuth: true });
+    }
+  }
   if (!resp.ok) {
     const err = await resp.text();
     throw new Error(`API error ${resp.status}: ${err}`);
@@ -1373,7 +1402,7 @@ function normalizeIsoDateTimeInput(raw) {
 
 async function runGetState() {
   const res = document.getElementById('test-result');
-  res.innerHTML = '<div class="loading">正在生成状态快照…（可能需要较长时间）</div>';
+  res.innerHTML = '<div class="loading">正在读取当前状态…</div>';
   try {
     const body = {
       current_time: normalizeIsoDateTimeInput(document.getElementById('t-now').value),
@@ -3067,6 +3096,27 @@ const PERSONA_SETTINGS_KEYS = [
   'L2_life_status',
 ];
 
+const SENSITIVE_SETTING_KEYS = new Set([
+  'llm_api_key',
+  'env_llm_api_key',
+  'snapshot_llm_api_key',
+  'vector_embedding_api_key',
+  'plan_web_search_api_key',
+]);
+
+function isSensitiveSettingKey(key) {
+  return SENSITIVE_SETTING_KEYS.has(String(key || ''));
+}
+
+function setSecretInputValue(id, value, isSet) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.value = '';
+  el.placeholder = isSet || value ? 'Set in server environment' : 'Missing server environment variable';
+  el.disabled = true;
+  el.title = 'API keys are read only from server environment variables.';
+}
+
 const PROMPT_DEFAULT_SAMPLES = {
   prompt_snapshot_generation: `基于以下信息，以凯尔希的第一人称视角，写一段内心状态独白。
 这段独白应该反映凯尔希此刻的心理状态、关注的事务、以及对近期发生事件的思考。
@@ -3441,7 +3491,11 @@ async function loadSettingsPage() {
       if ((!value || !String(value).trim()) && PROMPT_DEFAULT_SAMPLES[k]) {
         value = PROMPT_DEFAULT_SAMPLES[k];
       }
-      setInputValue(`setting-${k}`, value);
+      if (isSensitiveSettingKey(k)) {
+        setSecretInputValue(`setting-${k}`, value, !!value);
+      } else {
+        setInputValue(`setting-${k}`, value);
+      }
     });
     await loadModelSettingsPage();
     await loadEvolutionStatus();
@@ -3454,6 +3508,9 @@ async function loadSettingsPage() {
 async function saveSetting(key) {
   const el = document.getElementById(`setting-${key}`);
   if (!el) return;
+  if (isSensitiveSettingKey(key) && !String(el.value || '').trim()) {
+    return;
+  }
   await apiFetch(`/settings/${encodeURIComponent(key)}`, {
     method: 'PUT',
     body: JSON.stringify({ value: el.value }),
@@ -4069,7 +4126,11 @@ async function loadVectorSettings() {
     const data = await apiFetch('/vectors/settings');
     const settings = data.settings || {};
     setInputValue('vector-setting-vector_embedding_api_base', settings.embedding_api_base || '');
-    setInputValue('vector-setting-vector_embedding_api_key', settings.embedding_api_key || '');
+    setSecretInputValue(
+      'vector-setting-vector_embedding_api_key',
+      settings.embedding_api_key,
+      !!settings.embedding_api_key_set
+    );
     setInputValue('vector-setting-vector_embedding_model', settings.embedding_model || '');
     setInputValue('vector-setting-vector_embedding_dim', String(settings.embedding_dim || 256));
     setInputValue('vector-setting-vector_embedding_timeout_sec', String(settings.timeout_sec || 15));
@@ -4087,7 +4148,6 @@ async function loadVectorSettings() {
 async function saveVectorSettings() {
   const payload = {
     vector_embedding_api_base: (document.getElementById('vector-setting-vector_embedding_api_base')?.value || '').trim(),
-    vector_embedding_api_key: (document.getElementById('vector-setting-vector_embedding_api_key')?.value || '').trim(),
     vector_embedding_model: (document.getElementById('vector-setting-vector_embedding_model')?.value || '').trim(),
     vector_embedding_dim: Number(document.getElementById('vector-setting-vector_embedding_dim')?.value || 256),
     vector_embedding_timeout_sec: Number(document.getElementById('vector-setting-vector_embedding_timeout_sec')?.value || 15),
@@ -4796,7 +4856,7 @@ async function loadEnvironmentLLMConfig() {
     const enabled = !!settings.enabled;
     setInputValue('env-llm-enabled', enabled ? 'true' : 'false');
     setInputValue('env-llm-api-base', settings.api_base || '');
-    setInputValue('env-llm-api-key', settings.api_key || '');
+    setSecretInputValue('env-llm-api-key', settings.api_key, !!settings.api_key_set);
     setInputValue('env-llm-model', settings.model || '');
   } catch (e) {
     showStatus('环境 LLM 配置加载失败: ' + e.message, true);
@@ -4808,7 +4868,7 @@ async function loadRuntimeLLMConfig() {
     const data = await apiFetch('/runtime/llm');
     const settings = data.settings || {};
     setInputValue('runtime-llm-api-base', settings.api_base || '');
-    setInputValue('runtime-llm-api-key', settings.api_key || '');
+    setSecretInputValue('runtime-llm-api-key', settings.api_key, !!settings.api_key_set);
     setInputValue('runtime-llm-model', settings.model || '');
     setInputValue('runtime-llm-timeout-sec', settings.timeout_sec || '');
   } catch (e) {
@@ -4819,7 +4879,6 @@ async function loadRuntimeLLMConfig() {
 async function saveRuntimeLLMConfig() {
   const payload = {
     llm_api_base: (document.getElementById('runtime-llm-api-base')?.value || '').trim(),
-    llm_api_key: (document.getElementById('runtime-llm-api-key')?.value || '').trim(),
     llm_model: (document.getElementById('runtime-llm-model')?.value || '').trim(),
   };
   const timeoutRaw = (document.getElementById('runtime-llm-timeout-sec')?.value || '').trim();
@@ -4855,7 +4914,6 @@ async function saveEnvironmentLLMConfig() {
   const payload = {
     enabled: String(document.getElementById('env-llm-enabled')?.value || 'false') === 'true',
     api_base: (document.getElementById('env-llm-api-base')?.value || '').trim(),
-    api_key: (document.getElementById('env-llm-api-key')?.value || '').trim(),
     model: (document.getElementById('env-llm-model')?.value || '').trim(),
   };
   try {
@@ -4877,7 +4935,7 @@ async function loadSnapshotLLMConfig() {
     const enabled = !!settings.enabled;
     setInputValue('snapshot-llm-enabled', enabled ? 'true' : 'false');
     setInputValue('snapshot-llm-api-base', settings.api_base || '');
-    setInputValue('snapshot-llm-api-key', settings.api_key || '');
+    setSecretInputValue('snapshot-llm-api-key', settings.api_key, !!settings.api_key_set);
     setInputValue('snapshot-llm-model', settings.model || '');
   } catch (e) {
     showStatus('快照 LLM 配置加载失败: ' + e.message, true);
@@ -4888,7 +4946,6 @@ async function saveSnapshotLLMConfig() {
   const payload = {
     enabled: String(document.getElementById('snapshot-llm-enabled')?.value || 'false') === 'true',
     api_base: (document.getElementById('snapshot-llm-api-base')?.value || '').trim(),
-    api_key: (document.getElementById('snapshot-llm-api-key')?.value || '').trim(),
     model: (document.getElementById('snapshot-llm-model')?.value || '').trim(),
   };
   try {

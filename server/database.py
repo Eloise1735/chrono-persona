@@ -298,8 +298,11 @@ CREATE TABLE IF NOT EXISTS character_notifications (
 
 
 class Database:
+    SNAPSHOT_ORDER_DESC = "julianday(created_at) DESC, created_at DESC, id DESC"
+    SNAPSHOT_ORDER_ASC = "julianday(created_at) ASC, created_at ASC, id ASC"
+
     def __init__(self, db_path: str):
-        self._db_path = db_path
+        self._db_path = str(Path(db_path).expanduser().resolve())
         self._conn: aiosqlite.Connection | None = None
 
     async def initialize(self):
@@ -637,7 +640,7 @@ class Database:
 
     async def get_latest_snapshot(self) -> StateSnapshot | None:
         async with self.conn.execute(
-            "SELECT * FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT 1"
+            f"SELECT * FROM state_snapshots ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
             return StateSnapshot(**dict(row)) if row else None
@@ -656,14 +659,16 @@ class Database:
         async with self.conn.execute(
             """SELECT * FROM state_snapshots
                WHERE type != 'conversation_end'
-               ORDER BY created_at DESC, id DESC LIMIT 1"""
+               ORDER BY """
+            + self.SNAPSHOT_ORDER_DESC
+            + " LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
             return StateSnapshot(**dict(row)) if row else None
 
     async def count_snapshots_since(self, since_timestamp: str) -> int:
         async with self.conn.execute(
-            "SELECT COUNT(*) FROM state_snapshots WHERE created_at > ?",
+            "SELECT COUNT(*) FROM state_snapshots WHERE julianday(created_at) > julianday(?)",
             (since_timestamp,),
         ) as cur:
             row = await cur.fetchone()
@@ -671,7 +676,7 @@ class Database:
 
     async def get_recent_snapshots(self, limit: int = 7) -> list[StateSnapshot]:
         async with self.conn.execute(
-            "SELECT * FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+            f"SELECT * FROM state_snapshots ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?", (limit,)
         ) as cur:
             rows = await cur.fetchall()
             return [StateSnapshot(**dict(r)) for r in rows]
@@ -681,8 +686,10 @@ class Database:
         end_ts = f"{end_date}T23:59:59"
         async with self.conn.execute(
             """SELECT * FROM state_snapshots
-               WHERE created_at >= ? AND created_at <= ?
-               ORDER BY created_at ASC, id ASC""",
+               WHERE julianday(created_at) >= julianday(?)
+                 AND julianday(created_at) <= julianday(?)
+               ORDER BY """
+            + self.SNAPSHOT_ORDER_ASC,
             (start_ts, end_ts),
         ) as cur:
             rows = await cur.fetchall()
@@ -690,7 +697,7 @@ class Database:
 
     async def get_all_snapshots(self, offset: int = 0, limit: int = 50) -> list[StateSnapshot]:
         async with self.conn.execute(
-            "SELECT * FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM state_snapshots ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ? OFFSET ?",
             (limit, offset),
         ) as cur:
             rows = await cur.fetchall()
@@ -734,7 +741,10 @@ class Database:
         async with self.conn.execute(
             """SELECT * FROM state_snapshots
                WHERE id NOT IN (
-                   SELECT id FROM state_snapshots ORDER BY created_at DESC, id DESC LIMIT ?
+                   SELECT id FROM state_snapshots
+                   ORDER BY """
+            + self.SNAPSHOT_ORDER_DESC
+            + """ LIMIT ?
                )
                AND embedding_vector_id IS NULL
                ORDER BY id ASC""",
@@ -821,7 +831,9 @@ class Database:
             """SELECT * FROM state_snapshots
                WHERE datetime(created_at) <= datetime('now', ?)
                  AND embedding_vector_id IS NULL
-               ORDER BY created_at ASC, id ASC
+               ORDER BY """
+            + self.SNAPSHOT_ORDER_ASC
+            + """
                LIMIT ?""",
             (f"-{max(1, days)} days", limit),
         ) as cur:

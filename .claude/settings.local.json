@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path . -Recurse -Directory)",
+      "Bash(Select-Object -First 20)",
+      "Bash(python -m pytest tests/test_ob_alignment.py -q)",
+      "Bash(python -m pytest tests/ -q)"
+    ]
+  }
+}

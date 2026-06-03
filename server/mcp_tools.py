@@ -2,17 +2,25 @@
 
 Tools:
   - get_current_state: Called at conversation start
-  - summarize_conversation: Called before conversation end reflection
   - reflect_on_conversation: Called at conversation end
   - recall_memories: Called proactively during conversation for memory retrieval
   - upsert_key_record: Store structured key records during conversation, defaulting to automatic classification into the new 10-type taxonomy
   - recall_key_records: Called proactively during conversation for structured record retrieval
   - upsert_world_book: Store stable profile/world-book facts that rarely change
   - recall_world_book: Called proactively for stable profile/background lookup
+  - schedule_bundle: Read or directly edit the backend daily schedule from the conversation frontend
 
 OB startup protocol:
+  get_current_state returns operational context only (recent key_records and the
+  pinned principle cards). It does not inject schedule or feel memory; schedule
+  comes from schedule_bundle(), and feel comes from breath_bundle().
   On every new conversation or resumed conversation, call breath_bundle() before
-  answering. It returns ordinary breath(top_k=8) plus breath(domain="feel", top_k=3).
+  answering. It returns three grouped lists (固定 3+5+2=10 槽)：
+    personal   — 「个人事件·当下进行」(latest environment_event_summary)
+                 + 「个人事件·近期总结」(latest environment_life_rollup)
+                 + 「当下感受」(latest character_life feel)
+    relational — 3 non-character_life dynamic + 2 non-character_life feel
+    free       — 2 free-association slots (any type/tag, dedup against the 8 above)
   Do not use dream() as the startup tool by default.
   Use dream() at conversation end or maintenance time. Dream only reads dynamic
   candidates; after dream, explicitly choose hold_feel(source_bucket=...),
@@ -43,7 +51,7 @@ import json
 import logging
 from mcp.server.fastmcp import FastMCP
 from server.diagnostics import OperationTracer
-from server.models import WorldBook
+from server.models import PlanItem, WorldBook
 
 # FastMCP defaults streamable HTTP to path "/mcp". With mount "/mcp-http", the full URL is
 # /mcp-http/mcp (many clients append "/mcp" to the configured base URL).
@@ -58,6 +66,7 @@ mcp.settings.transport_security.enable_dns_rebinding_protection = False
 # Will be set during app startup
 _state_machine = None
 _evolution_engine = None
+_plan_engine = None
 _ob_client = None
 _ob_decay_engine = None
 logger = logging.getLogger(__name__)
@@ -73,6 +82,11 @@ def set_evolution_engine(engine):
     _evolution_engine = engine
 
 
+def set_plan_engine(engine):
+    global _plan_engine
+    _plan_engine = engine
+
+
 def set_ob_client(client):
     global _ob_client
     _ob_client = client
@@ -85,6 +99,248 @@ def set_ob_decay_engine(engine):
 
 def _ob_unavailable() -> str:
     return "错误：OB 记忆主干尚未初始化"
+
+
+_PLAN_ACTION_TYPES = {"internal", "web_search", "npc_interaction"}
+_PLAN_STATUSES = {"pending", "executing", "done", "skipped"}
+_PLAN_SOURCE_KINDS = {"generated", "routine", "carried_over", "thread", "spontaneous", "replan"}
+_PLAN_ITEM_FIELDS = {
+    "hour_start",
+    "hour_end",
+    "activity",
+    "action_type",
+    "action_payload",
+    "status",
+    "outcome",
+    "source_kind",
+    "source_ref_id",
+    "executed_at",
+}
+
+
+def _schedule_error(message: str) -> str:
+    return json.dumps({"ok": False, "error": message}, ensure_ascii=False, indent=2)
+
+
+def _parse_schedule_payload(payload_json: str):
+    raw = str(payload_json or "").strip()
+    if not raw:
+        raise ValueError("payload_json 不能为空")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"payload_json 不是有效 JSON：{exc}") from exc
+
+
+def _schedule_int(value, *, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} 必须是整数") from exc
+
+
+def _schedule_optional_int(value, *, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    return _schedule_int(value, field=field)
+
+
+def _sanitize_schedule_payload(payload: dict | None) -> dict:
+    data = dict(payload or {})
+    for key in ("content", "message", "message_text", "draft", "draft_message", "user_message", "sync_request"):
+        data.pop(key, None)
+    outline = data.get("progress_outline")
+    if isinstance(outline, dict):
+        data["progress_outline"] = {
+            "goal": str(outline.get("goal") or "").strip(),
+            "done_so_far": str(outline.get("done_so_far") or "").strip(),
+            "remaining": str(outline.get("remaining") or "").strip(),
+            "watch_points": str(outline.get("watch_points") or "").strip(),
+            "trigger_to_shift": str(outline.get("trigger_to_shift") or "").strip(),
+        }
+    if "thread_id" in data:
+        data["thread_id"] = str(data.get("thread_id") or "").strip()
+    if "progress_status" in data:
+        data["progress_status"] = str(data.get("progress_status") or "").strip()
+    if "closure_condition" in data:
+        data["closure_condition"] = str(data.get("closure_condition") or "").strip()
+    for numeric_key in ("expected_steps", "current_step"):
+        if numeric_key in data:
+            try:
+                data[numeric_key] = max(1, int(data.get(numeric_key) or 1))
+            except Exception:
+                data.pop(numeric_key, None)
+    return data
+
+
+def _parse_plan_item_payload(raw: str) -> dict:
+    try:
+        value = json.loads(raw or "{}")
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _schedule_item_dict(item: PlanItem) -> dict:
+    data = item.model_dump()
+    data["action_payload"] = _parse_plan_item_payload(item.action_payload)
+    return data
+
+
+def _schedule_plan_items_raw_plan(items: list[PlanItem]) -> str:
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "hour_start": int(item.hour_start),
+                    "hour_end": int(item.hour_end),
+                    "activity": item.activity,
+                    "action_type": item.action_type,
+                    "action_payload": _parse_plan_item_payload(item.action_payload),
+                    "status": item.status,
+                    "outcome": item.outcome,
+                    "source_kind": item.source_kind,
+                    "source_ref_id": item.source_ref_id,
+                    "executed_at": item.executed_at,
+                }
+                for item in items
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _validate_schedule_range(hour_start: int, hour_end: int) -> None:
+    if not 0 <= int(hour_start) <= 23:
+        raise ValueError("hour_start 必须在 0-23 之间")
+    if not 1 <= int(hour_end) <= 24:
+        raise ValueError("hour_end 必须在 1-24 之间")
+    if int(hour_end) <= int(hour_start):
+        raise ValueError("hour_end 必须大于 hour_start")
+
+
+def _normalize_schedule_patch(patch: dict, *, existing: PlanItem | None = None) -> dict:
+    if not isinstance(patch, dict):
+        raise ValueError("payload_json 必须是 JSON object")
+    unknown = sorted(set(patch) - _PLAN_ITEM_FIELDS)
+    if unknown:
+        raise ValueError(f"不支持的字段：{', '.join(unknown)}")
+    fields = {}
+    if "hour_start" in patch:
+        fields["hour_start"] = _schedule_int(patch.get("hour_start"), field="hour_start")
+    if "hour_end" in patch:
+        fields["hour_end"] = _schedule_int(patch.get("hour_end"), field="hour_end")
+    if "activity" in patch:
+        activity = str(patch.get("activity") or "").strip()
+        if not activity:
+            raise ValueError("activity 不能为空")
+        fields["activity"] = activity
+    if "action_type" in patch:
+        action_type = str(patch.get("action_type") or "").strip()
+        if action_type not in _PLAN_ACTION_TYPES:
+            raise ValueError("action_type 只能是 internal / web_search / npc_interaction")
+        fields["action_type"] = action_type
+    if "action_payload" in patch:
+        payload = patch.get("action_payload")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError("action_payload 必须是 JSON object")
+        fields["action_payload"] = json.dumps(_sanitize_schedule_payload(payload), ensure_ascii=False)
+    if "status" in patch:
+        status = str(patch.get("status") or "").strip()
+        if status not in _PLAN_STATUSES:
+            raise ValueError("status 只能是 pending / executing / done / skipped")
+        fields["status"] = status
+    if "outcome" in patch:
+        fields["outcome"] = str(patch.get("outcome") or "").strip()
+    if "source_kind" in patch:
+        source_kind = str(patch.get("source_kind") or "").strip()
+        if source_kind not in _PLAN_SOURCE_KINDS:
+            raise ValueError("source_kind 只能是 generated / routine / carried_over / thread / spontaneous / replan")
+        fields["source_kind"] = source_kind
+    if "source_ref_id" in patch:
+        fields["source_ref_id"] = _schedule_optional_int(patch.get("source_ref_id"), field="source_ref_id")
+    if "executed_at" in patch:
+        value = patch.get("executed_at")
+        fields["executed_at"] = None if value is None or value == "" else str(value).strip()
+    if existing is not None and ("hour_start" in fields or "hour_end" in fields):
+        hour_start = int(fields.get("hour_start", existing.hour_start))
+        hour_end = int(fields.get("hour_end", existing.hour_end))
+        _validate_schedule_range(hour_start, hour_end)
+    elif "hour_start" in fields or "hour_end" in fields:
+        if "hour_start" not in fields or "hour_end" not in fields:
+            raise ValueError("新增计划项必须同时提供 hour_start 和 hour_end")
+        _validate_schedule_range(int(fields["hour_start"]), int(fields["hour_end"]))
+    return fields
+
+
+def _normalize_schedule_item(plan_id: int, raw: dict) -> PlanItem:
+    fields = _normalize_schedule_patch(raw)
+    if "hour_start" not in fields or "hour_end" not in fields:
+        raise ValueError("每个计划项都必须提供 hour_start 和 hour_end")
+    activity = str(raw.get("activity") or "").strip()
+    if not activity:
+        raise ValueError("每个计划项都必须提供非空 activity")
+    return PlanItem(
+        plan_id=plan_id,
+        hour_start=int(fields["hour_start"]),
+        hour_end=int(fields["hour_end"]),
+        activity=activity,
+        action_type=str(fields.get("action_type") or "internal"),
+        action_payload=str(fields.get("action_payload") or json.dumps({}, ensure_ascii=False)),
+        status=str(fields.get("status") or "pending"),
+        outcome=str(fields.get("outcome") or ""),
+        source_kind=str(fields.get("source_kind") or "spontaneous"),
+        source_ref_id=fields.get("source_ref_id"),
+        executed_at=fields.get("executed_at"),
+    )
+
+
+async def _schedule_items_response(plan) -> tuple[dict | None, list[dict]]:
+    """Resolve a plan to (plan_dict, items_dicts), with replan-parent fallback for empty plans.
+
+    Failure mode this guards against: replan can leave behind a status=active plan with no
+    or partial items (e.g., LLM返回中途 insert 失败、或我们刚加的"items 全失败标 failed"未及时跑)。
+    schedule_bundle 直接读到这种空壳 plan 就会给前台返回空日程表。
+    防御：plan.items 为空时，沿 replan_parent_id 链回退到最近一个有 items 的祖先；
+    回退时在 plan_dict 里加 _fallback_from_plan_id / _fallback_reason 标记，前端能感知。
+    """
+    if plan is None or getattr(plan, "id", None) is None:
+        return None, []
+    if _plan_engine is not None:
+        items = await _plan_engine.get_effective_plan_items(plan)
+    else:
+        items = await _state_machine.db.list_plan_items(int(plan.id))
+    if items:
+        return plan.model_dump(), [_schedule_item_dict(item) for item in items]
+    # 空 plan → 沿 parent 回退（最多 5 层，防环）
+    visited: set[int] = {int(plan.id)}
+    cursor = plan
+    for _ in range(5):
+        parent_id = getattr(cursor, "replan_parent_id", None)
+        if not parent_id or int(parent_id) in visited:
+            break
+        visited.add(int(parent_id))
+        parent_plan = await _state_machine.db.get_daily_plan_by_id(int(parent_id))
+        if parent_plan is None or parent_plan.id is None:
+            break
+        if _plan_engine is not None:
+            parent_items = await _plan_engine.get_effective_plan_items(parent_plan)
+        else:
+            parent_items = await _state_machine.db.list_plan_items(int(parent_plan.id))
+        if parent_items:
+            payload = parent_plan.model_dump()
+            payload["_fallback_from_plan_id"] = int(plan.id)
+            payload["_fallback_reason"] = "current_plan_has_no_items_walked_replan_parent_chain"
+            return payload, [_schedule_item_dict(item) for item in parent_items]
+        cursor = parent_plan
+    # 链上全空 → 返回原始空 plan + 明确标记
+    payload = plan.model_dump()
+    payload["_fallback_attempted"] = True
+    payload["_fallback_reason"] = "no_ancestor_plan_with_items_found"
+    return payload, []
 
 
 async def _create_feel_crystal_key_record(
@@ -123,11 +379,10 @@ async def _create_feel_crystal_key_record(
 
 @mcp.tool()
 async def get_current_state(current_time: str, last_interaction_time: str | None = None) -> str:
-    """对话开始时调用。根据时间间隔生成凯尔希的最新状态快照。
+    """对话开始时调用。直接读取数据库里的最新状态快照与结构化上下文，不在请求期间生成新快照。
 
-    推进与「尾部补一格」会参考数据库中最后一条快照时刻；对话相关的上次互动检查点
-    固定取数据库最新 `conversation_end` 快照。仅「不足一整格最小时间单位、只在对话当下补一条」时：要求
-    （对话时刻 − 最后快照）大于 2 小时才会生成，避免短时重复刷新。
+    快照推进与补齐交给后台 scheduler 处理；对话相关的上次互动检查点仍固定取数据库最新
+    `conversation_end` 快照。
 
     Args:
         current_time: 当前真实时间。**强烈建议**使用东八区显式偏移，例如 ``2026-03-28T10:00:00+08:00``
@@ -136,7 +391,7 @@ async def get_current_state(current_time: str, last_interaction_time: str | None
         last_interaction_time: 兼容旧调用保留，可不传；实际推进不依赖该值
 
     Returns:
-        可直接注入会话上下文的文本块，顺序为：近期 key_records -> 当日日程 -> 当前状态快照。
+        可直接注入会话上下文的文本块，顺序为：近期 key_records -> pinned 稳定原则结晶。
         注意：在整个对话过程中，遇到任何与过往经历、事件、约定、人物相关的话题，
         应主动调用 key_records 与 OB 工具（breath/dream/feel/hold/grow）——不要等对方开口询问。
     """
@@ -223,11 +478,128 @@ async def _mark_notifications_delivered(notifications) -> None:
 
 
 @mcp.tool()
-async def summarize_conversation(conversation_text: str) -> str:
-    """对话结束前可调用。将本次原始对话整理为可持久化的摘要。"""
+async def schedule_bundle(
+    action: str,
+    plan_id: int = 0,
+    item_id: int = 0,
+    plan_date: str = "",
+    payload_json: str = "",
+    include_history: bool = False,
+    history_limit: int = 10,
+) -> str:
+    """日程管理 bundle：直接读取、单项编辑、整表替换后台日程表。
+
+    action:
+      - read: 默认读取当前计划；传 plan_id 读取指定计划；传 plan_date 读取该日期最新计划。
+      - edit_item: payload_json 为 patch object，直接更新 item_id 对应计划项。
+      - replace_items: payload_json 为 items 数组或 {"items":[...]}，替换 plan_id 下全部计划项。
+
+    这是直接同步后台数据库的工具，不调用 LLM，不做角色判断式改写。
+    """
     if _state_machine is None:
-        return "错误：状态机未初始化"
-    return await _state_machine.summarize_conversation(conversation_text)
+        return _schedule_error("状态机未初始化")
+    db = _state_machine.db
+    mode = str(action or "").strip().lower()
+    if mode not in {"read", "edit_item", "replace_items"}:
+        return _schedule_error("action 只能是 read / edit_item / replace_items")
+
+    try:
+        if mode == "read":
+            target_plan = None
+            requested_specific_plan = False
+            if int(plan_id or 0) > 0:
+                requested_specific_plan = True
+                target_plan = await db.get_daily_plan_by_id(int(plan_id))
+            elif str(plan_date or "").strip():
+                requested_specific_plan = True
+                target_plan = await db.get_latest_daily_plan_for_date(str(plan_date).strip())
+            elif _plan_engine is not None:
+                target_plan = await _plan_engine.get_current_plan()
+            else:
+                plans = await db.list_daily_plans(offset=0, limit=1, status="active")
+                target_plan = plans[0] if plans else None
+            if requested_specific_plan and target_plan is None:
+                return _schedule_error("未找到指定日程")
+            plan_payload, item_payload = await _schedule_items_response(target_plan)
+            result = {
+                "ok": True,
+                "action": mode,
+                "plan": plan_payload,
+                "items": item_payload,
+            }
+            if include_history:
+                limit = max(1, min(50, int(history_limit or 10)))
+                history = await db.list_daily_plans(offset=0, limit=limit)
+                result["history"] = [item.model_dump() for item in history]
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        if mode == "edit_item":
+            target_item_id = int(item_id or 0)
+            if target_item_id <= 0:
+                return _schedule_error("edit_item 需要提供 item_id")
+            item = await db.get_plan_item_by_id(target_item_id)
+            if item is None:
+                return _schedule_error("未找到该计划项")
+            patch = _parse_schedule_payload(payload_json)
+            fields = _normalize_schedule_patch(patch, existing=item)
+            if not fields:
+                return _schedule_error("payload_json 没有可更新字段")
+            await db.update_plan_item(target_item_id, **fields)
+            updated_item = await db.get_plan_item_by_id(target_item_id)
+            if updated_item is None:
+                return _schedule_error("更新后未找到该计划项")
+            plan_items = await db.list_plan_items(int(updated_item.plan_id))
+            await db.update_daily_plan(int(updated_item.plan_id), raw_plan=_schedule_plan_items_raw_plan(plan_items))
+            plan = await db.get_daily_plan_by_id(int(updated_item.plan_id))
+            plan_payload, item_payload = await _schedule_items_response(plan)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "action": mode,
+                    "updated_item_id": target_item_id,
+                    "plan": plan_payload,
+                    "items": item_payload,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        target_plan_id = int(plan_id or 0)
+        if target_plan_id <= 0:
+            return _schedule_error("replace_items 需要提供 plan_id")
+        plan = await db.get_daily_plan_by_id(target_plan_id)
+        if plan is None:
+            return _schedule_error("未找到该计划")
+        parsed = _parse_schedule_payload(payload_json)
+        raw_items = parsed.get("items") if isinstance(parsed, dict) else parsed
+        if not isinstance(raw_items, list):
+            return _schedule_error("replace_items 的 payload_json 必须是数组，或包含 items 数组")
+        normalized_items: list[PlanItem] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                return _schedule_error("items 中每一项都必须是 JSON object")
+            normalized_items.append(_normalize_schedule_item(target_plan_id, raw))
+        normalized_items.sort(key=lambda item: (item.hour_start, item.hour_end, item.activity))
+        await db.delete_plan_items_for_plan(target_plan_id)
+        for item in normalized_items:
+            await db.insert_plan_item(item)
+        fresh_items = await db.list_plan_items(target_plan_id)
+        await db.update_daily_plan(target_plan_id, raw_plan=_schedule_plan_items_raw_plan(fresh_items))
+        fresh_plan = await db.get_daily_plan_by_id(target_plan_id)
+        plan_payload, item_payload = await _schedule_items_response(fresh_plan)
+        return json.dumps(
+            {
+                "ok": True,
+                "action": mode,
+                "replaced_count": len(fresh_items),
+                "plan": plan_payload,
+                "items": item_payload,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except ValueError as exc:
+        return _schedule_error(str(exc))
 
 
 @mcp.tool()
@@ -307,11 +679,27 @@ async def breath(
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
+    date_from: str = "",
+    date_to: str = "",
+    include_character_life: bool = False,
 ) -> str:
     """OB 呼吸：无 query 时让记忆自然浮现；有 query 时按主题/情感坐标检索。
 
-    普通默认 top_k=8；domain=feel 默认 top_k=3，最多 1 条 character_life feel。
+    普通默认 top_k=8；domain=feel 默认 top_k=3。
     对话初始化优先调用 breath_bundle()，不要把 dream() 当成启动步骤。
+
+    【默认行为：排除 character_life】
+    breath 默认**不返回** character_life buckets（角色侧自身生活流），以避免角色侧
+    内容大量浮现掩盖关系侧 / 用户侧回忆。需要 character_life 内容时：
+      - 传 domain="character_life" — 专门取角色侧
+      - 或传 include_character_life=true — 混合返回（关系 + 角色）
+
+    【按日期检索】（适合"我记得大概在某天发生过"但关键词记不准）：
+      - date_from / date_to：YYYY-MM-DD 或完整 ISO，二者可独立使用
+      - 例：date_from="2026-05-20" date_to="2026-05-26" 取一周窗口
+      - date_to 仅给日期时自动延展到当日 23:59:59
+      - 按 metadata.created（写入日期）过滤，不受 touch 影响
+      - 与 query / domain / valence / arousal 可叠加使用
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -319,12 +707,17 @@ async def breath(
     q_arousal = arousal if 0 <= float(arousal) <= 1 else None
     domain_text = str(domain or "").strip().lower()
     limit = int(top_k or (3 if domain_text == "feel" else 8))
+    df = str(date_from or "").strip() or None
+    dt = str(date_to or "").strip() or None
     buckets = await _ob_client.breath(
         query=query,
         limit=limit,
         domain=domain or None,
         valence=q_valence,
         arousal=q_arousal,
+        date_from=df,
+        date_to=dt,
+        include_character_life=bool(include_character_life),
     )
     if not buckets:
         return "未浮现相关 OB 记忆。"
@@ -333,14 +726,63 @@ async def breath(
 
 @mcp.tool()
 async def breath_bundle(top_k: int = 8, feel_top_k: int = 3) -> str:
-    """OB 初始化打包呼吸：一次返回 ordinary breath 与 feel breath。
+    """OB 初始化打包呼吸：固定 10 槽，三组结构。
 
-    ordinary 默认 8 条，限制 core/pinned/protected、character_life dynamic 占比；
-    feel 默认 3 条，最多 1 条 character_life feel。自然浮现不会 touch。
+    返回三个 list 字段：
+      - personal   (3)：「个人事件·当下进行」(最新 environment_event_summary)
+                     + 「个人事件·近期总结」(最新 environment_life_rollup)
+                     + 「当下感受」(最新 character_life feel)。
+                     三者覆盖当下→近期→心境，让角色看到自己最近做了什么、连成什么、感受如何。
+      - relational (5)：3 条非 character_life dynamic + 2 条非 character_life feel，自然浮现关系侧。
+      - free       (2)：不限标签/类型，按 score 自由联想，与前 8 条去重。
+
+    pinned/protected 原则卡由 get_current_state 注入，不在这里重复出现。
+    自然浮现不会 touch。参数 top_k / feel_top_k 保留为兼容签名但已不生效（固定 3+5+2=10）。
     """
     if _ob_client is None:
         return _ob_unavailable()
     result = await _ob_client.breath_bundle(top_k=top_k, feel_top_k=feel_top_k)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def breath_personal() -> str:
+    """OB 个人侧轻量刷新：返回 personal 三槽 + 今日已被重排的日程条目。
+
+    同一对话内多次需要查"我最近做了什么 / 当下心境如何 / 我的日程被怎么调整过"时调用此工具，
+    节省 token。返回结构：
+      {
+        "personal": [
+            「个人事件·当下进行」(最新 environment_event_summary，缺则回退其他 character_life dynamic),
+            「个人事件·近期总结」(最新 environment_life_rollup),
+            「当下感受」(最新 character_life feel),
+        ],
+        "today_replanned_items": [   # 仅在今日存在被 replan 调整过的条目时出现
+            {
+              "hour_start": 14, "hour_end": 16,
+              "activity": "急诊配合", "objective": "...", "thread_id": "...",
+              "current_step": 1, "expected_steps": 3,
+              "status": "pending", "source_kind": "replan",
+              "replaces": [{"activity": "内务复盘", "objective": "...", ...}]
+            },
+            ...
+        ]
+      }
+    today_replanned_items 让前台模型看到"我这个时段原本是 X，已经被改成 Y"，
+    形成主动重排意识——而不是被动发现自己的日程变了。
+    自然浮现不会 touch。会话启动仍应优先用 breath_bundle()；此工具仅用于会话中刷新。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    result = await _ob_client.breath_personal()
+    if _plan_engine is not None:
+        try:
+            replanned = await _plan_engine.get_today_replanned_items_summary()
+        except Exception:
+            logger.exception("get_today_replanned_items_summary failed; omitting from breath_personal.")
+            replanned = []
+        if replanned:
+            result["today_replanned_items"] = replanned
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -469,6 +911,9 @@ async def feel_crystals(
 async def crystallize_feel(
     mode: str,
     principle_content: str = "",
+    principle_title: str = "",
+    principle_card_json: str = "",
+    principle_injection: str = "",
     key_record_content: str = "",
     feel_content: str = "",
     key_record_type: str = "auto",
@@ -492,12 +937,18 @@ async def crystallize_feel(
         return _ob_unavailable()
     normalized_mode = str(mode or "").strip().lower()
     try:
+        principle_card = None
+        if str(principle_card_json or "").strip():
+            parsed_card = json.loads(principle_card_json)
+            if not isinstance(parsed_card, dict):
+                return "错误：principle_card_json 必须是 JSON object"
+            principle_card = parsed_card
         key_record_result = None
         extra_targets: list[str] = []
         if normalized_mode in {"thread", "both"}:
             key_record_result = await _create_feel_crystal_key_record(
                 mode=normalized_mode,
-                content=key_record_content or principle_content or feel_content,
+                content=key_record_content or principle_injection or principle_content or feel_content,
                 key_record_type=key_record_type,
                 key_record_title=key_record_title,
                 feel_ids=feel_ids or [],
@@ -510,6 +961,9 @@ async def crystallize_feel(
         ob_result = await _ob_client.crystallize_feel(
             mode=normalized_mode,
             principle_content=principle_content,
+            principle_title=principle_title,
+            principle_card=principle_card,
+            principle_injection=principle_injection,
             feel_content=feel_content,
             domain=domain or ["core"],
             feel_ids=feel_ids or [],
@@ -517,6 +971,8 @@ async def crystallize_feel(
             include_all=include_all,
             extra_targets=extra_targets,
         )
+    except json.JSONDecodeError as exc:
+        return f"错误：principle_card_json 不是有效 JSON：{exc}"
     except ValueError as exc:
         return f"错误：{exc}"
     return json.dumps(
@@ -805,21 +1261,3 @@ async def upsert_world_book(
     item_id = await db.insert_world_book(item)
     return json.dumps({"id": item_id, "created": True}, ensure_ascii=False, indent=2)
 
-
-@mcp.tool()
-async def execute_profile_evolution() -> str:
-    """直接执行人格演化：评分事件、更新L2层、归档低分事件。"""
-    if _evolution_engine is None:
-        return "错误：演化引擎未初始化"
-    preview = await _evolution_engine.preview()
-    result = await _evolution_engine.apply(preview)
-    return json.dumps(
-        {
-            "change_summary": preview.get("change_summary", ""),
-            "archived_events": result.get("archived_count", 0),
-            "updated_layers": result.get("updated_keys", []),
-            "applied_at": result.get("applied_at", ""),
-        },
-        ensure_ascii=False,
-        indent=2,
-    )

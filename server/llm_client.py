@@ -8,6 +8,7 @@ import httpx
 
 from server.config import LLMConfig
 from server.database import Database
+from server.security import get_secret_from_env, validate_api_base
 
 _TOKEN_USAGE_CTX: ContextVar[dict | None] = ContextVar("_token_usage_ctx", default=None)
 logger = logging.getLogger(__name__)
@@ -76,11 +77,16 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int | None = 2048,
         timeout_sec_override: float | None = None,
+        runtime_override: dict[str, str] | None = None,
     ) -> str:
-        runtime = await self.get_runtime_config()
+        runtime = runtime_override or await self.get_runtime_config()
         api_base = runtime["api_base"]
         api_key = runtime["api_key"]
         model = runtime["model"]
+        if not str(api_key or "").strip():
+            raise RuntimeError(
+                "LLM API key is not configured. Set KELSEY_LLM_API_KEY or the dedicated task key in the server environment."
+            )
         timeout_sec = max(
             1.0,
             float(
@@ -207,20 +213,20 @@ class LLMClient:
         return usage
 
     async def get_runtime_config(self) -> dict[str, str]:
+        env_key = get_secret_from_env("llm_api_key", "")
         if self._db is None:
             return {
                 "api_base": self.api_base,
-                "api_key": self.api_key,
+                "api_key": env_key,
                 "model": self.model,
                 "timeout_sec": str(self.timeout_sec),
             }
         base = await self._get_setting("llm_api_base", self.api_base)
-        key = await self._get_setting("llm_api_key", self.api_key)
         model = await self._get_setting("llm_model", self.model)
         timeout_sec = await self._get_setting("llm_timeout_sec", str(self.DEFAULT_TIMEOUT_SEC))
         return {
             "api_base": base.rstrip("/"),
-            "api_key": key,
+            "api_key": env_key,
             "model": model,
             "timeout_sec": timeout_sec,
         }
@@ -228,9 +234,7 @@ class LLMClient:
     async def update_runtime_config(self, payload: dict):
         if self._db is None:
             if payload.get("llm_api_base"):
-                self.api_base = str(payload["llm_api_base"]).rstrip("/")
-            if payload.get("llm_api_key"):
-                self.api_key = str(payload["llm_api_key"])
+                self.api_base = validate_api_base(payload["llm_api_base"], "llm_api_base")
             if payload.get("llm_model"):
                 self.model = str(payload["llm_model"])
             if payload.get("llm_timeout_sec") is not None:
@@ -245,9 +249,14 @@ class LLMClient:
         for key, desc in mapping.items():
             if key not in payload:
                 continue
+            value = payload.get(key)
+            if key == "llm_api_base":
+                value = validate_api_base(value, "llm_api_base")
+            if key == "llm_api_key":
+                continue
             await self._db.set_setting(
                 key=key,
-                value=str(payload.get(key) or ""),
+                value=str(value or ""),
                 category="runtime",
                 description=desc,
             )
@@ -310,7 +319,7 @@ class EnvironmentLLMClient(LLMClient):
         if await self._get_setting("env_llm_enabled", "0") != "1":
             return await super().get_runtime_config()
         base = await self._get_setting("env_llm_api_base", self.api_base)
-        key = await self._get_setting("env_llm_api_key", self.api_key)
+        key = get_secret_from_env("env_llm_api_key", get_secret_from_env("llm_api_key", ""))
         model = await self._get_setting("env_llm_model", self.model)
         timeout_sec = await self._get_setting("llm_timeout_sec", str(self.DEFAULT_TIMEOUT_SEC))
         return {
@@ -335,6 +344,10 @@ class EnvironmentLLMClient(LLMClient):
             value = payload.get(key)
             if key == "env_llm_enabled":
                 value = "1" if str(value).strip().lower() in {"1", "true", "yes", "on"} else "0"
+            elif key == "env_llm_api_base":
+                value = validate_api_base(value, "env_llm_api_base")
+            elif key == "env_llm_api_key":
+                continue
             await self._db.set_setting(
                 key=key,
                 value=str(value or ""),
@@ -344,11 +357,59 @@ class EnvironmentLLMClient(LLMClient):
 
 
 class SnapshotLLMClient(LLMClient):
+    async def get_dedicated_runtime_config(self) -> dict[str, str]:
+        env_key = get_secret_from_env("snapshot_llm_api_key", "")
+        if self._db is None:
+            return {
+                "api_base": self.api_base.rstrip("/"),
+                "api_key": env_key or get_secret_from_env("llm_api_key", ""),
+                "model": self.model,
+                "timeout_sec": str(self.timeout_sec),
+            }
+        if await self._get_setting("snapshot_llm_enabled", "0") != "1":
+            raise RuntimeError("snapshot_llm_enabled is not 1")
+        base = await self._get_setting("snapshot_llm_api_base", "")
+        model = await self._get_setting("snapshot_llm_model", "")
+        missing = [
+            name for name, value in (
+                ("snapshot_llm_api_base", base),
+                ("KELSEY_SNAPSHOT_LLM_API_KEY", env_key),
+                ("snapshot_llm_model", model),
+            )
+            if not str(value or "").strip()
+        ]
+        if missing:
+            raise RuntimeError(f"Missing snapshot LLM settings: {', '.join(missing)}")
+        timeout_sec = await self._get_setting("llm_timeout_sec", str(self.DEFAULT_TIMEOUT_SEC))
+        return {
+            "api_base": base.rstrip("/"),
+            "api_key": env_key,
+            "model": model,
+            "timeout_sec": timeout_sec,
+        }
+
+    async def chat_dedicated(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int | None = 2048,
+        timeout_sec_override: float | None = None,
+    ) -> str:
+        runtime = await self.get_dedicated_runtime_config()
+        return await super().chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec_override=timeout_sec_override,
+            runtime_override=runtime,
+        )
+
     async def get_runtime_config(self) -> dict[str, str]:
         if await self._get_setting("snapshot_llm_enabled", "0") != "1":
             return await super().get_runtime_config()
         base = await self._get_setting("snapshot_llm_api_base", self.api_base)
-        key = await self._get_setting("snapshot_llm_api_key", self.api_key)
+        key = get_secret_from_env("snapshot_llm_api_key", get_secret_from_env("llm_api_key", ""))
         model = await self._get_setting("snapshot_llm_model", self.model)
         timeout_sec = await self._get_setting("llm_timeout_sec", str(self.DEFAULT_TIMEOUT_SEC))
         return {
@@ -373,6 +434,10 @@ class SnapshotLLMClient(LLMClient):
             value = payload.get(key)
             if key == "snapshot_llm_enabled":
                 value = "1" if str(value).strip().lower() in {"1", "true", "yes", "on"} else "0"
+            elif key == "snapshot_llm_api_base":
+                value = validate_api_base(value, "snapshot_llm_api_base")
+            elif key == "snapshot_llm_api_key":
+                continue
             await self._db.set_setting(
                 key=key,
                 value=str(value or ""),

@@ -41,6 +41,7 @@ from server.prompts import (
     KEY_PROMPT_PLAN_REPLAN,
     PromptManager,
 )
+from server.security import get_secret_from_env
 from server.state_machine import StateMachine
 from server.time_display import DISPLAY_TZ, shanghai_now
 from server.web_search import WebSearchClient
@@ -584,6 +585,13 @@ def _render_plan_item_focus_v2(item: PlanItem) -> str:
 
 
 def _render_previous_plan_reference(item: PlanItem, *, schema_version: str) -> str:
+    """Render one PlanItem for the next-day's plan generator.
+
+    Format: ``- HH:00-HH:00 | objective | thread=ID step=cur/exp | progress=X | [status]``.
+    thread/step is shown when the action_payload carries them, so the next-day LLM can
+    judge whether a thread is near closure and should NOT be re-extended day after day
+    (the "跨日同题内卷" failure mode the step counter was introduced to prevent).
+    """
     payload = _parse_action_payload_dict(item.action_payload)
     objective = str(payload.get("intended_objective") or "").strip()
     progress_status = str(payload.get("progress_status") or "").strip()
@@ -591,6 +599,17 @@ def _render_previous_plan_reference(item: PlanItem, *, schema_version: str) -> s
     parts = [f"- {item.hour_start:02d}:00-{item.hour_end:02d}:00"]
     if focus:
         parts.append(focus)
+    thread_id = str(payload.get("thread_id") or "").strip()
+    if thread_id:
+        try:
+            current_step = int(payload.get("current_step") or 1)
+        except (TypeError, ValueError):
+            current_step = 1
+        try:
+            expected_steps = int(payload.get("expected_steps") or 1)
+        except (TypeError, ValueError):
+            expected_steps = 1
+        parts.append(f"thread={thread_id} step={current_step}/{expected_steps}")
     if progress_status:
         parts.append(f"progress={progress_status}")
     parts.append(f"[{item.status}]")
@@ -715,18 +734,55 @@ class PlanEngine:
         if not patch_items:
             return list(existing_items)
 
+        # 在丢弃被替换的旧条目前，先把它们的关键信息（activity / objective / thread_id）
+        # 注入到对应的新 patch_item.action_payload[replan_replaces] 里——这样下游
+        # breath_personal 拿到今日 plan 时，就能让角色看到"我原来这个时段是 X，被改成了 Y"，
+        # 形成主动重排意识，而不是被动接受新计划。
+        replaced_by_patch: dict[int, list[PlanItem]] = {id(p): [] for p in patch_items}
         survivors: list[PlanItem] = []
         for item in existing_items:
             if item.status != "pending":
                 survivors.append(item)
                 continue
-            if any(self._items_overlap(item, patch_item) for patch_item in patch_items):
+            overlapping = [p for p in patch_items if self._items_overlap(item, p)]
+            if not overlapping:
+                survivors.append(item)
                 continue
-            survivors.append(item)
+            for p in overlapping:
+                replaced_by_patch[id(p)].append(item)
+
+        for patch in patch_items:
+            replaced = replaced_by_patch.get(id(patch), [])
+            if replaced:
+                self._stamp_patch_with_replaced_info(patch, replaced)
 
         merged = survivors + patch_items
         merged.sort(key=lambda item: (item.hour_start, item.hour_end, int(item.id or 0)))
         return merged
+
+    @staticmethod
+    def _stamp_patch_with_replaced_info(patch: PlanItem, replaced: list[PlanItem]) -> None:
+        """Stamp 'replan_replaces' onto the patch_item's action_payload (mutates in place)."""
+        try:
+            payload = _parse_action_payload_dict(patch.action_payload)
+        except Exception:
+            payload = {}
+        replaces_list: list[dict[str, Any]] = []
+        for old in replaced:
+            try:
+                old_payload = _parse_action_payload_dict(old.action_payload)
+            except Exception:
+                old_payload = {}
+            replaces_list.append({
+                "activity": old.activity,
+                "objective": str(old_payload.get("intended_objective") or "")[:200],
+                "thread_id": str(old_payload.get("thread_id") or ""),
+                "hour_start": int(old.hour_start),
+                "hour_end": int(old.hour_end),
+            })
+        # 若多次 replan，保留最近一次的替换链；不堆叠历史，避免 payload 膨胀。
+        payload["replan_replaces"] = replaces_list
+        patch.action_payload = json.dumps(payload, ensure_ascii=False)
 
     async def _create_replanned_version(
         self,
@@ -755,25 +811,41 @@ class PlanEngine:
         )
         next_plan_id = await self.db.insert_daily_plan(next_plan)
 
-        for item in merged_items:
-            cloned = PlanItem(
-                plan_id=next_plan_id,
-                hour_start=item.hour_start,
-                hour_end=item.hour_end,
-                activity=item.activity,
-                action_type=item.action_type,
-                action_payload=item.action_payload,
-                status=item.status,
-                outcome=item.outcome,
-                outcome_event_id=item.outcome_event_id,
-                source_kind=item.source_kind,
-                source_ref_id=item.source_ref_id,
-                created_at=item.created_at,
-                executed_at=item.executed_at,
+        # 事务化语义：items 全部成功落库才把旧 plan 标 replanned；任何一步失败
+        # 立即把新 plan status 标 "failed"，避免 get_current_plan 之后抓到空壳新 plan
+        # 导致 schedule_bundle 返回空日程。
+        try:
+            for item in merged_items:
+                cloned = PlanItem(
+                    plan_id=next_plan_id,
+                    hour_start=item.hour_start,
+                    hour_end=item.hour_end,
+                    activity=item.activity,
+                    action_type=item.action_type,
+                    action_payload=item.action_payload,
+                    status=item.status,
+                    outcome=item.outcome,
+                    outcome_event_id=item.outcome_event_id,
+                    source_kind=item.source_kind,
+                    source_ref_id=item.source_ref_id,
+                    created_at=item.created_at,
+                    executed_at=item.executed_at,
+                )
+                await self.db.insert_plan_item(cloned)
+            await self.db.update_daily_plan(int(current_plan.id), status="replanned")
+        except Exception:
+            logger.exception(
+                "Replan item-insertion failed mid-way for new plan %s; marking it failed and keeping old plan %s active.",
+                next_plan_id,
+                int(current_plan.id),
             )
-            await self.db.insert_plan_item(cloned)
+            try:
+                await self.db.update_daily_plan(next_plan_id, status="failed")
+            except Exception:
+                logger.exception("Failed to mark broken replan plan %s as failed.", next_plan_id)
+            # 重要：把异常抛回，让 maybe_replan 调用方知道 replan 整体失败
+            raise
 
-        await self.db.update_daily_plan(int(current_plan.id), status="replanned")
         created = await self.db.get_daily_plan_by_id(next_plan_id)
         assert created is not None
         return created
@@ -837,6 +909,107 @@ class PlanEngine:
                 f"- {objective or '当前事项'} | {current_step}/{expected_steps} | {status} | {emotional_hint}"
             )
         return "\n".join(lines[:4]) if lines else "（今日事项推进总体平稳，暂无强烈滞涩线）"
+
+    async def _build_current_progress_pins_text(self) -> str:
+        """Pull 当前生活推进态 from OB for the daily-plan generator.
+
+        Reuses state_machine._collect_environment_history_pins (which already returns
+        character_life_latest_event + latest N environment_life_rollup buckets). Output
+        format is one labelled block per bucket so the plan LLM can tell "当下进行" from
+        "近期事件链" without parsing source_kind itself.
+        """
+        sm = getattr(self, "state_machine", None)
+        if sm is None or getattr(sm, "ob_client", None) is None:
+            return "(暂无可用推进态)"
+        try:
+            pins = await sm._collect_environment_history_pins(max_rollups=2)
+        except Exception:
+            logger.exception("Failed to collect environment history pins for daily plan.")
+            return "(暂无可用推进态)"
+        if not pins:
+            return "(暂无可用推进态)"
+        label_map = {
+            "environment_event_summary": "当下进行",
+            "environment_life_rollup": "近期事件链",
+        }
+        blocks: list[str] = []
+        for bucket in pins:
+            meta = getattr(bucket, "metadata", {}) or {}
+            kind = str(meta.get("source_kind") or "").strip().lower()
+            label = label_map.get(kind, "历史背景")
+            title = str(meta.get("name") or getattr(bucket, "id", "") or "").strip()
+            content = re.sub(r"\s+", " ", str(getattr(bucket, "content", "") or "").strip())[:320]
+            header = f"[{label}] {title}" if title else f"[{label}]"
+            blocks.append(f"{header}\n{content}")
+        return "\n\n".join(blocks)
+
+    async def get_today_replanned_items_summary(self) -> list[dict[str, Any]]:
+        """Return today's plan items that carry replan tags, for breath_personal injection.
+
+        每条返回包含：时间段、当前 activity / objective / thread / step / status，以及
+        `replaces` 字段（被替换的旧条目摘要）——让前台角色看到"我这个时段原本是 X，
+        现在被改成了 Y"，形成主动重排意识，而不是被动发现新计划。
+
+        判定条件：item.source_kind == "replan" 或 action_payload.replan_replaces 非空。
+        """
+        try:
+            today = shanghai_now().date().isoformat()
+        except Exception:
+            today = datetime.utcnow().date().isoformat()
+        plan = await self.db.get_latest_daily_plan_for_date(today, status=None)
+        if plan is None or plan.id is None:
+            return []
+        try:
+            items = await self.db.list_plan_items(int(plan.id))
+        except Exception:
+            logger.exception("Failed to list plan items for replanned summary.")
+            return []
+        out: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                payload = _parse_action_payload_dict(item.action_payload)
+            except Exception:
+                payload = {}
+            replaces = payload.get("replan_replaces") if isinstance(payload.get("replan_replaces"), list) else []
+            is_replan = item.source_kind == "replan" or bool(replaces)
+            if not is_replan:
+                continue
+            thread_id = str(payload.get("thread_id") or "").strip()
+            try:
+                current_step = int(payload.get("current_step") or 1)
+            except (TypeError, ValueError):
+                current_step = 1
+            try:
+                expected_steps = int(payload.get("expected_steps") or 1)
+            except (TypeError, ValueError):
+                expected_steps = 1
+            out.append({
+                "hour_start": int(item.hour_start),
+                "hour_end": int(item.hour_end),
+                "activity": item.activity,
+                "objective": str(payload.get("intended_objective") or "")[:200],
+                "thread_id": thread_id,
+                "current_step": current_step,
+                "expected_steps": expected_steps,
+                "status": item.status,
+                "source_kind": item.source_kind,
+                "replaces": replaces,
+            })
+        out.sort(key=lambda row: (row["hour_start"], row["hour_end"]))
+        return out
+
+    async def _build_open_loop_pool_text(
+        self,
+        *,
+        max_hours: float = 48.0,
+        max_items: int = 8,
+    ) -> str:
+        """Thin wrapper — defers to ``StateMachine._collect_open_loop_pool_text`` so
+        plan_engine and env generation share the same aggregation rules."""
+        sm = getattr(self, "state_machine", None)
+        if sm is None:
+            return "(近 48h 无未完成线索)"
+        return await sm._collect_open_loop_pool_text(max_hours=max_hours, max_items=max_items)
 
     @staticmethod
     def _format_character_key_records_for_plan(records: list[KeyRecord]) -> str:
@@ -937,7 +1110,7 @@ class PlanEngine:
         web_ok = await self._bool_setting(KEY_PLAN_WEB_SEARCH_ENABLED)
         npc_ok = await self._bool_setting(KEY_PLAN_NPC_INTERACTION_ENABLED)
         web_base = (await self.prompt_manager.get_config_value(KEY_PLAN_WEB_SEARCH_API_BASE)).strip()
-        web_key = (await self.prompt_manager.get_config_value(KEY_PLAN_WEB_SEARCH_API_KEY)).strip()
+        web_key = get_secret_from_env(KEY_PLAN_WEB_SEARCH_API_KEY, "")
 
         latest_snapshot = "（状态快照只服务前端当下状态展示，不作为后台计划生成注入。）"
         recent_events = await self.state_machine._ob_feel_context_text(character_life_limit=1, other_limit=2)
@@ -1145,7 +1318,11 @@ class PlanEngine:
         char_bg = await self.prompt_manager.get_layer_content(KEY_L1_CHARACTER_BACKGROUND)
         personality = await self.prompt_manager.get_layer_content(KEY_L2_CHARACTER_PERSONALITY)
         life = await self.prompt_manager.get_layer_content(KEY_L2_LIFE_STATUS)
-        latest_snapshot = "（状态快照只服务前端当下状态展示，不作为后台计划生成注入。）"
+        # 注：character_key_records (life_scope=character_life) 经验证基本为空——
+        # 角色侧的连续主线已经全部由 OB 系统承担（character_life_latest_event 当下槽 +
+        # environment_life_rollup 事件链 + fragment.open_loop 线索池）。
+        # 因此本处不再读 key_records，节省一次 DB 查询与一段噪音注入。
+        # latest_snapshot 提示段也一并移除（plan 已经从 OB 拿到更精准的推进态）。
         character_life_context = ""
         try:
             character_life_context = await self.state_machine._ob_feel_context_text(
@@ -1154,12 +1331,8 @@ class PlanEngine:
             )
         except Exception:
             logger.exception("Failed to load OB feel context for daily plan.")
-        character_key_records = await self.db.get_recent_key_records(
-            limit=5,
-            include_archived=False,
-            life_scope="character_life",
-        )
-        character_key_record_context = self._format_character_key_records_for_plan(character_key_records)
+        current_progress_pins = await self._build_current_progress_pins_text()
+        open_loop_pool = await self._build_open_loop_pool_text()
         npcs = await self.npc_engine.list_active_npcs()
         npc_list = json.dumps([n.model_dump() for n in npcs], ensure_ascii=False)
 
@@ -1196,21 +1369,33 @@ class PlanEngine:
             template,
             flags=re.DOTALL,
         )
-        if "{character_life_context}" not in template:
+        # 移除旧的【状态快照】和【角色侧连续主线 key_records】兼容段（如果还在 DB 模板里）。
+        template = re.sub(
+            r"\n?【状态快照】\s*\n[^\n【]*\n",
+            "\n",
+            template,
+        )
+        template = re.sub(
+            r"\n?【角色侧连续主线 key_records】\s*\n\{character_key_records\}\s*\n",
+            "\n",
+            template,
+        )
+        # 若模板仍是旧版（缺新字段），补一段 fallback——确保新字段一定被渲染。
+        if "{current_progress_pins}" not in template:
             template += (
-                "\n\n【近期 feel】\n{character_life_context}\n"
-                "\n【角色侧连续主线 key_records】\n{character_key_records}\n"
-                "\n要求：承接角色侧 key_record 主线时必须写 source_kind=\"thread\" 和 source_ref_id，"
-                "并延续既有推进步数，不得同题重开 step 1。"
+                "\n\n【当前生活推进态】\n{current_progress_pins}\n"
+                "\n【未完成线索池】\n{open_loop_pool}\n"
             )
+        if "{character_life_context}" not in template:
+            template += "\n\n【近期 feel（心境参考，不影响骨架）】\n{character_life_context}\n"
         prompt = _safe_prompt_format(
             template,
             character_background=char_bg,
             character_personality=personality,
             life_status=life,
-            latest_snapshot=latest_snapshot,
-            character_life_context=character_life_context or "(none)",
-            character_key_records=character_key_record_context,
+            character_life_context=character_life_context or "(无可用 feel)",
+            current_progress_pins=current_progress_pins or "(暂无可用推进态)",
+            open_loop_pool=open_loop_pool or "(近 48h 无未完成线索)",
             recent_events=character_life_context or "(none)",
             npc_list=npc_list,
             previous_plan_summary=previous_plan_summary,
