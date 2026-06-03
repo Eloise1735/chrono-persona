@@ -621,12 +621,13 @@ class Database:
 
     async def insert_snapshot(self, snap: StateSnapshot) -> int:
         wall = format_utc_instant_z(datetime.utcnow())
+        created_at = normalize_user_instant_to_utc_z(snap.created_at or wall)
         cursor = await self.conn.execute(
             """INSERT INTO state_snapshots
                (created_at, inserted_at, type, content, environment, referenced_events, embedding_vector_id)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
-                snap.created_at,
+                created_at,
                 wall,
                 snap.type,
                 snap.content,
@@ -1223,9 +1224,9 @@ class Database:
     async def search_snapshots_by_keyword(self, keyword: str, limit: int = 10) -> list[StateSnapshot]:
         pattern = f"%{keyword}%"
         async with self.conn.execute(
-            """SELECT * FROM state_snapshots
+            f"""SELECT * FROM state_snapshots
                WHERE content LIKE ? AND embedding_vector_id IS NOT NULL
-               ORDER BY created_at DESC, id DESC LIMIT ?""",
+               ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?""",
             (pattern, limit),
         ) as cur:
             rows = await cur.fetchall()
@@ -1248,7 +1249,7 @@ class Database:
         async with self.conn.execute(
             f"""SELECT * FROM state_snapshots
                 WHERE ({where}) AND embedding_vector_id IS NOT NULL
-                ORDER BY created_at DESC, id DESC LIMIT ?""",
+                ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?""",
             params,
         ) as cur:
             rows = await cur.fetchall()
