@@ -2291,6 +2291,24 @@ class StateMachine:
             return await awaitable
         return await tracer.run(stage_name, awaitable, **meta)
 
+    @staticmethod
+    def _compute_prompt_hash(*parts: str) -> str:
+        """Stable sha256 across LLM prompt parts. Used by the B2 in-flight
+        idempotency barrier to detect "we have already attempted this exact
+        prompt" before another LLM call is made. See
+        docs/fix_plan_snapshot_loop.md B2."""
+        h = hashlib.sha256()
+        for part in parts:
+            h.update((part or "").encode("utf-8", errors="replace"))
+            h.update(b"\x00")
+        return h.hexdigest()
+
+    # B2: identifiers raised when the idempotency barrier refuses an LLM
+    # call. Surfaced so callers (api_routes) can decide whether to treat it
+    # as a user-visible error or a benign "already done" no-op.
+    _IDEMPOTENCY_REASON_IN_FLIGHT = "snapshot_in_flight_duplicate"
+    _IDEMPOTENCY_REASON_DEAD_LETTER = "snapshot_dead_letter"
+
     async def get_current_state(
         self,
         current_time: str,
@@ -2686,33 +2704,119 @@ class StateMachine:
                     memory_context=memory_text,
                 )
 
-                new_content = await self._trace_await(
+                # B2 idempotency barrier: a placeholder row is committed BEFORE
+                # the LLM call so that any failure during finalize/side-effects
+                # cannot cause the same prompt to be re-sent on the next tick.
+                # See docs/fix_plan_snapshot_loop.md B2.
+                reflect_prompt_hash = self._compute_prompt_hash(
+                    "reflect_on_conversation",
+                    system_prompt,
+                    reflect_prompt,
+                )
+                await self._trace_await(
                     tracer,
-                    "snapshot_llm.reflect_snapshot",
-                    self.snapshot_llm.chat(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": reflect_prompt},
-                        ],
-                        max_tokens=None,
+                    "db.reset_stale_in_flight_snapshots",
+                    self.db.reset_stale_in_flight_snapshots(older_than_seconds=600),
+                )
+                existing_done = await self._trace_await(
+                    tracer,
+                    "db.find_done_snapshot_by_prompt_hash",
+                    self.db.find_done_snapshot_by_prompt_hash(reflect_prompt_hash),
+                )
+                if existing_done is not None:
+                    logger.warning(
+                        "reflect_on_conversation: identical prompt already produced "
+                        "snapshot_id=%s; reusing cached content and skipping LLM call.",
+                        existing_done.id,
+                    )
+                    new_content = existing_done.content
+                    tracer.finish_ok(
+                        llm_requests=0,
+                        output_snapshot_chars=len(new_content or ""),
+                        reflect_event_mode="idempotent_cache_hit",
+                        idempotency_snapshot_id=int(existing_done.id or 0),
+                    )
+                    return new_content
+                in_flight = await self._trace_await(
+                    tracer,
+                    "db.find_in_flight_snapshot_by_prompt_hash",
+                    self.db.find_in_flight_snapshot_by_prompt_hash(reflect_prompt_hash),
+                )
+                if in_flight is not None:
+                    raise RuntimeError(
+                        f"{self._IDEMPOTENCY_REASON_IN_FLIGHT}: identical reflect prompt "
+                        f"already in flight (snapshot_id={in_flight.id}); refusing duplicate LLM call."
+                    )
+                failed_count = await self._trace_await(
+                    tracer,
+                    "db.count_failed_snapshot_attempts",
+                    self.db.count_failed_snapshot_attempts(reflect_prompt_hash),
+                )
+                if failed_count >= 3:
+                    raise RuntimeError(
+                        f"{self._IDEMPOTENCY_REASON_DEAD_LETTER}: reflect prompt has "
+                        f"{failed_count} prior failures; manual intervention required."
+                    )
+                snap_created_at = format_utc_instant_z(datetime.utcnow())
+                placeholder_id = await self._trace_await(
+                    tracer,
+                    "db.insert_conversation_end_placeholder",
+                    self.db.insert_snapshot_placeholder(
+                        prompt_hash=reflect_prompt_hash,
+                        snap_type="conversation_end",
+                        created_at=snap_created_at,
+                        attempt_count=failed_count + 1,
                     ),
-                    prompt_chars=len(reflect_prompt or ""),
-                    memory_chars=len(memory_text or ""),
                 )
 
-                snap = StateSnapshot(
-                    created_at=format_utc_instant_z(datetime.utcnow()),
-                    type="conversation_end",
-                    content=new_content,
-                    environment="{}",
-                    referenced_events="[]",
-                )
-                snap_id = await self._trace_await(
-                    tracer,
-                    "db.insert_conversation_end_snapshot",
-                    self.db.insert_snapshot(snap),
-                    snapshot_chars=len(new_content or ""),
-                )
+                try:
+                    new_content = await self._trace_await(
+                        tracer,
+                        "snapshot_llm.reflect_snapshot",
+                        self.snapshot_llm.chat(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": reflect_prompt},
+                            ],
+                            max_tokens=None,
+                        ),
+                        prompt_chars=len(reflect_prompt or ""),
+                        memory_chars=len(memory_text or ""),
+                    )
+
+                    snap = StateSnapshot(
+                        id=placeholder_id,
+                        created_at=snap_created_at,
+                        type="conversation_end",
+                        content=new_content,
+                        environment="{}",
+                        referenced_events="[]",
+                    )
+                    await self._trace_await(
+                        tracer,
+                        "db.finalize_conversation_end_snapshot",
+                        self.db.finalize_snapshot(
+                            placeholder_id,
+                            content=new_content,
+                            environment="{}",
+                            referenced_events="[]",
+                            created_at=snap_created_at,
+                        ),
+                        snapshot_chars=len(new_content or ""),
+                    )
+                    snap_id = placeholder_id
+                except Exception:
+                    # Mark the placeholder as failed so the next attempt with the
+                    # same prompt can either retry (attempt_count < 3) or get
+                    # dead-lettered. This keeps the LLM-spend counter honest.
+                    try:
+                        await self.db.mark_snapshot_failed(placeholder_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to mark snapshot placeholder %s as failed.",
+                            placeholder_id,
+                        )
+                    raise
                 await self._trace_await(
                     tracer,
                     "ob_hold_conversation_snapshot_feel",
@@ -6043,6 +6147,24 @@ class StateMachine:
         )
         generated_snapshots: list[dict] = []
         prev_time = baseline_time
+        # B2 idempotency: recover any in_flight placeholders left behind by a
+        # crashed earlier tick (started_at older than 10min). They will be
+        # flipped to 'failed' so attempt_count gating can apply on retry.
+        try:
+            stale_reset_ids = await self._trace_await(
+                diagnostic,
+                f"{trigger}.reset_stale_in_flight_snapshots",
+                self.db.reset_stale_in_flight_snapshots(older_than_seconds=600),
+            )
+            if stale_reset_ids:
+                logger.warning(
+                    "snapshot scheduler tick (%s): recovered %d stale in_flight placeholder(s): %s",
+                    trigger,
+                    len(stale_reset_ids),
+                    stale_reset_ids,
+                )
+        except Exception:
+            logger.exception("reset_stale_in_flight_snapshots failed; continuing.")
         if diagnostic is not None:
             with diagnostic.stage(
                 f"{trigger}.load_snapshot_prompts_and_layers",
@@ -6293,21 +6415,12 @@ class StateMachine:
                 prompt_text=prompt,
             )
 
-            current_content = await self._trace_await(
-                diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.snapshot_llm",
-                self.snapshot_llm.chat(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=None,
-                ),
-                checkpoint_time_cst=checkpoint_cst,
-                prompt_chars=len(prompt or ""),
-                memory_chars=len(memory_text or ""),
-            )
-
+            # B2 idempotency barrier: every per-checkpoint LLM call is gated on
+            # a placeholder row committed BEFORE the LLM is invoked. If a
+            # downstream step fails the placeholder is marked 'failed', so the
+            # NEXT tick can either retry (attempt_count gating) or dead-letter
+            # — never silently re-burn tokens on the same prompt.
+            # See docs/fix_plan_snapshot_loop.md B2.
             is_final_executed_checkpoint = (
                 i == len(due_checkpoints) - 1
                 and len(due_checkpoints) == len(planned_checkpoints)
@@ -6317,24 +6430,136 @@ class StateMachine:
                 and is_final_executed_checkpoint
                 and abs((checkpoint_time - target_time).total_seconds()) <= 1e-6
             )
-            snap = StateSnapshot(
-                created_at=format_utc_instant_z(shanghai_time_to_utc_naive(checkpoint_time)),
-                type="accumulated" if is_tail_checkpoint else "daily",
-                content=current_content,
-                environment=json.dumps(env, ensure_ascii=False),
-                referenced_events=json.dumps(
-                    [e.id for e in checkpoint_events if e.id is not None],
-                    ensure_ascii=False,
-                ),
+            checkpoint_snap_type = "accumulated" if is_tail_checkpoint else "daily"
+            checkpoint_snap_created_at = format_utc_instant_z(
+                shanghai_time_to_utc_naive(checkpoint_time)
             )
-            snap_id = await self._trace_await(
+            checkpoint_prompt_hash = self._compute_prompt_hash(
+                f"snapshot_scheduler:{trigger}",
+                checkpoint_cst,
+                checkpoint_snap_type,
+                system_prompt,
+                prompt,
+            )
+            existing_done = await self._trace_await(
                 diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.db.insert_snapshot",
-                self.db.insert_snapshot(snap),
+                f"{trigger}.checkpoint_{checkpoint_index}.find_done_snapshot_by_prompt_hash",
+                self.db.find_done_snapshot_by_prompt_hash(checkpoint_prompt_hash),
                 checkpoint_time_cst=checkpoint_cst,
-                snapshot_type=snap.type,
-                snapshot_chars=len(current_content or ""),
             )
+            if existing_done is not None:
+                logger.warning(
+                    "snapshot scheduler (%s checkpoint=%s): identical prompt already "
+                    "produced snapshot_id=%s; aborting advance loop and letting next "
+                    "tick re-plan from the new baseline.",
+                    trigger, checkpoint_cst, existing_done.id,
+                )
+                schedule_meta["idempotency_break"] = {
+                    "reason": "cache_hit",
+                    "checkpoint_cst": checkpoint_cst,
+                    "existing_snapshot_id": int(existing_done.id or 0),
+                }
+                break
+            in_flight = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.find_in_flight_snapshot_by_prompt_hash",
+                self.db.find_in_flight_snapshot_by_prompt_hash(checkpoint_prompt_hash),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            if in_flight is not None:
+                logger.warning(
+                    "snapshot scheduler (%s checkpoint=%s): identical prompt already "
+                    "in flight (snapshot_id=%s); aborting tick to avoid duplicate LLM call.",
+                    trigger, checkpoint_cst, in_flight.id,
+                )
+                schedule_meta["idempotency_break"] = {
+                    "reason": "in_flight_duplicate",
+                    "checkpoint_cst": checkpoint_cst,
+                    "in_flight_snapshot_id": int(in_flight.id or 0),
+                }
+                break
+            failed_count = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.count_failed_snapshot_attempts",
+                self.db.count_failed_snapshot_attempts(checkpoint_prompt_hash),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            if failed_count >= 3:
+                logger.warning(
+                    "snapshot scheduler (%s checkpoint=%s): dead-letter, %d prior "
+                    "failures for identical prompt; refusing further LLM calls until "
+                    "manual intervention.",
+                    trigger, checkpoint_cst, failed_count,
+                )
+                schedule_meta["idempotency_break"] = {
+                    "reason": "dead_letter",
+                    "checkpoint_cst": checkpoint_cst,
+                    "failed_attempts": failed_count,
+                }
+                break
+            placeholder_id = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.db.insert_snapshot_placeholder",
+                self.db.insert_snapshot_placeholder(
+                    prompt_hash=checkpoint_prompt_hash,
+                    snap_type=checkpoint_snap_type,
+                    created_at=checkpoint_snap_created_at,
+                    attempt_count=failed_count + 1,
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+
+            try:
+                current_content = await self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.snapshot_llm",
+                    self.snapshot_llm.chat(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=None,
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
+                    prompt_chars=len(prompt or ""),
+                    memory_chars=len(memory_text or ""),
+                )
+
+                snap = StateSnapshot(
+                    id=placeholder_id,
+                    created_at=checkpoint_snap_created_at,
+                    type=checkpoint_snap_type,
+                    content=current_content,
+                    environment=json.dumps(env, ensure_ascii=False),
+                    referenced_events=json.dumps(
+                        [e.id for e in checkpoint_events if e.id is not None],
+                        ensure_ascii=False,
+                    ),
+                )
+                await self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.db.finalize_snapshot",
+                    self.db.finalize_snapshot(
+                        placeholder_id,
+                        content=current_content,
+                        environment=snap.environment,
+                        referenced_events=snap.referenced_events,
+                        created_at=checkpoint_snap_created_at,
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
+                    snapshot_type=snap.type,
+                    snapshot_chars=len(current_content or ""),
+                )
+                snap_id = placeholder_id
+            except Exception:
+                try:
+                    await self.db.mark_snapshot_failed(placeholder_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to mark snapshot placeholder %s as failed.",
+                        placeholder_id,
+                    )
+                raise
             ob_life_bucket_id = await self._trace_await(
                 diagnostic,
                 f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_snapshot_feel",
