@@ -140,6 +140,11 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     border-left-color: var(--accent);
     background: var(--surface2);
   }
+  /* The fixed bottom status-bar (.status-bar) would otherwise sit on
+     top of the bottom ~30px of the sidebar (z-index 50 > nav's 40),
+     hiding the last nav entry behind a strip of darker surface even
+     after scrolling to max. In sidebar mode, offset it past the nav. */
+  .status-bar { left: 220px; }
 }
 
 @media (max-width: 760px) {
