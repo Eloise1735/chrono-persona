@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS state_snapshots (
     status TEXT NOT NULL DEFAULT 'done',
     prompt_hash TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
-    started_at TEXT
+    started_at TEXT,
+    side_effects_status TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS event_anchors (
@@ -343,6 +344,11 @@ class Database:
         await self._ensure_column("state_snapshots", "prompt_hash", "TEXT")
         await self._ensure_column("state_snapshots", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
         await self._ensure_column("state_snapshots", "started_at", "TEXT")
+        # B3: per-snapshot record of which post-finalize side effects ran. JSON of
+        # {name: "ok" | "failed:<ExcType>:<msg>"}; '{}' for pre-B3 rows.
+        await self._ensure_column(
+            "state_snapshots", "side_effects_status", "TEXT NOT NULL DEFAULT '{}'"
+        )
         await self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_state_snapshots_status ON state_snapshots(status)"
         )
@@ -725,6 +731,22 @@ class Database:
                     row_id,
                 ),
             )
+        await self.conn.commit()
+
+    async def update_snapshot_side_effects_status(
+        self, row_id: int, status_map: dict
+    ) -> None:
+        """Persist the per-effect outcome dict produced by
+        StateMachine._run_side_effect. Best-effort: any DB error here is
+        logged by the caller but never propagated — side-effect bookkeeping
+        must not itself fail the tick. See docs/fix_plan_snapshot_loop.md B3."""
+        import json as _json
+
+        payload = _json.dumps(status_map or {}, ensure_ascii=False)
+        await self.conn.execute(
+            "UPDATE state_snapshots SET side_effects_status=? WHERE id=?",
+            (payload, row_id),
+        )
         await self.conn.commit()
 
     async def mark_snapshot_failed(self, row_id: int) -> None:

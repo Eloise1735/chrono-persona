@@ -34,7 +34,8 @@ def _make_db_with_schema(conn):
             status TEXT NOT NULL DEFAULT 'done',
             prompt_hash TEXT,
             attempt_count INTEGER NOT NULL DEFAULT 0,
-            started_at TEXT
+            started_at TEXT,
+            side_effects_status TEXT NOT NULL DEFAULT '{}'
         )"""
     )
 

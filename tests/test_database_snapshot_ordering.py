@@ -35,7 +35,8 @@ def test_snapshot_ordering_uses_actual_instant_for_mixed_timezone_strings():
                     status TEXT NOT NULL DEFAULT 'done',
                     prompt_hash TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
-                    started_at TEXT
+                    started_at TEXT,
+                    side_effects_status TEXT NOT NULL DEFAULT '{}'
                 )"""
             )
             older = await conn.execute(
@@ -88,7 +89,8 @@ def test_insert_snapshot_normalizes_created_at_to_utc_z():
                     status TEXT NOT NULL DEFAULT 'done',
                     prompt_hash TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
-                    started_at TEXT
+                    started_at TEXT,
+                    side_effects_status TEXT NOT NULL DEFAULT '{}'
                 )"""
             )
             snap_id = await db.insert_snapshot(
@@ -126,7 +128,8 @@ def test_snapshot_keyword_search_uses_actual_instant_order_for_mixed_timezones()
                     status TEXT NOT NULL DEFAULT 'done',
                     prompt_hash TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
-                    started_at TEXT
+                    started_at TEXT,
+                    side_effects_status TEXT NOT NULL DEFAULT '{}'
                 )"""
             )
             older = await conn.execute(

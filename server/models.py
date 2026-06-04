@@ -56,6 +56,8 @@ class StateSnapshot(BaseModel):
     prompt_hash: str | None = None
     attempt_count: int = 0
     started_at: str | None = None
+    # B3 side-effect isolation: JSON of {effect_name: "ok"|"failed:<ExcType>:<msg>"}
+    side_effects_status: str = "{}"
 
     @computed_field
     @property
