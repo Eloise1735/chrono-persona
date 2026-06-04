@@ -88,7 +88,11 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     bottom: 0;
     width: 220px;
     height: 100vh;
-    padding: 14px 10px;
+    /* Top padding only — bottom space is supplied by nav::after below.
+       Chrome / Safari drop padding-bottom from scrollable flex columns,
+       so a literal `padding: 14px 10px` clips the last <a> when the
+       sidebar overflows. */
+    padding: 14px 10px 0;
     border-bottom: 0;
     border-right: 1px solid var(--border);
     flex-direction: column;
@@ -98,7 +102,27 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     gap: 2px;
     overflow-y: auto;
     overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
   }
+  /* Bottom spacer that participates in the flex layout. Sized large
+     enough (72px) that scrolling to max pushes the last <a> well above
+     the fixed bottom .status-bar (~30px tall, z-index 50 vs nav's 40)
+     — i.e. the top entries scroll out of view to reveal the bottom
+     ones, instead of the bottom entries being permanently hidden
+     behind the status-bar strip. */
+  nav::after {
+    content: "";
+    display: block;
+    flex: 0 0 72px;
+  }
+  nav::-webkit-scrollbar { width: 8px; }
+  nav::-webkit-scrollbar-track { background: transparent; }
+  nav::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+  }
+  nav::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
   nav .logo {
     padding: 8px 10px 14px;
     margin: 0 0 8px;
@@ -120,6 +144,11 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     border-left-color: var(--accent);
     background: var(--surface2);
   }
+  /* The fixed bottom status-bar (.status-bar) would otherwise sit on
+     top of the bottom ~30px of the sidebar (z-index 50 > nav's 40),
+     hiding the last nav entry behind a strip of darker surface even
+     after scrolling to max. In sidebar mode, offset it past the nav. */
+  .status-bar { left: 220px; }
 }
 
 @media (max-width: 760px) {
