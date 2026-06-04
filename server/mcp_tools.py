@@ -866,18 +866,27 @@ async def hold_feel(
 
 
 @mcp.tool()
-async def dream(limit: int = 10) -> str:
+async def dream(limit: int = 10, scope: str = "relational") -> str:
     """OB dream: read recent undigested dynamic buckets for end/maintenance reflection.
+
+    【scope 三态，默认 relational】
+    - scope="relational" (默认)：只看关系侧 dynamic（排除 character_life buckets）。
+      角色侧生活流（environment_event_summary / rollup / fragment 等都是 character_life
+      domain）会霸占视野，干扰对关系侧的消化与梳理，所以默认隔离。
+    - scope="character"：只看角色侧 dynamic（仅 character_life buckets）。
+      角色侧已有专属的总结/聚合机制，此参数留给需要单独整理角色侧时使用。
+    - scope="all"：旧行为，全部 dynamic 一起浮现。
 
     Dream never writes and does not read feel. After reading it, explicitly choose:
     - hold_feel(content=..., source_bucket=...): sediment a dynamic event into feel.
     - resolve_bucket(bucket_id, reason=...): after the dynamic source event has been
       understood, sedimented, or rewritten, let it stop occupying active dynamic slots.
-    - feel_crystals()/crystallize_feel(...): handle repeated/similar feel clusters.
+    - feel_crystals()/crystallize_feel(...): handle repeated/similar feel clusters
+      (同样默认 scope="relational"，与 dream 对称)。
     """
     if _ob_client is None:
         return _ob_unavailable()
-    result = await _ob_client.dream(limit=limit)
+    result = await _ob_client.dream(limit=limit, scope=scope)
     return str(result.get("text") or "")
 
 
@@ -888,12 +897,21 @@ async def feel_crystals(
     min_cluster_size: int = 3,
     min_similarity: float = 0.7,
     cursor: str = "",
+    scope: str = "relational",
 ) -> str:
     """Find similar feel clusters for crystallization.
+
+    【scope 三态，默认 relational】
+    - scope="relational" (默认)：只在关系侧 feel 内聚类（排除 character_life）。
+      避免角色侧生活流自动产生的 feel 与关系侧混杂、难以 resolve / 梳理。
+    - scope="character"：只在角色侧 feel 内聚类（仅 character_life）。
+      用于专门整理角色侧自身的感受沉淀。
+    - scope="all"：旧行为，全部 feel 一起聚类。
 
     limit is the number of clusters, not the number of feel items. If a cluster is
     larger than max_items_per_cluster, use next_cursor / cluster_id + include_all
     with crystallize_feel(...) so the full cluster is handled without losing hidden items.
+    crystallize_feel 必须传相同的 scope，才能在同一 scope 池里复原 cluster_id。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -903,6 +921,7 @@ async def feel_crystals(
         min_cluster_size=min_cluster_size,
         min_similarity=min_similarity,
         cursor=cursor,
+        scope=scope,
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -923,6 +942,7 @@ async def crystallize_feel(
     cluster_id: str = "",
     include_all: bool = False,
     cursor_snapshot: str = "",
+    scope: str = "relational",
 ) -> str:
     """Crystallize repeated feel into one of four destinations.
 
@@ -932,6 +952,13 @@ async def crystallize_feel(
     mode="feel" condenses many feel entries into one ordinary feel.
     This is distinct from hold_feel: hold_feel records immediate sediment, while
     crystallize_feel turns repeated sediments into stable growth.
+
+    【scope 三态，默认 relational，仅影响 cluster_id+include_all 路径】
+    - scope="relational" (默认)：在关系侧 feel 池里复原 cluster_id。
+    - scope="character"：在角色侧 feel 池里复原 cluster_id。
+    - scope="all"：在全量 feel 池里复原。
+    必须与上游 feel_crystals(...) 调用的 scope 保持一致，否则 cluster_id 找不到。
+    显式传 feel_ids 不受 scope 影响（信任调用者的 ID 列表）。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -970,6 +997,7 @@ async def crystallize_feel(
             cluster_id=cluster_id,
             include_all=include_all,
             extra_targets=extra_targets,
+            scope=scope,
         )
     except json.JSONDecodeError as exc:
         return f"错误：principle_card_json 不是有效 JSON：{exc}"
