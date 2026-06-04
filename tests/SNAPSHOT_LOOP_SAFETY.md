@@ -1,0 +1,177 @@
+# Snapshot loop safety — invariants registry
+
+This file is the map of which test pins down which safety invariant from
+[`docs/fix_plan_snapshot_loop.md`](../docs/fix_plan_snapshot_loop.md). If
+any of these tests fail or get deleted, the original 21-hour token-burn
+incident becomes possible again. Find the matching subsystem and fix the
+underlying invariant before relaxing an assertion.
+
+The full incident replay lives in
+[`test_snapshot_loop_safety_incident_replay.py`](test_snapshot_loop_safety_incident_replay.py)
+and exercises every layer end-to-end in a single test
+(`test_incident_replay_all_defenses_hold`). It's the smoke test to run
+when in doubt.
+
+## Layered defenses and their tests
+
+### B1 — snapshot ordering by real UTC instant
+
+**Invariant.** `state_snapshots.created_at` rows in either `...Z` or
+`...+08:00` format must sort by their actual UTC instant, not by their
+string representation. Without this the scheduler reads the wrong
+baseline and re-builds the same prompt forever.
+
+- [`test_database_snapshot_ordering.py`](test_database_snapshot_ordering.py)
+  - `test_snapshot_ordering_uses_actual_instant_for_mixed_timezone_strings`
+  - `test_insert_snapshot_normalizes_created_at_to_utc_z`
+  - `test_snapshot_keyword_search_uses_actual_instant_order_for_mixed_timezones`
+  - `test_normalize_snapshot_created_at_script_is_idempotent`
+
+### B2 — in-flight idempotency barrier
+
+**Invariant.** A placeholder row (`status='in_flight'`, recorded
+`prompt_hash`) is committed BEFORE the LLM is invoked. If anything fails
+between placeholder commit and finalize, the row stays `in_flight` or
+flips to `failed`. The next tick consults `find_done_snapshot_by_prompt_hash`
+/ `find_in_flight_snapshot_by_prompt_hash` /
+`count_failed_snapshot_attempts` and short-circuits — the same prompt is
+NEVER re-sent to the LLM after a successful run, and is dead-lettered
+after 3 failed attempts.
+
+- [`test_snapshot_in_flight_helpers.py`](test_snapshot_in_flight_helpers.py)
+  - `test_insert_placeholder_creates_in_flight_row`
+  - `test_finalize_snapshot_marks_done_and_writes_content`
+  - `test_in_flight_placeholder_is_not_returned_as_latest` *(critical: an
+    unfinished placeholder must NOT shift `get_latest_snapshot`)*
+  - `test_find_done_skips_in_flight_and_failed`
+  - `test_count_failed_attempts_gates_dead_letter`
+  - `test_reset_stale_in_flight_flips_old_rows_to_failed`
+  - `test_mark_failed_transitions_status`
+- [`test_snapshot_in_flight_state_machine.py`](test_snapshot_in_flight_state_machine.py)
+  - `test_compute_prompt_hash_*` (4 tests, hash stability / sensitivity / part-boundary / None tolerance)
+  - `test_cache_hit_after_successful_run_skips_llm` *(the headline B2 invariant)*
+  - `test_in_flight_placeholder_blocks_duplicate_llm_call`
+  - `test_dead_letter_after_three_failures_refuses_llm`
+  - `test_first_two_failures_still_allow_retry`
+  - `test_llm_failure_marks_placeholder_failed_and_does_not_advance_done_count`
+
+### B3 — post-finalize side-effect isolation
+
+**Invariant.** Once `finalize_snapshot` commits `status='done'`, the LLM
+spend is sunk. Subsequent OB-hold / relationship-thought / life-flow /
+slowlines / disturbance-pulse writes are wrapped by
+`StateMachine._run_side_effect`; their failures are logged into the
+snapshot's `side_effects_status` JSON column but never propagate out of
+the tick.
+
+- [`test_snapshot_side_effect_isolation.py`](test_snapshot_side_effect_isolation.py)
+  - `test_run_side_effect_records_ok_on_success`
+  - `test_run_side_effect_records_failure_and_returns_default`
+  - `test_run_side_effect_swallows_unrelated_failures_independently`
+  - `test_run_side_effect_truncates_overlong_error_messages`
+  - `test_run_side_effect_default_is_none_when_unspecified`
+  - `test_update_snapshot_side_effects_status_writes_json_payload`
+  - `test_update_snapshot_side_effects_status_overwrites_previous_payload`
+  - `test_update_snapshot_side_effects_status_empty_payload_is_safe`
+  - `test_chained_side_effects_continue_after_a_failure_and_persist_status`
+
+### C1 — scheduler circuit breaker
+
+**Invariant.** Each scheduler loop runs through a
+`SchedulerCircuitBreaker`. Consecutive failures bump
+`consecutive_failures`; exponential backoff (30 s → 2 m → 5 m → 15 m →
+30 m) inserts between retries; at 10 failures the loop pauses entirely
+until `resume()` is called. Success resets the counter but does NOT
+auto-resume a deliberately paused breaker. Forward-compat hooks
+(`pause_immediately_exception_types`, `non_failure_exception_types`)
+let A2/A3 plug in their classes without re-touching the loop.
+
+- [`test_scheduler_circuit_breaker.py`](test_scheduler_circuit_breaker.py)
+  - construction / invariants (2 tests)
+  - timestamp recording (2 tests)
+  - backoff progression + default sequence (2 tests)
+  - success resets counter, success does NOT auto-resume (2 tests)
+  - pause-after-N + paused_reason / paused_at frozen (2 tests)
+  - exception-classifier hooks (3 tests)
+  - resume returns was-paused and preserves history (3 tests)
+  - error message truncation (1 test)
+  - snapshot field-shape lock (1 test)
+  - StateMachine attaches both breakers (1 test)
+
+### C3 — admin observability and one-click resume
+
+**Invariant.** `GET /api/admin/health` returns a consistent JSON shape
+exposing both breakers' state, the in-flight placeholder list (oldest
+first), the last `done` snapshot/reflect timestamps, and the seconds
+since each. `POST /api/admin/scheduler/{name}/resume` is idempotent and
+404s on unknown names. The web page at `/admin/health` polls this
+endpoint every 10 s and shows a one-click resume button when paused.
+This is the property that would have flagged the original 21-hour
+incident within minutes.
+
+- [`test_admin_health_endpoint.py`](test_admin_health_endpoint.py)
+  - `test_admin_health_returns_both_breakers_with_documented_shape`
+    *(locks the JSON shape that web/admin-health.html depends on)*
+  - `test_admin_health_surfaces_in_flight_placeholders_oldest_first`
+  - `test_admin_health_reports_last_snapshot_and_reflect_timestamps`
+    *(in_flight rows must NOT shift `last_snapshot_at`)*
+  - `test_admin_health_handles_empty_database`
+  - `test_admin_health_reflects_paused_breaker_state`
+  - `test_resume_clears_paused_breaker_via_endpoint`
+  - `test_resume_on_not_paused_breaker_is_idempotent`
+  - `test_resume_unknown_scheduler_returns_404`
+  - `test_health_reflects_resume_after_full_round_trip`
+
+### C4 — end-to-end regression replay
+
+**Invariant.** Every defense above, exercised as a single sequence,
+matches the production scheduler tick's behavior. This test is the
+smoke alarm for the whole subsystem.
+
+- [`test_snapshot_loop_safety_incident_replay.py`](test_snapshot_loop_safety_incident_replay.py)
+  - `test_incident_replay_all_defenses_hold` *(B1 → B2 → B3 → C1 → C3
+    in a single walkthrough mirroring the 21-hour incident)*
+  - `test_stale_in_flight_recovery_unblocks_a_stuck_prompt` *(an
+    11-minute-old placeholder is flipped to failed so future ticks
+    are not permanently blocked)*
+  - `test_admin_health_renders_during_an_active_in_flight_window`
+    *(mid-flight tick is observable on the dashboard but does not
+    corrupt last_snapshot_at)*
+
+## Deferred phases
+
+These phases of [`docs/fix_plan_snapshot_loop.md`](../docs/fix_plan_snapshot_loop.md)
+were NOT implemented (the team opted to ship the highest-value layers
+first) and have no tests yet. If you implement them later, add the
+corresponding tests here so the registry stays current.
+
+- **A2** — LLM hard budget cap (`BudgetExceeded` exception). Designed to
+  plug into `SchedulerCircuitBreaker.pause_immediately_exception_types`
+  without re-touching `server/main.py`.
+- **A3** — Prompt-hash 60 s dedup at the `LLMClient.chat` level.
+  Designed to plug into `non_failure_exception_types` so duplicate-prompt
+  skips don't trip C1.
+- **B4** — `idempotency_key` on `reflect_on_conversation` for client-side
+  retry de-duplication. Skipped because the current production deployment
+  generates reflects in the front-end model directly and does not call
+  the backend reflect endpoint.
+- **C2** — Hourly/daily budget threshold alerts at 80% / 95%. Depends on
+  A2's tracker.
+
+## Running just the safety suite
+
+```bash
+pytest tests/test_database_snapshot_ordering.py \
+       tests/test_snapshot_in_flight_helpers.py \
+       tests/test_snapshot_in_flight_state_machine.py \
+       tests/test_snapshot_side_effect_isolation.py \
+       tests/test_scheduler_circuit_breaker.py \
+       tests/test_admin_health_endpoint.py \
+       tests/test_snapshot_loop_safety_incident_replay.py -v
+```
+
+As of the C4 commit this suite is 60 tests; the full repo suite is 111.
+Either should be green before merging anything that touches
+`server/database.py`, `server/state_machine.py`,
+`server/scheduler_breaker.py`, `server/main.py` scheduler loops, or
+`server/api_routes.py` admin endpoints.
