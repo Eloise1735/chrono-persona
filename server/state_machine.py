@@ -130,6 +130,18 @@ class StateMachine:
         self._deferred_env_retry_task: asyncio.Task | None = None
         self.plan_engine = None
         self.ob_client = None
+        # C1 scheduler circuit breakers — one per loop. The scheduler loops in
+        # server/main.py consult these before/after each tick to apply
+        # exponential backoff and to pause entirely after N consecutive
+        # failures. Exposed as instance attributes so admin endpoints (C3)
+        # can read .snapshot() and call .resume() without restarting.
+        from server.scheduler_breaker import SchedulerCircuitBreaker
+        self.snapshot_scheduler_breaker = SchedulerCircuitBreaker(
+            name="snapshot_scheduler"
+        )
+        self.life_scheduler_breaker = SchedulerCircuitBreaker(
+            name="life_scheduler"
+        )
 
     def set_plan_engine(self, plan_engine) -> None:
         self.plan_engine = plan_engine
