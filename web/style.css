@@ -105,12 +105,16 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;
   }
-  /* Bottom spacer that participates in the flex layout, so scrolling to
-     max actually reveals it (unlike padding-bottom). */
+  /* Bottom spacer that participates in the flex layout. Sized large
+     enough (72px) that scrolling to max pushes the last <a> well above
+     the fixed bottom .status-bar (~30px tall, z-index 50 vs nav's 40)
+     — i.e. the top entries scroll out of view to reveal the bottom
+     ones, instead of the bottom entries being permanently hidden
+     behind the status-bar strip. */
   nav::after {
     content: "";
     display: block;
-    flex: 0 0 14px;
+    flex: 0 0 72px;
   }
   nav::-webkit-scrollbar { width: 8px; }
   nav::-webkit-scrollbar-track { background: transparent; }
