@@ -787,6 +787,62 @@ class Database:
             row = await cur.fetchone()
             return int(row[0] or 0)  # type: ignore
 
+    async def list_in_flight_snapshots(self, limit: int = 20) -> list[dict]:
+        """Return currently-in-flight placeholder rows for /admin/health.
+        Each row carries enough metadata to spot a hung tick (age_s,
+        attempt_count, prompt_hash short-form). Ordered oldest-first so
+        stale rows surface at the top of the admin view."""
+        async with self.conn.execute(
+            """SELECT id, created_at, type, prompt_hash, attempt_count, started_at,
+                      (julianday('now') - julianday(started_at)) * 86400.0 AS age_s
+               FROM state_snapshots
+               WHERE status='in_flight'
+               ORDER BY julianday(started_at) ASC, id ASC
+               LIMIT ?""",
+            (int(limit),),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": int(r["id"]),
+                    "created_at": r["created_at"],
+                    "type": r["type"],
+                    "prompt_hash": r["prompt_hash"],
+                    "prompt_hash_short": (r["prompt_hash"] or "")[:12],
+                    "attempt_count": int(r["attempt_count"] or 0),
+                    "started_at": r["started_at"],
+                    "age_s": float(r["age_s"] or 0.0),
+                }
+            )
+        return out
+
+    async def get_latest_snapshot_created_at(self) -> str | None:
+        """Returns the most-recent done snapshot's created_at (ISO Z), or
+        None if none exist. Used by /admin/health to surface "time since
+        last snapshot" so an admin notices a stuck scheduler quickly."""
+        async with self.conn.execute(
+            """SELECT created_at FROM state_snapshots
+               WHERE status='done'
+               ORDER BY julianday(created_at) DESC, created_at DESC, id DESC
+               LIMIT 1"""
+        ) as cur:
+            row = await cur.fetchone()
+            return row["created_at"] if row else None
+
+    async def get_latest_reflect_created_at(self) -> str | None:
+        """Returns the most-recent done conversation_end snapshot's
+        created_at (ISO Z), or None if none exist."""
+        async with self.conn.execute(
+            """SELECT created_at FROM state_snapshots
+               WHERE status='done' AND type='conversation_end'
+               ORDER BY julianday(created_at) DESC, created_at DESC, id DESC
+               LIMIT 1"""
+        ) as cur:
+            row = await cur.fetchone()
+            return row["created_at"] if row else None
+
     async def reset_stale_in_flight_snapshots(self, older_than_seconds: int = 600) -> list[int]:
         """Flip in_flight rows whose started_at is older than `older_than_seconds`
         to status='failed' and return their ids. Used by the scheduler to recover

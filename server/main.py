@@ -552,6 +552,19 @@ async def serve_npcs():
     return {"message": "NPC page not found."}
 
 
+@app.get("/admin/health")
+async def serve_admin_health():
+    """C3 system-health page. Consumes /api/admin/health (which is gated
+    by the same admin-token middleware as the rest of /api)."""
+    page = Path(__file__).parent.parent / "web" / "admin-health.html"
+    if page.exists():
+        return FileResponse(
+            str(page),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return {"message": "Admin health page not found."}
+
+
 if __name__ == "__main__":
     import os
 
