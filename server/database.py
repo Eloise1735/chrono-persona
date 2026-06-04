@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 from datetime import datetime
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 from server.models import (
     CharacterNotification,
@@ -314,6 +317,56 @@ class Database:
         os.makedirs(Path(self._db_path).parent, exist_ok=True)
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
+
+        # temp_store=MEMORY: keep sort/group spill buffers in process memory
+        # instead of writing them to the OS temp directory. The dataset is
+        # small (a few MB at most) and this avoids SQLITE_CANTOPEN errors when
+        # the Windows TEMP path is unwritable or unset under a service account.
+        await self._conn.execute("PRAGMA temp_store=MEMORY")
+
+        # Crash-safety tuning. WAL is preferred (process-kill survivable
+        # without losing committed rows) but requires creating -wal / -shm
+        # sidecars in the DB directory; some Windows hosts refuse that. Fall
+        # back to rollback-journal with synchronous=FULL so commits still
+        # survive a hard reboot, just at higher fsync cost.
+        wal_ok = False
+        try:
+            async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
+                row = await cur.fetchone()
+            if row is not None and str(row[0]).lower() == "wal":
+                wal_ok = True
+            else:
+                logger.warning(
+                    "PRAGMA journal_mode=WAL did not take (got %r); "
+                    "falling back to rollback journal + synchronous=FULL.",
+                    None if row is None else row[0],
+                )
+        except Exception:
+            logger.exception(
+                "Setting journal_mode=WAL raised; falling back to rollback journal."
+            )
+
+        if wal_ok:
+            # NORMAL is the standard safe pairing with WAL — committed rows
+            # survive process kill; only an OS-level crash can lose the last
+            # transaction's tail.
+            await self._conn.execute("PRAGMA synchronous=NORMAL")
+        else:
+            # FULL is the standard pairing with rollback journal to keep the
+            # main DB file consistent under power loss / kill -9.
+            await self._conn.execute("PRAGMA journal_mode=DELETE")
+            await self._conn.execute("PRAGMA synchronous=FULL")
+
+        # Surface corruption early — refuse to start on a malformed file so the
+        # operator runs recovery instead of writing more damage on top.
+        async with self._conn.execute("PRAGMA quick_check") as cur:
+            qc = await cur.fetchone()
+        if qc is not None and str(qc[0]).strip().lower() != "ok":
+            raise RuntimeError(
+                f"SQLite quick_check failed for {self._db_path!r}: {qc[0]!r}. "
+                "Refusing to start on a corrupt database — run .recover."
+            )
+
         await self._conn.executescript(_CREATE_TABLES)
         await self._ensure_schema_updates()
         await self._conn.commit()
