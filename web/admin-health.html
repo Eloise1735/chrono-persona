@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=950ceae3">
+  <title>凯尔希状态机 - 系统健康</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260512-nav">
+  <style>
+    .health-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    @media (max-width: 800px) { .health-grid { grid-template-columns: 1fr; } }
+    .health-card { padding: 14px 18px; border-radius: 8px; border: 1px solid #d0d7de; background: #ffffff; }
+    .health-card h3 { margin: 0 0 8px 0; display: flex; align-items: center; gap: 10px; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+    .badge-ok { background: #d4edda; color: #155724; }
+    .badge-warn { background: #fff3cd; color: #856404; }
+    .badge-bad { background: #f8d7da; color: #721c24; }
+    .field-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed #eaeaea; font-size: 14px; }
+    .field-row:last-child { border-bottom: none; }
+    .field-key { color: #57606a; }
+    .field-val { color: #1f2328; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; text-align: right; }
+    .err-row { background: #fff3cd; padding: 6px 10px; border-radius: 4px; font-size: 12px; color: #856404; margin-top: 6px; }
+    .resume-btn { margin-top: 10px; padding: 6px 14px; border: 1px solid #0969da; background: #0969da; color: #fff; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    .resume-btn[disabled] { background: #8c959f; border-color: #8c959f; cursor: not-allowed; opacity: 0.7; }
+    .resume-btn:hover:not([disabled]) { background: #0860c8; }
+    table.in-flight { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.in-flight th, table.in-flight td { padding: 6px 8px; border-bottom: 1px solid #eaeaea; text-align: left; vertical-align: top; }
+    table.in-flight th { background: #f6f8fa; font-weight: 600; }
+    table.in-flight tr.stale td { background: #fff3cd; }
+    .age-fresh { color: #155724; }
+    .age-warn { color: #856404; }
+    .age-bad { color: #721c24; font-weight: 600; }
+    .refresh-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: #57606a; }
+    .refresh-bar button { padding: 4px 12px; }
+    .top-summary { font-size: 13px; color: #57606a; margin-bottom: 12px; }
+    .empty { color: #8c959f; font-style: italic; padding: 12px; text-align: center; }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="logo">Kal'tsit State Machine</span>
+    <a href="/">仪表盘</a>
+    <a href="/guide">使用指南</a>
+    <a href="/snapshots-history">状态历史</a>
+    <a href="/events-history">事件历史</a>
+    <a href="/key-records">关键记录</a>
+    <a href="/world-books">世界书</a>
+    <a href="/schedule">日程表</a>
+    <a href="/npcs">NPC 管理</a>
+    <a href="/settings">设定管理</a>
+    <a href="/environment-manage">环境管理</a>
+    <a href="/evolution">人格演化</a>
+    <a href="/ob">OB 记忆</a>
+    <a href="/vectors">向量管理</a>
+    <a href="/admin/health" class="active">系统健康</a>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h2>系统健康监控</h2>
+      <div class="top-summary">
+        快照调度器、对话反思与 LLM 调用的运行状态。检测到熔断（连续失败 ≥ 10）时此页会显示红色徽章，点"恢复"按钮即可一键复位。
+      </div>
+      <div class="refresh-bar">
+        <span id="updated-at">尚未刷新</span>
+        <button onclick="loadHealth()">手动刷新</button>
+      </div>
+
+      <div class="health-grid" id="schedulers-grid">
+        <!-- breaker cards injected here -->
+      </div>
+
+      <div class="card" style="margin-top: 18px; padding: 0; box-shadow: none; border: 1px solid #d0d7de;">
+        <div style="padding: 12px 18px; border-bottom: 1px solid #d0d7de; background: #f6f8fa; display: flex; justify-content: space-between; align-items: center;">
+          <strong>最近快照 / 反思</strong>
+          <span id="snapshot-summary" style="font-size: 12px; color: #57606a;"></span>
+        </div>
+        <div style="padding: 14px 18px;">
+          <div class="field-row">
+            <span class="field-key">最近一次 daily / accumulated 快照</span>
+            <span class="field-val" id="last-snap"></span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">距上次快照</span>
+            <span class="field-val" id="age-snap"></span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">最近一次 reflect (conversation_end)</span>
+            <span class="field-val" id="last-reflect"></span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">距上次反思</span>
+            <span class="field-val" id="age-reflect"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 18px; padding: 0; box-shadow: none; border: 1px solid #d0d7de;">
+        <div style="padding: 12px 18px; border-bottom: 1px solid #d0d7de; background: #f6f8fa; display: flex; justify-content: space-between; align-items: center;">
+          <strong>进行中的快照占位 (B2 in-flight)</strong>
+          <span id="in-flight-count" style="font-size: 12px; color: #57606a;">0</span>
+        </div>
+        <div id="in-flight-wrap" style="padding: 14px 18px;">
+          <div class="empty">无在途占位。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const POLL_INTERVAL_MS = 10000;
+let pollTimer = null;
+
+function fmtSeconds(s) {
+  if (s == null || isNaN(s)) return "—";
+  s = Math.floor(Number(s));
+  if (s < 60) return `${s} 秒前`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分前`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)} 小时前`;
+  return `${(s / 86400).toFixed(1)} 天前`;
+}
+
+function ageClass(s) {
+  if (s == null) return "";
+  if (s < 600) return "age-fresh";        // < 10 min
+  if (s < 3 * 3600) return "age-warn";    // < 3 h
+  return "age-bad";                        // >= 3 h
+}
+
+function badgeForBreaker(snap) {
+  if (snap.paused) return '<span class="badge badge-bad">PAUSED</span>';
+  if (snap.consecutive_failures > 0) {
+    return `<span class="badge badge-warn">FAILING (${snap.consecutive_failures})</span>`;
+  }
+  return '<span class="badge badge-ok">OK</span>';
+}
+
+function renderBreakerCard(name, snap) {
+  const card = document.createElement('div');
+  card.className = 'health-card';
+  const errBlock = snap.last_error_summary
+    ? `<div class="err-row">最近错误：${escapeHtml(snap.last_error_summary)}</div>`
+    : "";
+  const resumeBtn = snap.paused
+    ? `<button class="resume-btn" onclick="resumeBreaker('${name}', this)">恢复运行</button>`
+    : `<button class="resume-btn" disabled>恢复运行</button>`;
+  card.innerHTML = `
+    <h3>${escapeHtml(name)} ${badgeForBreaker(snap)}</h3>
+    <div class="field-row">
+      <span class="field-key">连续失败</span>
+      <span class="field-val">${snap.consecutive_failures}</span>
+    </div>
+    <div class="field-row">
+      <span class="field-key">距上次成功</span>
+      <span class="field-val ${ageClass(snap.age_since_last_success_s)}">${fmtSeconds(snap.age_since_last_success_s)}</span>
+    </div>
+    <div class="field-row">
+      <span class="field-key">距上次失败</span>
+      <span class="field-val ${ageClass(snap.age_since_last_failure_s)}">${fmtSeconds(snap.age_since_last_failure_s)}</span>
+    </div>
+    <div class="field-row">
+      <span class="field-key">熔断原因</span>
+      <span class="field-val">${escapeHtml(snap.paused_reason || "—")}</span>
+    </div>
+    ${errBlock}
+    ${resumeBtn}
+  `;
+  return card;
+}
+
+function renderInFlight(rows) {
+  const wrap = document.getElementById('in-flight-wrap');
+  document.getElementById('in-flight-count').textContent = `${rows.length} 条`;
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">无在途占位。</div>';
+    return;
+  }
+  const table = document.createElement('table');
+  table.className = 'in-flight';
+  table.innerHTML = `
+    <thead>
+      <tr><th>ID</th><th>type</th><th>prompt hash</th><th>attempt</th><th>started</th><th>age</th></tr>
+    </thead>
+    <tbody>
+      ${rows.map(r => {
+        const stale = r.age_s >= 600;  // matches reset_stale_in_flight default
+        return `<tr class="${stale ? 'stale' : ''}">
+          <td>${r.id}</td>
+          <td>${escapeHtml(r.type || '')}</td>
+          <td><code>${escapeHtml(r.prompt_hash_short || '')}</code></td>
+          <td>${r.attempt_count}</td>
+          <td><code>${escapeHtml(r.started_at || '')}</code></td>
+          <td class="${ageClass(r.age_s)}">${fmtSeconds(r.age_s)}</td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  `;
+  wrap.innerHTML = '';
+  wrap.appendChild(table);
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]
+  ));
+}
+
+async function loadHealth() {
+  try {
+    const headers = {};
+    const token = localStorage.getItem('kelsey_admin_token');
+    if (token) {
+      headers['X-Kelsey-Admin-Token'] = token;
+    }
+    const r = await fetch('/api/admin/health', { headers });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const payload = await r.json();
+
+    const grid = document.getElementById('schedulers-grid');
+    grid.innerHTML = '';
+    for (const [name, snap] of Object.entries(payload.schedulers || {})) {
+      grid.appendChild(renderBreakerCard(name, snap));
+    }
+
+    document.getElementById('last-snap').textContent = payload.last_snapshot_at || '—';
+    document.getElementById('last-reflect').textContent = payload.last_reflect_at || '—';
+    const ageSnap = payload.age_since_last_snapshot_s;
+    const ageRef = payload.age_since_last_reflect_s;
+    const ageSnapEl = document.getElementById('age-snap');
+    ageSnapEl.textContent = fmtSeconds(ageSnap);
+    ageSnapEl.className = `field-val ${ageClass(ageSnap)}`;
+    const ageRefEl = document.getElementById('age-reflect');
+    ageRefEl.textContent = fmtSeconds(ageRef);
+    ageRefEl.className = `field-val ${ageClass(ageRef)}`;
+
+    renderInFlight(payload.in_flight_snapshots || []);
+
+    document.getElementById('updated-at').textContent =
+      `最近刷新：${new Date().toLocaleTimeString()}（每 ${POLL_INTERVAL_MS / 1000}s 自动刷新）`;
+  } catch (err) {
+    document.getElementById('updated-at').textContent = `刷新失败：${err.message}`;
+  }
+}
+
+async function resumeBreaker(name, btn) {
+  if (!confirm(`确认恢复 ${name}？这会清空连续失败计数并让循环重新接受 tick。`)) return;
+  btn.disabled = true;
+  btn.textContent = '恢复中…';
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = localStorage.getItem('kelsey_admin_token');
+    if (token) headers['X-Kelsey-Admin-Token'] = token;
+    const r = await fetch(`/api/admin/scheduler/${encodeURIComponent(name)}/resume`, {
+      method: 'POST', headers,
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    await loadHealth();
+  } catch (err) {
+    alert(`恢复失败：${err.message}`);
+    btn.disabled = false;
+    btn.textContent = '恢复运行';
+  }
+}
+
+loadHealth();
+pollTimer = setInterval(loadHealth, POLL_INTERVAL_MS);
+</script>
+</body>
+</html>
