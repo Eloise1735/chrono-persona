@@ -88,7 +88,11 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     bottom: 0;
     width: 220px;
     height: 100vh;
-    padding: 14px 10px;
+    /* Top padding only — bottom space is supplied by nav::after below.
+       Chrome / Safari drop padding-bottom from scrollable flex columns,
+       so a literal `padding: 14px 10px` clips the last <a> when the
+       sidebar overflows. */
+    padding: 14px 10px 0;
     border-bottom: 0;
     border-right: 1px solid var(--border);
     flex-direction: column;
@@ -98,7 +102,23 @@ nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
     gap: 2px;
     overflow-y: auto;
     overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
   }
+  /* Bottom spacer that participates in the flex layout, so scrolling to
+     max actually reveals it (unlike padding-bottom). */
+  nav::after {
+    content: "";
+    display: block;
+    flex: 0 0 14px;
+  }
+  nav::-webkit-scrollbar { width: 8px; }
+  nav::-webkit-scrollbar-track { background: transparent; }
+  nav::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+  }
+  nav::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
   nav .logo {
     padding: 8px 10px 14px;
     margin: 0 0 8px;
