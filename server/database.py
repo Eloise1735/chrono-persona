@@ -34,7 +34,12 @@ CREATE TABLE IF NOT EXISTS state_snapshots (
     content TEXT NOT NULL DEFAULT '',
     environment TEXT NOT NULL DEFAULT '{}',
     referenced_events TEXT NOT NULL DEFAULT '[]',
-    embedding_vector_id TEXT
+    embedding_vector_id TEXT,
+    status TEXT NOT NULL DEFAULT 'done',
+    prompt_hash TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    side_effects_status TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS event_anchors (
@@ -334,6 +339,22 @@ class Database:
         await self._ensure_column("key_records", "life_scope", "TEXT NOT NULL DEFAULT 'user_life'")
         await self._ensure_column("world_books", "embedding_vector_id", "TEXT")
         await self._ensure_column("state_snapshots", "inserted_at", "TEXT")
+        # B2 in-flight idempotency
+        await self._ensure_column("state_snapshots", "status", "TEXT NOT NULL DEFAULT 'done'")
+        await self._ensure_column("state_snapshots", "prompt_hash", "TEXT")
+        await self._ensure_column("state_snapshots", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+        await self._ensure_column("state_snapshots", "started_at", "TEXT")
+        # B3: per-snapshot record of which post-finalize side effects ran. JSON of
+        # {name: "ok" | "failed:<ExcType>:<msg>"}; '{}' for pre-B3 rows.
+        await self._ensure_column(
+            "state_snapshots", "side_effects_status", "TEXT NOT NULL DEFAULT '{}'"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_state_snapshots_status ON state_snapshots(status)"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_state_snapshots_prompt_hash ON state_snapshots(prompt_hash)"
+        )
         await self._ensure_column("plan_items", "source_kind", "TEXT NOT NULL DEFAULT 'generated'")
         await self._ensure_column("plan_items", "source_ref_id", "INTEGER")
         await self._ensure_column("relationship_states", "hours_since_meaningful_contact", "REAL NOT NULL DEFAULT 0")
@@ -621,12 +642,13 @@ class Database:
 
     async def insert_snapshot(self, snap: StateSnapshot) -> int:
         wall = format_utc_instant_z(datetime.utcnow())
+        created_at = normalize_user_instant_to_utc_z(snap.created_at or wall)
         cursor = await self.conn.execute(
             """INSERT INTO state_snapshots
                (created_at, inserted_at, type, content, environment, referenced_events, embedding_vector_id)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
-                snap.created_at,
+                created_at,
                 wall,
                 snap.type,
                 snap.content,
@@ -638,9 +660,218 @@ class Database:
         await self.conn.commit()
         return cursor.lastrowid  # type: ignore
 
-    async def get_latest_snapshot(self) -> StateSnapshot | None:
+    # ── B2: In-flight idempotency barrier ──
+    #
+    # The snapshot scheduler and reflect_on_conversation BOTH used to call the
+    # LLM *before* writing anything to the DB. If a downstream side-effect blew
+    # up, the LLM tokens were spent but no row appeared, so the next tick saw
+    # the exact same baseline and re-sent the exact same prompt — burning the
+    # account dry. The four helpers below let callers reserve a placeholder
+    # row (status='in_flight', prompt_hash recorded) BEFORE the LLM call, then
+    # either finalize or mark_failed afterwards. Subsequent ticks consult
+    # find_*_snapshot_by_prompt_hash to skip work that's already done or in
+    # progress, and count_failed_snapshot_attempts gates dead-letter handling.
+    # See docs/fix_plan_snapshot_loop.md B2.
+
+    async def insert_snapshot_placeholder(
+        self,
+        *,
+        prompt_hash: str,
+        snap_type: str = "daily",
+        created_at: str | None = None,
+        attempt_count: int = 1,
+    ) -> int:
+        wall = format_utc_instant_z(datetime.utcnow())
+        created_at_norm = (
+            normalize_user_instant_to_utc_z(created_at) if created_at else wall
+        )
+        cursor = await self.conn.execute(
+            """INSERT INTO state_snapshots
+               (created_at, inserted_at, type, content, environment, referenced_events,
+                embedding_vector_id, status, prompt_hash, attempt_count, started_at)
+               VALUES (?, ?, ?, '', '{}', '[]', NULL, 'in_flight', ?, ?, ?)""",
+            (created_at_norm, wall, snap_type, prompt_hash, attempt_count, wall),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    async def finalize_snapshot(
+        self,
+        row_id: int,
+        *,
+        content: str,
+        environment: str = "{}",
+        referenced_events: str = "[]",
+        created_at: str | None = None,
+        embedding_vector_id: str | None = None,
+    ) -> None:
+        created_at_norm = (
+            normalize_user_instant_to_utc_z(created_at) if created_at else None
+        )
+        if created_at_norm is None:
+            await self.conn.execute(
+                """UPDATE state_snapshots
+                   SET status='done', content=?, environment=?, referenced_events=?,
+                       embedding_vector_id=?
+                   WHERE id=?""",
+                (content, environment, referenced_events, embedding_vector_id, row_id),
+            )
+        else:
+            await self.conn.execute(
+                """UPDATE state_snapshots
+                   SET status='done', content=?, environment=?, referenced_events=?,
+                       embedding_vector_id=?, created_at=?
+                   WHERE id=?""",
+                (
+                    content,
+                    environment,
+                    referenced_events,
+                    embedding_vector_id,
+                    created_at_norm,
+                    row_id,
+                ),
+            )
+        await self.conn.commit()
+
+    async def update_snapshot_side_effects_status(
+        self, row_id: int, status_map: dict
+    ) -> None:
+        """Persist the per-effect outcome dict produced by
+        StateMachine._run_side_effect. Best-effort: any DB error here is
+        logged by the caller but never propagated — side-effect bookkeeping
+        must not itself fail the tick. See docs/fix_plan_snapshot_loop.md B3."""
+        import json as _json
+
+        payload = _json.dumps(status_map or {}, ensure_ascii=False)
+        await self.conn.execute(
+            "UPDATE state_snapshots SET side_effects_status=? WHERE id=?",
+            (payload, row_id),
+        )
+        await self.conn.commit()
+
+    async def mark_snapshot_failed(self, row_id: int) -> None:
+        await self.conn.execute(
+            "UPDATE state_snapshots SET status='failed' WHERE id=?", (row_id,)
+        )
+        await self.conn.commit()
+
+    async def find_done_snapshot_by_prompt_hash(
+        self, prompt_hash: str
+    ) -> StateSnapshot | None:
         async with self.conn.execute(
-            f"SELECT * FROM state_snapshots ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT 1"
+            """SELECT * FROM state_snapshots
+               WHERE prompt_hash=? AND status='done'
+               ORDER BY id DESC LIMIT 1""",
+            (prompt_hash,),
+        ) as cur:
+            row = await cur.fetchone()
+            return StateSnapshot(**dict(row)) if row else None
+
+    async def find_in_flight_snapshot_by_prompt_hash(
+        self, prompt_hash: str
+    ) -> StateSnapshot | None:
+        async with self.conn.execute(
+            """SELECT * FROM state_snapshots
+               WHERE prompt_hash=? AND status='in_flight'
+               ORDER BY id DESC LIMIT 1""",
+            (prompt_hash,),
+        ) as cur:
+            row = await cur.fetchone()
+            return StateSnapshot(**dict(row)) if row else None
+
+    async def count_failed_snapshot_attempts(self, prompt_hash: str) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM state_snapshots WHERE prompt_hash=? AND status='failed'",
+            (prompt_hash,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0] or 0)  # type: ignore
+
+    async def list_in_flight_snapshots(self, limit: int = 20) -> list[dict]:
+        """Return currently-in-flight placeholder rows for /admin/health.
+        Each row carries enough metadata to spot a hung tick (age_s,
+        attempt_count, prompt_hash short-form). Ordered oldest-first so
+        stale rows surface at the top of the admin view."""
+        async with self.conn.execute(
+            """SELECT id, created_at, type, prompt_hash, attempt_count, started_at,
+                      (julianday('now') - julianday(started_at)) * 86400.0 AS age_s
+               FROM state_snapshots
+               WHERE status='in_flight'
+               ORDER BY julianday(started_at) ASC, id ASC
+               LIMIT ?""",
+            (int(limit),),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": int(r["id"]),
+                    "created_at": r["created_at"],
+                    "type": r["type"],
+                    "prompt_hash": r["prompt_hash"],
+                    "prompt_hash_short": (r["prompt_hash"] or "")[:12],
+                    "attempt_count": int(r["attempt_count"] or 0),
+                    "started_at": r["started_at"],
+                    "age_s": float(r["age_s"] or 0.0),
+                }
+            )
+        return out
+
+    async def get_latest_snapshot_created_at(self) -> str | None:
+        """Returns the most-recent done snapshot's created_at (ISO Z), or
+        None if none exist. Used by /admin/health to surface "time since
+        last snapshot" so an admin notices a stuck scheduler quickly."""
+        async with self.conn.execute(
+            """SELECT created_at FROM state_snapshots
+               WHERE status='done'
+               ORDER BY julianday(created_at) DESC, created_at DESC, id DESC
+               LIMIT 1"""
+        ) as cur:
+            row = await cur.fetchone()
+            return row["created_at"] if row else None
+
+    async def get_latest_reflect_created_at(self) -> str | None:
+        """Returns the most-recent done conversation_end snapshot's
+        created_at (ISO Z), or None if none exist."""
+        async with self.conn.execute(
+            """SELECT created_at FROM state_snapshots
+               WHERE status='done' AND type='conversation_end'
+               ORDER BY julianday(created_at) DESC, created_at DESC, id DESC
+               LIMIT 1"""
+        ) as cur:
+            row = await cur.fetchone()
+            return row["created_at"] if row else None
+
+    async def reset_stale_in_flight_snapshots(self, older_than_seconds: int = 600) -> list[int]:
+        """Flip in_flight rows whose started_at is older than `older_than_seconds`
+        to status='failed' and return their ids. Used by the scheduler to recover
+        from crashes that left a placeholder hanging."""
+        async with self.conn.execute(
+            """SELECT id FROM state_snapshots
+               WHERE status='in_flight'
+                 AND started_at IS NOT NULL
+                 AND (julianday('now') - julianday(started_at)) * 86400.0 > ?""",
+            (float(older_than_seconds),),
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = [int(r[0]) for r in rows]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        await self.conn.execute(
+            f"UPDATE state_snapshots SET status='failed' WHERE id IN ({placeholders})",
+            ids,
+        )
+        await self.conn.commit()
+        return ids
+
+    async def get_latest_snapshot(self) -> StateSnapshot | None:
+        # B2: in_flight/failed placeholders are never returned as the "latest"
+        # baseline — otherwise the scheduler would plan from a row with empty
+        # content and re-burn the LLM. Legacy rows default to status='done'.
+        async with self.conn.execute(
+            f"SELECT * FROM state_snapshots WHERE status='done' ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
             return StateSnapshot(**dict(row)) if row else None
@@ -649,7 +880,7 @@ class Database:
         async with self.conn.execute(
             # 对话检查点语义优先「最新写入的一条记录」而非 created_at 最大值：
             # created_at 可能来自导入/回填的历史时间，不能稳定代表最近一次互动写入。
-            "SELECT * FROM state_snapshots WHERE type = ? ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM state_snapshots WHERE type = ? AND status='done' ORDER BY id DESC LIMIT 1",
             (snap_type,),
         ) as cur:
             row = await cur.fetchone()
@@ -658,7 +889,7 @@ class Database:
     async def get_latest_non_conversation_snapshot(self) -> StateSnapshot | None:
         async with self.conn.execute(
             """SELECT * FROM state_snapshots
-               WHERE type != 'conversation_end'
+               WHERE type != 'conversation_end' AND status='done'
                ORDER BY """
             + self.SNAPSHOT_ORDER_DESC
             + " LIMIT 1"
@@ -668,7 +899,8 @@ class Database:
 
     async def count_snapshots_since(self, since_timestamp: str) -> int:
         async with self.conn.execute(
-            "SELECT COUNT(*) FROM state_snapshots WHERE julianday(created_at) > julianday(?)",
+            """SELECT COUNT(*) FROM state_snapshots
+               WHERE julianday(created_at) > julianday(?) AND status='done'""",
             (since_timestamp,),
         ) as cur:
             row = await cur.fetchone()
@@ -676,7 +908,7 @@ class Database:
 
     async def get_recent_snapshots(self, limit: int = 7) -> list[StateSnapshot]:
         async with self.conn.execute(
-            f"SELECT * FROM state_snapshots ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?", (limit,)
+            f"SELECT * FROM state_snapshots WHERE status='done' ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?", (limit,)
         ) as cur:
             rows = await cur.fetchall()
             return [StateSnapshot(**dict(r)) for r in rows]
@@ -1223,9 +1455,9 @@ class Database:
     async def search_snapshots_by_keyword(self, keyword: str, limit: int = 10) -> list[StateSnapshot]:
         pattern = f"%{keyword}%"
         async with self.conn.execute(
-            """SELECT * FROM state_snapshots
+            f"""SELECT * FROM state_snapshots
                WHERE content LIKE ? AND embedding_vector_id IS NOT NULL
-               ORDER BY created_at DESC, id DESC LIMIT ?""",
+               ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?""",
             (pattern, limit),
         ) as cur:
             rows = await cur.fetchall()
@@ -1248,7 +1480,7 @@ class Database:
         async with self.conn.execute(
             f"""SELECT * FROM state_snapshots
                 WHERE ({where}) AND embedding_vector_id IS NOT NULL
-                ORDER BY created_at DESC, id DESC LIMIT ?""",
+                ORDER BY {self.SNAPSHOT_ORDER_DESC} LIMIT ?""",
             params,
         ) as cur:
             rows = await cur.fetchall()

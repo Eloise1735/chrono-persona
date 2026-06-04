@@ -27,6 +27,17 @@ llm:
 python -m server.main
 ```
 
+> **升级现有部署（B1 快照排序修复）**：从旧版本升级时，`state_snapshots.created_at` 历史行可能混用 `...Z` 与 `+08:00` 两种字面量，会让排序错乱（参见 `docs/fix_plan_snapshot_loop.md` 出血点 3）。**首次启动前**请执行一次幂等回填脚本，把所有历史行规范化为 UTC `Z` 格式：
+>
+> ```bash
+> # 先 dry-run 看影响范围
+> python migrate/normalize_snapshot_created_at.py --db ./data/kelsey.db --dry-run
+> # 确认无误后正式回填
+> python migrate/normalize_snapshot_created_at.py --db ./data/kelsey.db
+> ```
+>
+> 脚本复用 `Database.repair_snapshot_timezones()`，可多次重跑，已规范化的行会被跳过。
+
 服务启动后：
 - Web 管理面板: http://localhost:8000
 - 历史记录: http://localhost:8000/history

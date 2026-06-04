@@ -92,7 +92,14 @@ def _scheduler_tick_log_summary(result: dict) -> str:
 
 
 
+# How long the scheduler loop sleeps each time the breaker is paused. Short
+# enough that a manual resume() takes effect quickly; long enough that a
+# paused loop doesn't busy-spin.
+_BREAKER_PAUSED_POLL_SEC = 30
+
+
 async def _snapshot_scheduler_loop(state_machine: StateMachine):
+    breaker = state_machine.snapshot_scheduler_breaker
     first = True
     while True:
         interval_sec = 60
@@ -104,20 +111,52 @@ async def _snapshot_scheduler_loop(state_machine: StateMachine):
                     interval_sec,
                 )
                 first = False
-            result = await state_machine.run_snapshot_scheduler_tick()
-            status = str(result.get("status") or "")
-            if status == "advanced":
-                logger.info(
-                    "Snapshot scheduler tick: %s | %s",
-                    _scheduler_tick_log_summary(result),
-                    json.dumps(result, ensure_ascii=False),
-                )
+
+            # C1: if a previous failure streak pushed us over the limit, do
+            # nothing until resume() is invoked (e.g. by an admin endpoint).
+            if breaker.is_paused():
+                await asyncio.sleep(_BREAKER_PAUSED_POLL_SEC)
+                continue
+
+            breaker.record_tick_start()
+            try:
+                result = await state_machine.run_snapshot_scheduler_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Snapshot scheduler tick failed.")
+                backoff = breaker.record_failure(exc)
+                if breaker.is_paused():
+                    logger.warning(
+                        "Snapshot scheduler PAUSED after %d consecutive failures.",
+                        breaker.consecutive_failures,
+                    )
+                    continue
+                if backoff > 0:
+                    logger.warning(
+                        "Snapshot scheduler backing off %ds (consecutive_failures=%d).",
+                        backoff,
+                        breaker.consecutive_failures,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
             else:
-                logger.info("Snapshot scheduler tick: %s", _scheduler_tick_log_summary(result))
+                breaker.record_success()
+                status = str(result.get("status") or "")
+                if status == "advanced":
+                    logger.info(
+                        "Snapshot scheduler tick: %s | %s",
+                        _scheduler_tick_log_summary(result),
+                        json.dumps(result, ensure_ascii=False),
+                    )
+                else:
+                    logger.info("Snapshot scheduler tick: %s", _scheduler_tick_log_summary(result))
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Snapshot scheduler loop failed.")
+            # Outer-frame error (e.g. interval lookup failed). Don't count
+            # toward the tick failure budget — log and sleep.
+            logger.exception("Snapshot scheduler loop outer frame failed.")
         await asyncio.sleep(max(5, int(interval_sec)))
 
 
@@ -125,6 +164,7 @@ async def _life_scheduler_loop(
     state_machine: StateMachine,
     plan_engine: PlanEngine,
 ):
+    breaker = state_machine.life_scheduler_breaker
     first = True
     while True:
         interval_sec = 60
@@ -136,27 +176,55 @@ async def _life_scheduler_loop(
                     interval_sec,
                 )
                 first = False
-            if await plan_engine.is_enabled():
-                await plan_engine.ensure_today_plan()
-                current_item = await plan_engine.get_current_item()
-                if current_item is not None:
-                    await plan_engine.execute_item(current_item)
-            result = await state_machine.run_snapshot_scheduler_tick()
-            if await plan_engine.is_enabled():
-                await plan_engine.maybe_replan_on_drift()
-            status = str(result.get("status") or "")
-            if status == "advanced":
-                logger.info(
-                    "Life scheduler tick: %s | %s",
-                    _scheduler_tick_log_summary(result),
-                    json.dumps(result, ensure_ascii=False),
-                )
+
+            if breaker.is_paused():
+                await asyncio.sleep(_BREAKER_PAUSED_POLL_SEC)
+                continue
+
+            breaker.record_tick_start()
+            try:
+                if await plan_engine.is_enabled():
+                    await plan_engine.ensure_today_plan()
+                    current_item = await plan_engine.get_current_item()
+                    if current_item is not None:
+                        await plan_engine.execute_item(current_item)
+                result = await state_machine.run_snapshot_scheduler_tick()
+                if await plan_engine.is_enabled():
+                    await plan_engine.maybe_replan_on_drift()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Life scheduler tick failed.")
+                backoff = breaker.record_failure(exc)
+                if breaker.is_paused():
+                    logger.warning(
+                        "Life scheduler PAUSED after %d consecutive failures.",
+                        breaker.consecutive_failures,
+                    )
+                    continue
+                if backoff > 0:
+                    logger.warning(
+                        "Life scheduler backing off %ds (consecutive_failures=%d).",
+                        backoff,
+                        breaker.consecutive_failures,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
             else:
-                logger.info("Life scheduler tick: %s", _scheduler_tick_log_summary(result))
+                breaker.record_success()
+                status = str(result.get("status") or "")
+                if status == "advanced":
+                    logger.info(
+                        "Life scheduler tick: %s | %s",
+                        _scheduler_tick_log_summary(result),
+                        json.dumps(result, ensure_ascii=False),
+                    )
+                else:
+                    logger.info("Life scheduler tick: %s", _scheduler_tick_log_summary(result))
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Life scheduler loop failed.")
+            logger.exception("Life scheduler loop outer frame failed.")
         await asyncio.sleep(max(5, int(interval_sec)))
 
 
@@ -482,6 +550,19 @@ async def serve_npcs():
     if page.exists():
         return FileResponse(str(page))
     return {"message": "NPC page not found."}
+
+
+@app.get("/admin/health")
+async def serve_admin_health():
+    """C3 system-health page. Consumes /api/admin/health (which is gated
+    by the same admin-token middleware as the rest of /api)."""
+    page = Path(__file__).parent.parent / "web" / "admin-health.html"
+    if page.exists():
+        return FileResponse(
+            str(page),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return {"message": "Admin health page not found."}
 
 
 if __name__ == "__main__":

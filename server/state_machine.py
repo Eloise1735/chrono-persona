@@ -130,6 +130,18 @@ class StateMachine:
         self._deferred_env_retry_task: asyncio.Task | None = None
         self.plan_engine = None
         self.ob_client = None
+        # C1 scheduler circuit breakers — one per loop. The scheduler loops in
+        # server/main.py consult these before/after each tick to apply
+        # exponential backoff and to pause entirely after N consecutive
+        # failures. Exposed as instance attributes so admin endpoints (C3)
+        # can read .snapshot() and call .resume() without restarting.
+        from server.scheduler_breaker import SchedulerCircuitBreaker
+        self.snapshot_scheduler_breaker = SchedulerCircuitBreaker(
+            name="snapshot_scheduler"
+        )
+        self.life_scheduler_breaker = SchedulerCircuitBreaker(
+            name="life_scheduler"
+        )
 
     def set_plan_engine(self, plan_engine) -> None:
         self.plan_engine = plan_engine
@@ -2291,6 +2303,66 @@ class StateMachine:
             return await awaitable
         return await tracer.run(stage_name, awaitable, **meta)
 
+    @staticmethod
+    def _compute_prompt_hash(*parts: str) -> str:
+        """Stable sha256 across LLM prompt parts. Used by the B2 in-flight
+        idempotency barrier to detect "we have already attempted this exact
+        prompt" before another LLM call is made. See
+        docs/fix_plan_snapshot_loop.md B2."""
+        h = hashlib.sha256()
+        for part in parts:
+            h.update((part or "").encode("utf-8", errors="replace"))
+            h.update(b"\x00")
+        return h.hexdigest()
+
+    # B2: identifiers raised when the idempotency barrier refuses an LLM
+    # call. Surfaced so callers (api_routes) can decide whether to treat it
+    # as a user-visible error or a benign "already done" no-op.
+    _IDEMPOTENCY_REASON_IN_FLIGHT = "snapshot_in_flight_duplicate"
+    _IDEMPOTENCY_REASON_DEAD_LETTER = "snapshot_dead_letter"
+
+    @staticmethod
+    async def _run_side_effect(
+        name: str,
+        awaitable,
+        status: dict,
+        *,
+        default=None,
+    ):
+        """B3 side-effect isolation.
+
+        Run a post-snapshot side effect (OB hold, relationship thought,
+        life-flow trace, slowlines refresh, …) such that any failure is
+        logged and recorded into `status[name]` but NEVER propagates up.
+
+        Before B3, a single failing side effect would re-raise out of the
+        snapshot scheduler tick / reflect_on_conversation and trigger the
+        scheduler's failure counter, eventually pausing the loop entirely.
+        The main transaction (finalize_snapshot) already succeeded by the
+        time these run, so failing the tick over a relationship-thought
+        write — or worse, retrying and re-burning the LLM — was always the
+        wrong tradeoff.
+
+        Returns the awaitable's value on success, or `default` on failure.
+        See docs/fix_plan_snapshot_loop.md B3.
+        """
+        try:
+            result = await awaitable
+            status[name] = "ok"
+            return result
+        except Exception as exc:  # noqa: BLE001 — deliberate catch-all
+            msg = str(exc)
+            if len(msg) > 240:
+                msg = msg[:240] + "…"
+            status[name] = f"failed:{type(exc).__name__}:{msg}"
+            logger.warning(
+                "post-snapshot side-effect %s failed: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
+            return default
+
     async def get_current_state(
         self,
         current_time: str,
@@ -2686,66 +2758,174 @@ class StateMachine:
                     memory_context=memory_text,
                 )
 
-                new_content = await self._trace_await(
-                    tracer,
-                    "snapshot_llm.reflect_snapshot",
-                    self.snapshot_llm.chat(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": reflect_prompt},
-                        ],
-                        max_tokens=None,
-                    ),
-                    prompt_chars=len(reflect_prompt or ""),
-                    memory_chars=len(memory_text or ""),
-                )
-
-                snap = StateSnapshot(
-                    created_at=format_utc_instant_z(datetime.utcnow()),
-                    type="conversation_end",
-                    content=new_content,
-                    environment="{}",
-                    referenced_events="[]",
-                )
-                snap_id = await self._trace_await(
-                    tracer,
-                    "db.insert_conversation_end_snapshot",
-                    self.db.insert_snapshot(snap),
-                    snapshot_chars=len(new_content or ""),
+                # B2 idempotency barrier: a placeholder row is committed BEFORE
+                # the LLM call so that any failure during finalize/side-effects
+                # cannot cause the same prompt to be re-sent on the next tick.
+                # See docs/fix_plan_snapshot_loop.md B2.
+                reflect_prompt_hash = self._compute_prompt_hash(
+                    "reflect_on_conversation",
+                    system_prompt,
+                    reflect_prompt,
                 )
                 await self._trace_await(
                     tracer,
-                    "ob_hold_conversation_snapshot_feel",
-                    self._ob_hold_snapshot_feel(
-                        title=f"{shanghai_now().isoformat(timespec='seconds')} 对话结束快照",
+                    "db.reset_stale_in_flight_snapshots",
+                    self.db.reset_stale_in_flight_snapshots(older_than_seconds=600),
+                )
+                existing_done = await self._trace_await(
+                    tracer,
+                    "db.find_done_snapshot_by_prompt_hash",
+                    self.db.find_done_snapshot_by_prompt_hash(reflect_prompt_hash),
+                )
+                if existing_done is not None:
+                    logger.warning(
+                        "reflect_on_conversation: identical prompt already produced "
+                        "snapshot_id=%s; reusing cached content and skipping LLM call.",
+                        existing_done.id,
+                    )
+                    new_content = existing_done.content
+                    tracer.finish_ok(
+                        llm_requests=0,
+                        output_snapshot_chars=len(new_content or ""),
+                        reflect_event_mode="idempotent_cache_hit",
+                        idempotency_snapshot_id=int(existing_done.id or 0),
+                    )
+                    return new_content
+                in_flight = await self._trace_await(
+                    tracer,
+                    "db.find_in_flight_snapshot_by_prompt_hash",
+                    self.db.find_in_flight_snapshot_by_prompt_hash(reflect_prompt_hash),
+                )
+                if in_flight is not None:
+                    raise RuntimeError(
+                        f"{self._IDEMPOTENCY_REASON_IN_FLIGHT}: identical reflect prompt "
+                        f"already in flight (snapshot_id={in_flight.id}); refusing duplicate LLM call."
+                    )
+                failed_count = await self._trace_await(
+                    tracer,
+                    "db.count_failed_snapshot_attempts",
+                    self.db.count_failed_snapshot_attempts(reflect_prompt_hash),
+                )
+                if failed_count >= 3:
+                    raise RuntimeError(
+                        f"{self._IDEMPOTENCY_REASON_DEAD_LETTER}: reflect prompt has "
+                        f"{failed_count} prior failures; manual intervention required."
+                    )
+                snap_created_at = format_utc_instant_z(datetime.utcnow())
+                placeholder_id = await self._trace_await(
+                    tracer,
+                    "db.insert_conversation_end_placeholder",
+                    self.db.insert_snapshot_placeholder(
+                        prompt_hash=reflect_prompt_hash,
+                        snap_type="conversation_end",
+                        created_at=snap_created_at,
+                        attempt_count=failed_count + 1,
+                    ),
+                )
+
+                try:
+                    new_content = await self._trace_await(
+                        tracer,
+                        "snapshot_llm.reflect_snapshot",
+                        self.snapshot_llm.chat(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": reflect_prompt},
+                            ],
+                            max_tokens=None,
+                        ),
+                        prompt_chars=len(reflect_prompt or ""),
+                        memory_chars=len(memory_text or ""),
+                    )
+
+                    snap = StateSnapshot(
+                        id=placeholder_id,
+                        created_at=snap_created_at,
+                        type="conversation_end",
                         content=new_content,
-                        tags=["snapshot", "feel", "conversation_end"],
-                        importance=5,
-                        valence=0.5,
-                        arousal=0.4,
-                        created=snap.created_at,
-                        extra_metadata={
-                            "snapshot_id": int(snap_id or 0),
-                            "source": "conversation_reflection",
-                            "source_kind": "state_snapshot",
-                        },
+                        environment="{}",
+                        referenced_events="[]",
+                    )
+                    await self._trace_await(
+                        tracer,
+                        "db.finalize_conversation_end_snapshot",
+                        self.db.finalize_snapshot(
+                            placeholder_id,
+                            content=new_content,
+                            environment="{}",
+                            referenced_events="[]",
+                            created_at=snap_created_at,
+                        ),
+                        snapshot_chars=len(new_content or ""),
+                    )
+                    snap_id = placeholder_id
+                except Exception:
+                    # Mark the placeholder as failed so the next attempt with the
+                    # same prompt can either retry (attempt_count < 3) or get
+                    # dead-lettered. This keeps the LLM-spend counter honest.
+                    try:
+                        await self.db.mark_snapshot_failed(placeholder_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to mark snapshot placeholder %s as failed.",
+                            placeholder_id,
+                        )
+                    raise
+
+                # B3: from here on, the main transaction (finalize_snapshot) has
+                # already succeeded — the snapshot row is status='done' and the
+                # LLM tokens are accounted for. Any side-effect failure below
+                # must NOT raise, otherwise the caller would see a generic
+                # error even though the actual snapshot was persisted, and the
+                # scheduler's failure counter would tick up.
+                side_effects: dict[str, str] = {}
+                await self._run_side_effect(
+                    "ob_hold_conversation_snapshot_feel",
+                    self._trace_await(
+                        tracer,
+                        "ob_hold_conversation_snapshot_feel",
+                        self._ob_hold_snapshot_feel(
+                            title=f"{shanghai_now().isoformat(timespec='seconds')} 对话结束快照",
+                            content=new_content,
+                            tags=["snapshot", "feel", "conversation_end"],
+                            importance=5,
+                            valence=0.5,
+                            arousal=0.4,
+                            created=snap.created_at,
+                            extra_metadata={
+                                "snapshot_id": int(snap_id or 0),
+                                "source": "conversation_reflection",
+                                "source_kind": "state_snapshot",
+                            },
+                        ),
+                        snapshot_id=int(snap_id or 0),
                     ),
-                    snapshot_id=int(snap_id or 0),
+                    side_effects,
                 )
-                closed_claim = await self._trace_await(
-                    tracer,
+                closed_claim = await self._run_side_effect(
                     "close_active_conversation_claim",
-                    self._close_active_conversation_time_claim(
-                        ended_at=shanghai_now(),
-                        closing_snapshot_id=int(snap_id or 0),
-                        context_summary=conversation_summary,
+                    self._trace_await(
+                        tracer,
+                        "close_active_conversation_claim",
+                        self._close_active_conversation_time_claim(
+                            ended_at=shanghai_now(),
+                            closing_snapshot_id=int(snap_id or 0),
+                            context_summary=conversation_summary,
+                        ),
                     ),
+                    side_effects,
                 )
-                impacted_summary, schedule_alignment, impacted_items = await self._trace_await(
-                    tracer,
+                impact_tuple = await self._run_side_effect(
                     "build_conversation_schedule_impact",
-                    self._build_conversation_schedule_impact(closed_claim),
+                    self._trace_await(
+                        tracer,
+                        "build_conversation_schedule_impact",
+                        self._build_conversation_schedule_impact(closed_claim),
+                    ),
+                    side_effects,
+                    default=("", "on_track", []),
                 )
+                impacted_summary, schedule_alignment, impacted_items = impact_tuple
                 trace_details = {
                     "conversation_summary": conversation_summary,
                     "impacted_plan_items": impacted_items,
@@ -2756,33 +2936,56 @@ class StateMachine:
                     trace_summary = (
                         f"对话占用了原日程：{impacted_summary}。{trace_summary}"
                     ).strip()
-                await self._trace_await(
-                    tracer,
+                await self._run_side_effect(
                     "append_conversation_life_flow_trace",
-                    self._append_life_flow_trace(
-                        trace_date=shanghai_now().date().isoformat(),
-                        source="conversation",
-                        summary=trace_summary,
-                        details=trace_details,
-                        schedule_alignment=schedule_alignment,
-                        related_snapshot_id=int(snap_id or 0),
+                    self._trace_await(
+                        tracer,
+                        "append_conversation_life_flow_trace",
+                        self._append_life_flow_trace(
+                            trace_date=shanghai_now().date().isoformat(),
+                            source="conversation",
+                            summary=trace_summary,
+                            details=trace_details,
+                            schedule_alignment=schedule_alignment,
+                            related_snapshot_id=int(snap_id or 0),
+                        ),
                     ),
+                    side_effects,
                 )
-                await self._trace_await(
-                    tracer,
+                await self._run_side_effect(
                     "refresh_slowlines.after_conversation",
-                    self._refresh_slowlines(),
-                )
-                await self._trace_await(
-                    tracer,
-                    "append_relationship_thought.after_conversation",
-                    self._append_relationship_thought_from_context(
-                        source_snapshot_id=int(snap_id or 0),
-                        source_env_id="conversation_end",
-                        snapshot_text=new_content,
-                        conversation_summary=conversation_summary,
+                    self._trace_await(
+                        tracer,
+                        "refresh_slowlines.after_conversation",
+                        self._refresh_slowlines(),
                     ),
+                    side_effects,
                 )
+                await self._run_side_effect(
+                    "append_relationship_thought.after_conversation",
+                    self._trace_await(
+                        tracer,
+                        "append_relationship_thought.after_conversation",
+                        self._append_relationship_thought_from_context(
+                            source_snapshot_id=int(snap_id or 0),
+                            source_env_id="conversation_end",
+                            snapshot_text=new_content,
+                            conversation_summary=conversation_summary,
+                        ),
+                    ),
+                    side_effects,
+                )
+                # Persist the per-effect outcome dict for diagnostics. Failure
+                # of this DB write is itself a side effect — log & swallow.
+                try:
+                    await self.db.update_snapshot_side_effects_status(
+                        int(snap_id or 0), side_effects
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist side_effects_status for snapshot %s.",
+                        snap_id,
+                    )
             finally:
                 llm_usage = self.snapshot_llm.end_usage_tracking()
 
@@ -6043,6 +6246,24 @@ class StateMachine:
         )
         generated_snapshots: list[dict] = []
         prev_time = baseline_time
+        # B2 idempotency: recover any in_flight placeholders left behind by a
+        # crashed earlier tick (started_at older than 10min). They will be
+        # flipped to 'failed' so attempt_count gating can apply on retry.
+        try:
+            stale_reset_ids = await self._trace_await(
+                diagnostic,
+                f"{trigger}.reset_stale_in_flight_snapshots",
+                self.db.reset_stale_in_flight_snapshots(older_than_seconds=600),
+            )
+            if stale_reset_ids:
+                logger.warning(
+                    "snapshot scheduler tick (%s): recovered %d stale in_flight placeholder(s): %s",
+                    trigger,
+                    len(stale_reset_ids),
+                    stale_reset_ids,
+                )
+        except Exception:
+            logger.exception("reset_stale_in_flight_snapshots failed; continuing.")
         if diagnostic is not None:
             with diagnostic.stage(
                 f"{trigger}.load_snapshot_prompts_and_layers",
@@ -6293,21 +6514,12 @@ class StateMachine:
                 prompt_text=prompt,
             )
 
-            current_content = await self._trace_await(
-                diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.snapshot_llm",
-                self.snapshot_llm.chat(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=None,
-                ),
-                checkpoint_time_cst=checkpoint_cst,
-                prompt_chars=len(prompt or ""),
-                memory_chars=len(memory_text or ""),
-            )
-
+            # B2 idempotency barrier: every per-checkpoint LLM call is gated on
+            # a placeholder row committed BEFORE the LLM is invoked. If a
+            # downstream step fails the placeholder is marked 'failed', so the
+            # NEXT tick can either retry (attempt_count gating) or dead-letter
+            # — never silently re-burn tokens on the same prompt.
+            # See docs/fix_plan_snapshot_loop.md B2.
             is_final_executed_checkpoint = (
                 i == len(due_checkpoints) - 1
                 and len(due_checkpoints) == len(planned_checkpoints)
@@ -6317,120 +6529,276 @@ class StateMachine:
                 and is_final_executed_checkpoint
                 and abs((checkpoint_time - target_time).total_seconds()) <= 1e-6
             )
-            snap = StateSnapshot(
-                created_at=format_utc_instant_z(shanghai_time_to_utc_naive(checkpoint_time)),
-                type="accumulated" if is_tail_checkpoint else "daily",
-                content=current_content,
-                environment=json.dumps(env, ensure_ascii=False),
-                referenced_events=json.dumps(
-                    [e.id for e in checkpoint_events if e.id is not None],
-                    ensure_ascii=False,
-                ),
+            checkpoint_snap_type = "accumulated" if is_tail_checkpoint else "daily"
+            checkpoint_snap_created_at = format_utc_instant_z(
+                shanghai_time_to_utc_naive(checkpoint_time)
             )
-            snap_id = await self._trace_await(
+            checkpoint_prompt_hash = self._compute_prompt_hash(
+                f"snapshot_scheduler:{trigger}",
+                checkpoint_cst,
+                checkpoint_snap_type,
+                system_prompt,
+                prompt,
+            )
+            existing_done = await self._trace_await(
                 diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.db.insert_snapshot",
-                self.db.insert_snapshot(snap),
+                f"{trigger}.checkpoint_{checkpoint_index}.find_done_snapshot_by_prompt_hash",
+                self.db.find_done_snapshot_by_prompt_hash(checkpoint_prompt_hash),
                 checkpoint_time_cst=checkpoint_cst,
-                snapshot_type=snap.type,
-                snapshot_chars=len(current_content or ""),
             )
-            ob_life_bucket_id = await self._trace_await(
+            if existing_done is not None:
+                logger.warning(
+                    "snapshot scheduler (%s checkpoint=%s): identical prompt already "
+                    "produced snapshot_id=%s; aborting advance loop and letting next "
+                    "tick re-plan from the new baseline.",
+                    trigger, checkpoint_cst, existing_done.id,
+                )
+                schedule_meta["idempotency_break"] = {
+                    "reason": "cache_hit",
+                    "checkpoint_cst": checkpoint_cst,
+                    "existing_snapshot_id": int(existing_done.id or 0),
+                }
+                break
+            in_flight = await self._trace_await(
                 diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_snapshot_feel",
-                self._ob_hold_snapshot_feel(
-                    title=f"{checkpoint_cst} 生活快照",
+                f"{trigger}.checkpoint_{checkpoint_index}.find_in_flight_snapshot_by_prompt_hash",
+                self.db.find_in_flight_snapshot_by_prompt_hash(checkpoint_prompt_hash),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            if in_flight is not None:
+                logger.warning(
+                    "snapshot scheduler (%s checkpoint=%s): identical prompt already "
+                    "in flight (snapshot_id=%s); aborting tick to avoid duplicate LLM call.",
+                    trigger, checkpoint_cst, in_flight.id,
+                )
+                schedule_meta["idempotency_break"] = {
+                    "reason": "in_flight_duplicate",
+                    "checkpoint_cst": checkpoint_cst,
+                    "in_flight_snapshot_id": int(in_flight.id or 0),
+                }
+                break
+            failed_count = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.count_failed_snapshot_attempts",
+                self.db.count_failed_snapshot_attempts(checkpoint_prompt_hash),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+            if failed_count >= 3:
+                logger.warning(
+                    "snapshot scheduler (%s checkpoint=%s): dead-letter, %d prior "
+                    "failures for identical prompt; refusing further LLM calls until "
+                    "manual intervention.",
+                    trigger, checkpoint_cst, failed_count,
+                )
+                schedule_meta["idempotency_break"] = {
+                    "reason": "dead_letter",
+                    "checkpoint_cst": checkpoint_cst,
+                    "failed_attempts": failed_count,
+                }
+                break
+            placeholder_id = await self._trace_await(
+                diagnostic,
+                f"{trigger}.checkpoint_{checkpoint_index}.db.insert_snapshot_placeholder",
+                self.db.insert_snapshot_placeholder(
+                    prompt_hash=checkpoint_prompt_hash,
+                    snap_type=checkpoint_snap_type,
+                    created_at=checkpoint_snap_created_at,
+                    attempt_count=failed_count + 1,
+                ),
+                checkpoint_time_cst=checkpoint_cst,
+            )
+
+            try:
+                current_content = await self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.snapshot_llm",
+                    self.snapshot_llm.chat(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=None,
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
+                    prompt_chars=len(prompt or ""),
+                    memory_chars=len(memory_text or ""),
+                )
+
+                snap = StateSnapshot(
+                    id=placeholder_id,
+                    created_at=checkpoint_snap_created_at,
+                    type=checkpoint_snap_type,
                     content=current_content,
-                    tags=["snapshot", "feel", trigger],
-                    importance=4,
-                    valence=0.5,
-                    arousal=0.38,
-                    created=snap.created_at,
-                    extra_metadata={
-                        "snapshot_id": int(snap_id or 0),
-                        "checkpoint_cst": checkpoint_cst,
-                        "source": "snapshot_scheduler",
-                        "source_kind": "state_snapshot",
-                    },
+                    environment=json.dumps(env, ensure_ascii=False),
+                    referenced_events=json.dumps(
+                        [e.id for e in checkpoint_events if e.id is not None],
+                        ensure_ascii=False,
+                    ),
+                )
+                await self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.db.finalize_snapshot",
+                    self.db.finalize_snapshot(
+                        placeholder_id,
+                        content=current_content,
+                        environment=snap.environment,
+                        referenced_events=snap.referenced_events,
+                        created_at=checkpoint_snap_created_at,
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
+                    snapshot_type=snap.type,
+                    snapshot_chars=len(current_content or ""),
+                )
+                snap_id = placeholder_id
+            except Exception:
+                try:
+                    await self.db.mark_snapshot_failed(placeholder_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to mark snapshot placeholder %s as failed.",
+                        placeholder_id,
+                    )
+                raise
+            # B3: post-finalize side effects. From here on, finalize_snapshot
+            # has already committed status='done' and the LLM cost is sunk —
+            # individual failures must NOT raise out of the tick.
+            side_effects: dict[str, str] = {}
+            ob_life_bucket_id = await self._run_side_effect(
+                "ob_hold_snapshot_feel",
+                self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_snapshot_feel",
+                    self._ob_hold_snapshot_feel(
+                        title=f"{checkpoint_cst} 生活快照",
+                        content=current_content,
+                        tags=["snapshot", "feel", trigger],
+                        importance=4,
+                        valence=0.5,
+                        arousal=0.38,
+                        created=snap.created_at,
+                        extra_metadata={
+                            "snapshot_id": int(snap_id or 0),
+                            "checkpoint_cst": checkpoint_cst,
+                            "source": "snapshot_scheduler",
+                            "source_kind": "state_snapshot",
+                        },
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
                 ),
-                checkpoint_time_cst=checkpoint_cst,
+                side_effects,
             )
-            environment_fragment = self._build_environment_life_fragment(
-                env,
-                checkpoint_cst=checkpoint_cst,
-                snapshot_id=int(snap_id or 0),
-            )
-            environment_fragment_bucket_id = await self._trace_await(
-                diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_environment_life_fragment",
-                self._ob_hold_environment_life_fragment(
-                    title=f"{checkpoint_cst} 生活碎片",
-                    content=str(environment_fragment.get("content") or ""),
-                    tags=["environment_life_fragment", "character_life", trigger],
-                    importance=5,
-                    valence=0.5,
-                    arousal=0.36,
-                    created=snap.created_at,
-                    extra_metadata={
-                        "snapshot_id": int(snap_id or 0),
-                        "checkpoint_cst": checkpoint_cst,
-                        "source": "snapshot_scheduler",
-                        "source_kind": "environment_life_fragment",
-                        "memory_role": "recent_life_event_candidate",
-                        "life_scope": "character_life",
-                        "life_theme": environment_fragment.get("life_theme", "general"),
-                        "group_key": environment_fragment.get("group_key", "environment_life:general"),
-                        "open_loop": environment_fragment.get("open_loop", ""),
-                        "plan_effect": environment_fragment.get("plan_effect", "on_track"),
-                        "has_disturbance": bool(environment_fragment.get("has_disturbance")),
-                        "disturbance_excerpt": environment_fragment.get("disturbance_excerpt", ""),
-                        "recent_disturbances_excerpt": environment_fragment.get("recent_disturbances_excerpt", ""),
-                    },
+            try:
+                environment_fragment = self._build_environment_life_fragment(
+                    env,
+                    checkpoint_cst=checkpoint_cst,
+                    snapshot_id=int(snap_id or 0),
+                )
+                side_effects["build_environment_life_fragment"] = "ok"
+            except Exception as exc:
+                logger.warning(
+                    "post-snapshot side-effect build_environment_life_fragment failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+                msg = str(exc)
+                if len(msg) > 240:
+                    msg = msg[:240] + "…"
+                side_effects["build_environment_life_fragment"] = (
+                    f"failed:{type(exc).__name__}:{msg}"
+                )
+                environment_fragment = {}
+            environment_fragment_bucket_id = await self._run_side_effect(
+                "ob_hold_environment_life_fragment",
+                self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.ob_hold_environment_life_fragment",
+                    self._ob_hold_environment_life_fragment(
+                        title=f"{checkpoint_cst} 生活碎片",
+                        content=str(environment_fragment.get("content") or ""),
+                        tags=["environment_life_fragment", "character_life", trigger],
+                        importance=5,
+                        valence=0.5,
+                        arousal=0.36,
+                        created=snap.created_at,
+                        extra_metadata={
+                            "snapshot_id": int(snap_id or 0),
+                            "checkpoint_cst": checkpoint_cst,
+                            "source": "snapshot_scheduler",
+                            "source_kind": "environment_life_fragment",
+                            "memory_role": "recent_life_event_candidate",
+                            "life_scope": "character_life",
+                            "life_theme": environment_fragment.get("life_theme", "general"),
+                            "group_key": environment_fragment.get("group_key", "environment_life:general"),
+                            "open_loop": environment_fragment.get("open_loop", ""),
+                            "plan_effect": environment_fragment.get("plan_effect", "on_track"),
+                            "has_disturbance": bool(environment_fragment.get("has_disturbance")),
+                            "disturbance_excerpt": environment_fragment.get("disturbance_excerpt", ""),
+                            "recent_disturbances_excerpt": environment_fragment.get("recent_disturbances_excerpt", ""),
+                        },
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
+                    fragment_chars=len(str(environment_fragment.get("content") or "")),
                 ),
-                checkpoint_time_cst=checkpoint_cst,
-                fragment_chars=len(str(environment_fragment.get("content") or "")),
+                side_effects,
             )
-            environment_event_summary_bucket_id = await self._trace_await(
-                diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.ob_upsert_environment_event_summary",
-                self._ob_upsert_environment_event_summary(
-                    env=env,
-                    title="最新生活事件槽位",
-                    created=snap.created_at,
-                    extra_metadata={
-                        "snapshot_id": int(snap_id or 0),
-                        "checkpoint_cst": checkpoint_cst,
-                    },
+            environment_event_summary_bucket_id = await self._run_side_effect(
+                "ob_upsert_environment_event_summary",
+                self._trace_await(
+                    diagnostic,
+                    f"{trigger}.checkpoint_{checkpoint_index}.ob_upsert_environment_event_summary",
+                    self._ob_upsert_environment_event_summary(
+                        env=env,
+                        title="最新生活事件槽位",
+                        created=snap.created_at,
+                        extra_metadata={
+                            "snapshot_id": int(snap_id or 0),
+                            "checkpoint_cst": checkpoint_cst,
+                        },
+                    ),
+                    checkpoint_time_cst=checkpoint_cst,
                 ),
-                checkpoint_time_cst=checkpoint_cst,
+                side_effects,
             )
             environment_rollups = []
             if environment_fragment_bucket_id:
-                environment_rollups = await self._trace_await(
+                environment_rollups = await self._run_side_effect(
+                    "environment_life_rollup_scan",
+                    self._trace_await(
+                        diagnostic,
+                        f"{trigger}.checkpoint_{checkpoint_index}.environment_life_rollup_scan",
+                        self._process_pending_environment_life_rollups(
+                            group_key=str(environment_fragment.get("group_key") or ""),
+                            reason=f"{trigger}.checkpoint",
+                        ),
+                        checkpoint_time_cst=checkpoint_cst,
+                        source_bucket_id=environment_fragment_bucket_id,
+                    ),
+                    side_effects,
+                    default=[],
+                )
+            await self._run_side_effect(
+                "append_relationship_thought",
+                self._trace_await(
                     diagnostic,
-                    f"{trigger}.checkpoint_{checkpoint_index}.environment_life_rollup_scan",
-                    self._process_pending_environment_life_rollups(
-                        group_key=str(environment_fragment.get("group_key") or ""),
-                        reason=f"{trigger}.checkpoint",
+                    f"{trigger}.checkpoint_{checkpoint_index}.append_relationship_thought",
+                    self._append_relationship_thought_from_context(
+                        source_snapshot_id=int(snap_id or 0),
+                        source_env_id=f"{trigger}:{checkpoint_index}:{snap.type}",
+                        snapshot_text=current_content,
+                        environment_text=environment_text,
                     ),
                     checkpoint_time_cst=checkpoint_cst,
-                    source_bucket_id=environment_fragment_bucket_id,
-                )
-            await self._trace_await(
-                diagnostic,
-                f"{trigger}.checkpoint_{checkpoint_index}.append_relationship_thought",
-                self._append_relationship_thought_from_context(
-                    source_snapshot_id=int(snap_id or 0),
-                    source_env_id=f"{trigger}:{checkpoint_index}:{snap.type}",
-                    snapshot_text=current_content,
-                    environment_text=environment_text,
                 ),
-                checkpoint_time_cst=checkpoint_cst,
+                side_effects,
             )
             if disturbance_result.get("should_inject") and int(disturbance_result.get("disturbance_id") or 0) > 0:
-                await self.db.update_disturbance_pulse(
-                    int(disturbance_result.get("disturbance_id") or 0),
-                    linked_snapshot_id=int(snap_id),
+                await self._run_side_effect(
+                    "update_disturbance_pulse",
+                    self.db.update_disturbance_pulse(
+                        int(disturbance_result.get("disturbance_id") or 0),
+                        linked_snapshot_id=int(snap_id),
+                    ),
+                    side_effects,
                 )
             generated_snapshots.append(
                 {
@@ -6449,22 +6817,51 @@ class StateMachine:
 
             if env.get("stale"):
                 generated_snapshots[-1]["environment_stale"] = True
-                self._schedule_deferred_env_retry(
-                    snapshot_id=snap_id,
-                    event_id=None,
-                    checkpoint_time=checkpoint_time,
-                    previous_snapshot_content=prior_snapshot_content,
-                    previous_env=previous_env,
-                    checkpoint_events=[e.model_dump() for e in checkpoint_events],
-                    snapshot_type=snap.type,
-                    snapshot_created_at=snap.created_at,
-                )
+                try:
+                    self._schedule_deferred_env_retry(
+                        snapshot_id=snap_id,
+                        event_id=None,
+                        checkpoint_time=checkpoint_time,
+                        previous_snapshot_content=prior_snapshot_content,
+                        previous_env=previous_env,
+                        checkpoint_events=[e.model_dump() for e in checkpoint_events],
+                        snapshot_type=snap.type,
+                        snapshot_created_at=snap.created_at,
+                    )
+                    side_effects["schedule_deferred_env_retry"] = "ok"
+                except Exception as exc:
+                    logger.warning(
+                        "post-snapshot side-effect schedule_deferred_env_retry failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    msg = str(exc)
+                    if len(msg) > 240:
+                        msg = msg[:240] + "…"
+                    side_effects["schedule_deferred_env_retry"] = (
+                        f"failed:{type(exc).__name__}:{msg}"
+                    )
             if not defer_maintenance:
-                await self._trace_await(
-                    diagnostic,
-                    f"{trigger}.checkpoint_{checkpoint_index}.enforce_snapshot_limit",
-                    self._enforce_snapshot_limit(),
-                    checkpoint_time_cst=checkpoint_cst,
+                await self._run_side_effect(
+                    "enforce_snapshot_limit",
+                    self._trace_await(
+                        diagnostic,
+                        f"{trigger}.checkpoint_{checkpoint_index}.enforce_snapshot_limit",
+                        self._enforce_snapshot_limit(),
+                        checkpoint_time_cst=checkpoint_cst,
+                    ),
+                    side_effects,
+                )
+            # Persist per-effect outcomes for diagnostics. Failure of this DB
+            # write is itself a side effect — log & swallow.
+            try:
+                await self.db.update_snapshot_side_effects_status(
+                    int(snap_id or 0), side_effects
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist side_effects_status for snapshot %s.",
+                    snap_id,
                 )
             previous_env = env
 

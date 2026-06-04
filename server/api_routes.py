@@ -3381,3 +3381,118 @@ async def evolution_rescore(req: EvolutionRescoreRequest):
     if callable(sync_method):
         await sync_method()
     return result
+
+
+# ── C3 admin: scheduler health + resume ──────────────────────────────
+#
+# Surface the state that the C1 SchedulerCircuitBreaker tracks, the list
+# of in-flight B2 placeholders, and the time-since-last-snapshot — so an
+# admin notices a stuck/looping scheduler within minutes instead of after
+# 21 hours. /api/admin/* is gated by the existing admin-token middleware
+# in server/main.py. See docs/fix_plan_snapshot_loop.md C3.
+
+
+def _seconds_between_iso_z(earlier_iso: str | None, later_iso: str) -> float | None:
+    if not earlier_iso:
+        return None
+    from datetime import datetime as _dt
+
+    def _parse(s: str) -> _dt | None:
+        s = (s or "").strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1]
+        try:
+            return _dt.fromisoformat(s)
+        except ValueError:
+            return None
+
+    a = _parse(earlier_iso)
+    b = _parse(later_iso)
+    if a is None or b is None:
+        return None
+    return max(0.0, (b - a).total_seconds())
+
+
+def _breaker_health_snapshot(breaker, *, now_iso: str) -> dict:
+    snap = breaker.snapshot()
+    snap["age_since_last_success_s"] = _seconds_between_iso_z(
+        snap.get("last_success_at"), now_iso
+    )
+    snap["age_since_last_failure_s"] = _seconds_between_iso_z(
+        snap.get("last_failure_at"), now_iso
+    )
+    return snap
+
+
+@router.get("/admin/health")
+async def get_admin_health():
+    """Single health payload consumed by web/admin-health.html. Designed
+    to be pulled every ~10s; all queries are O(1) or O(20) so this is
+    cheap enough to poll."""
+    sm = _require_state_machine()
+    from datetime import datetime as _dt
+    from server.models import format_utc_instant_z
+
+    now_iso = format_utc_instant_z(_dt.utcnow())
+
+    schedulers: dict[str, dict] = {}
+    for attr in ("snapshot_scheduler_breaker", "life_scheduler_breaker"):
+        breaker = getattr(sm, attr, None)
+        if breaker is None:
+            continue
+        schedulers[breaker.name] = _breaker_health_snapshot(breaker, now_iso=now_iso)
+
+    try:
+        in_flight = await _db.list_in_flight_snapshots(limit=20)
+    except Exception:
+        logger.exception("admin/health: list_in_flight_snapshots failed")
+        in_flight = []
+
+    try:
+        last_snap_at = await _db.get_latest_snapshot_created_at()
+    except Exception:
+        logger.exception("admin/health: get_latest_snapshot_created_at failed")
+        last_snap_at = None
+
+    try:
+        last_reflect_at = await _db.get_latest_reflect_created_at()
+    except Exception:
+        logger.exception("admin/health: get_latest_reflect_created_at failed")
+        last_reflect_at = None
+
+    return {
+        "now": now_iso,
+        "schedulers": schedulers,
+        "in_flight_snapshots": in_flight,
+        "in_flight_count": len(in_flight),
+        "last_snapshot_at": last_snap_at,
+        "last_reflect_at": last_reflect_at,
+        "age_since_last_snapshot_s": _seconds_between_iso_z(last_snap_at, now_iso),
+        "age_since_last_reflect_s": _seconds_between_iso_z(last_reflect_at, now_iso),
+    }
+
+
+@router.post("/admin/scheduler/{name}/resume")
+async def resume_scheduler(name: str):
+    """One-click resume for a paused scheduler breaker. Idempotent — calling
+    it on a not-paused breaker is a no-op that returns was_paused=False."""
+    sm = _require_state_machine()
+    breaker_map = {
+        "snapshot_scheduler": getattr(sm, "snapshot_scheduler_breaker", None),
+        "life_scheduler": getattr(sm, "life_scheduler_breaker", None),
+    }
+    breaker = breaker_map.get(name)
+    if breaker is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown scheduler '{name}'. Valid: {sorted(breaker_map.keys())}",
+        )
+    was_paused = breaker.resume()
+    return {
+        "ok": True,
+        "name": name,
+        "was_paused": bool(was_paused),
+        "breaker": breaker.snapshot(),
+    }
