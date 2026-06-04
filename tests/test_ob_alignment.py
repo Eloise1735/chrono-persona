@@ -1611,3 +1611,169 @@ def test_special_decay_scores():
         assert both < resolved
 
     run(scenario())
+
+
+def test_dream_scope_default_excludes_character_life():
+    """dream(scope='relational') default — character_life dynamics must not surface."""
+
+    async def scenario():
+        client = await _client("dream_scope")
+        rel_id = await client.hold(
+            "relational dynamic event",
+            bucket_type="dynamic",
+            domain=["relationship"],
+            created="2026-01-01T00:00:00",
+        )
+        char_id = await client.hold(
+            "character life dynamic event",
+            bucket_type="dynamic",
+            domain=["character_life"],
+            tags=["environment_event_summary", "character_life"],
+            created="2026-01-02T00:00:00",
+        )
+
+        relational = await client.dream(limit=10)
+        ids_rel = {item["id"] for item in relational["items"]}
+        assert relational["scope"] == "relational"
+        assert rel_id in ids_rel
+        assert char_id not in ids_rel
+
+        character = await client.dream(limit=10, scope="character")
+        ids_char = {item["id"] for item in character["items"]}
+        assert character["scope"] == "character"
+        assert char_id in ids_char
+        assert rel_id not in ids_char
+
+        full = await client.dream(limit=10, scope="all")
+        ids_all = {item["id"] for item in full["items"]}
+        assert full["scope"] == "all"
+        assert {rel_id, char_id} <= ids_all
+
+    run(scenario())
+
+
+def test_feel_crystals_scope_isolates_relational_and_character():
+    """feel_crystals must cluster only within the requested scope."""
+
+    async def scenario():
+        client = await _client("feel_crystals_scope")
+        rel_ids = []
+        for idx in range(3):
+            rel_ids.append(await client.hold(
+                f"relational similar feel {idx}",
+                bucket_type="feel",
+                domain=["relationship"],
+                created=f"2026-01-0{idx + 1}T00:00:00",
+            ))
+        char_ids = []
+        for idx in range(3):
+            char_ids.append(await client.hold(
+                f"character similar feel {idx}",
+                bucket_type="feel",
+                domain=["character_life"],
+                created=f"2026-01-1{idx}T00:00:00",
+            ))
+
+        client.set_embedding_store(FakeEmbeddingStore({
+            rel_ids[0]: [1.0, 0.0, 0.0],
+            rel_ids[1]: [0.99, 0.01, 0.0],
+            rel_ids[2]: [0.98, 0.02, 0.0],
+            char_ids[0]: [0.0, 1.0, 0.0],
+            char_ids[1]: [0.0, 0.99, 0.01],
+            char_ids[2]: [0.0, 0.98, 0.02],
+        }))
+
+        relational = await client.feel_crystals(
+            limit=5, min_cluster_size=3, min_similarity=0.9,
+        )
+        assert relational["scope"] == "relational"
+        assert relational["total_clusters"] == 1
+        rel_cluster_ids = set(relational["clusters"][0]["feel_ids"])
+        assert rel_cluster_ids == set(rel_ids)
+
+        character = await client.feel_crystals(
+            limit=5, min_cluster_size=3, min_similarity=0.9, scope="character",
+        )
+        assert character["scope"] == "character"
+        assert character["total_clusters"] == 1
+        char_cluster_ids = set(character["clusters"][0]["feel_ids"])
+        assert char_cluster_ids == set(char_ids)
+
+        full = await client.feel_crystals(
+            limit=5, min_cluster_size=3, min_similarity=0.9, scope="all",
+        )
+        assert full["scope"] == "all"
+        assert full["total_clusters"] == 2
+
+    run(scenario())
+
+
+def test_crystallize_feel_cluster_lookup_respects_scope():
+    """crystallize_feel(cluster_id, include_all) must resolve cluster within scope."""
+
+    async def scenario():
+        client = await _client("crystallize_scope")
+        rel_ids = []
+        for idx in range(3):
+            rel_ids.append(await client.hold(
+                f"rel feel {idx}",
+                bucket_type="feel",
+                domain=["relationship"],
+                created=f"2026-01-0{idx + 1}T00:00:00",
+            ))
+        char_ids = []
+        for idx in range(3):
+            char_ids.append(await client.hold(
+                f"char feel {idx}",
+                bucket_type="feel",
+                domain=["character_life"],
+                created=f"2026-01-1{idx}T00:00:00",
+            ))
+        client.set_embedding_store(FakeEmbeddingStore({
+            rel_ids[0]: [1.0, 0.0, 0.0],
+            rel_ids[1]: [0.99, 0.01, 0.0],
+            rel_ids[2]: [0.98, 0.02, 0.0],
+            char_ids[0]: [0.0, 1.0, 0.0],
+            char_ids[1]: [0.0, 0.99, 0.01],
+            char_ids[2]: [0.0, 0.98, 0.02],
+        }))
+
+        relational = await client.feel_crystals(
+            limit=5, min_cluster_size=3, min_similarity=0.9,
+        )
+        rel_cluster_id = relational["clusters"][0]["cluster_id"]
+
+        # Wrong scope ("character") cannot find a relational-side cluster_id.
+        wrong = await client.crystallize_feel(
+            mode="feel",
+            feel_content="cross-scope condensed",
+            cluster_id=rel_cluster_id,
+            include_all=True,
+            scope="character",
+            min_cluster_size=3,
+            min_similarity=0.9,
+        )
+        assert wrong["marked_count"] == 0
+
+        # Correct relational scope resolves the cluster and marks all 3 sources.
+        good = await client.crystallize_feel(
+            mode="feel",
+            feel_content="relational condensed",
+            cluster_id=rel_cluster_id,
+            include_all=True,
+            scope="relational",
+            min_cluster_size=3,
+            min_similarity=0.9,
+        )
+        assert good["marked_count"] == 3
+        assert set(good["source_feel_ids"]) == set(rel_ids)
+        for source_id in good["source_feel_ids"]:
+            source = await client.get(source_id)
+            assert source.metadata["crystallized"] is True
+
+        # character_life feels remain untouched by the relational crystallization.
+        for cid in char_ids:
+            char_feel = await client.get(cid)
+            assert not char_feel.metadata.get("crystallized")
+
+    run(scenario())

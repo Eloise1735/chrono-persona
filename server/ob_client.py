@@ -762,18 +762,21 @@ class OBClient:
         await self.update(bucket.id, **updates)
         return bucket.id
 
-    async def dream(self, *, limit: int = 10) -> dict[str, Any]:
+    async def dream(self, *, limit: int = 10, scope: str = "relational") -> dict[str, Any]:
+        normalized_scope = self._normalize_scope(scope)
         buckets = await self.list_buckets(include_archive=False)
-        candidates = [bucket for bucket in buckets if self._is_dream_candidate(bucket)]
+        scoped_buckets = self._filter_by_scope(buckets, normalized_scope)
+        candidates = [bucket for bucket in scoped_buckets if self._is_dream_candidate(bucket)]
         candidates.sort(key=lambda b: str(b.metadata.get("created") or ""), reverse=True)
         recent = candidates[: max(1, min(30, int(limit or 10)))]
         connection_hint = await self._dream_connection_hint(recent)
-        crystal_hint = await self._dream_crystal_hint(buckets)
+        crystal_hint = await self._dream_crystal_hint(scoped_buckets, scope=normalized_scope)
         return {
             "text": self._dream_text(recent, connection_hint=connection_hint, crystal_hint=crystal_hint),
             "items": self.format_buckets(recent),
             "connection_hint": connection_hint,
             "crystal_hint": crystal_hint,
+            "scope": normalized_scope,
         }
 
     async def feel_crystals(
@@ -785,16 +788,19 @@ class OBClient:
         min_similarity: float = 0.7,
         cursor: str = "",
         include_crystallized: bool = False,
+        scope: str = "relational",
     ) -> dict[str, Any]:
         limit = max(1, min(20, int(limit or 3)))
         max_items = max(1, min(20, int(max_items_per_cluster or 5)))
         min_size = max(2, min(20, int(min_cluster_size or 3)))
         threshold = max(0.0, min(1.0, float(min_similarity or 0.7)))
+        normalized_scope = self._normalize_scope(scope)
         offset = self._cursor_offset(cursor)
         clusters = await self._feel_clusters(
             min_cluster_size=min_size,
             min_similarity=threshold,
             include_crystallized=include_crystallized,
+            scope=normalized_scope,
         )
         page = clusters[offset : offset + limit]
         formatted = [
@@ -812,6 +818,7 @@ class OBClient:
             "min_cluster_size": min_size,
             "min_similarity": threshold,
             "include_crystallized": bool(include_crystallized),
+            "scope": normalized_scope,
             "cursor": str(offset) if offset else "",
             "cursor_snapshot": str(offset) if offset else "",
             "next_cursor": str(next_offset) if has_more else "",
@@ -839,16 +846,19 @@ class OBClient:
         extra_targets: list[str] | None = None,
         min_cluster_size: int = 3,
         min_similarity: float = 0.7,
+        scope: str = "relational",
     ) -> dict[str, Any]:
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode not in {"principle", "thread", "both", "feel"}:
             raise ValueError("mode must be principle, thread, both, or feel")
+        normalized_scope = self._normalize_scope(scope)
         source_ids = [self._safe_id(item) for item in (feel_ids or []) if str(item or "").strip()]
         if cluster_id and include_all:
             cluster = await self._get_feel_cluster_by_id(
                 cluster_id,
                 min_cluster_size=min_cluster_size,
                 min_similarity=min_similarity,
+                scope=normalized_scope,
             )
             if cluster:
                 source_ids = list(cluster["ids"])
@@ -1371,7 +1381,7 @@ class OBClient:
             logger.exception("OB dream connection hint failed")
             return ""
 
-    async def _dream_crystal_hint(self, buckets: list[OBBucket]) -> str:
+    async def _dream_crystal_hint(self, buckets: list[OBBucket], *, scope: str = "relational") -> str:
         if self.embedding_store is None:
             return ""
         feels = [
@@ -1379,6 +1389,7 @@ class OBClient:
             if self._bucket_type(bucket.metadata) == "feel"
             and not bucket.metadata.get("pinned")
         ]
+        feels = self._filter_by_scope(feels, scope)
         if len(feels) < 3:
             return ""
         try:
@@ -1410,6 +1421,7 @@ class OBClient:
         min_cluster_size: int,
         min_similarity: float,
         include_crystallized: bool = False,
+        scope: str = "relational",
     ) -> list[dict[str, Any]]:
         if self.embedding_store is None:
             return []
@@ -1418,6 +1430,7 @@ class OBClient:
             if self._bucket_type(bucket.metadata) == "feel"
             and (include_crystallized or not bucket.metadata.get("crystallized"))
         ]
+        feels = self._filter_by_scope(feels, scope)
         embeddings = {bucket.id: self.embedding_store.get(bucket.id) for bucket in feels}
         embeddings = {bid: emb for bid, emb in embeddings.items() if emb}
         by_id = {bucket.id: bucket for bucket in feels if bucket.id in embeddings}
@@ -1474,11 +1487,13 @@ class OBClient:
         min_cluster_size: int,
         min_similarity: float,
         include_crystallized: bool = False,
+        scope: str = "relational",
     ) -> dict[str, Any] | None:
         for cluster in await self._feel_clusters(
             min_cluster_size=min_cluster_size,
             min_similarity=min_similarity,
             include_crystallized=include_crystallized,
+            scope=scope,
         ):
             if cluster.get("id") == cluster_id:
                 return cluster
@@ -1780,6 +1795,30 @@ class OBClient:
     def _is_character_life_bucket(self, bucket: OBBucket) -> bool:
         meta_domains = {str(d).strip().lower() for d in bucket.metadata.get("domain", []) if str(d).strip()}
         return "character_life" in meta_domains
+
+    def _normalize_scope(self, scope: str | None) -> str:
+        """Normalize scope into one of {relational, character, all}; default relational.
+
+        relational — 仅关系侧（排除 character_life buckets）
+        character  — 仅角色侧（只 character_life buckets）
+        all        — 全量（旧行为，兜底）
+        """
+        value = str(scope or "").strip().lower()
+        if value in {"relational", "character", "all"}:
+            return value
+        return "relational"
+
+    def _filter_by_scope(self, buckets: list[OBBucket], scope: str) -> list[OBBucket]:
+        """Filter a bucket list by relational / character / all scope.
+
+        Centralized so dream / feel_crystals / crystallize_feel all behave consistently.
+        """
+        normalized = self._normalize_scope(scope)
+        if normalized == "all":
+            return list(buckets)
+        if normalized == "character":
+            return [b for b in buckets if self._is_character_life_bucket(b)]
+        return [b for b in buckets if not self._is_character_life_bucket(b)]
 
     @staticmethod
     def _sanitize_filename(value: str) -> str:
