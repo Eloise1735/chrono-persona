@@ -117,6 +117,25 @@ _PLAN_ITEM_FIELDS = {
     "executed_at",
 }
 
+# Structured fields that live *inside* action_payload but which the read side
+# (e.g. PlanEngine.get_today_replanned_items_summary, injected into
+# breath_personal) flattens to the top level of each item dict. To keep the
+# read and write schemas symmetric, the write side accepts these aliases at the
+# top level too and folds them back into action_payload. Maps top-level alias →
+# action_payload key.
+_PLAN_STRUCTURED_PAYLOAD_FIELDS = {
+    "objective": "intended_objective",
+    "intended_objective": "intended_objective",
+    "thread_id": "thread_id",
+    "current_step": "current_step",
+    "expected_steps": "expected_steps",
+    "progress_status": "progress_status",
+    "closure_condition": "closure_condition",
+    "progress_outline": "progress_outline",
+    "replaces": "replan_replaces",
+    "replan_replaces": "replan_replaces",
+}
+
 
 def _schedule_error(message: str) -> str:
     return json.dumps({"ok": False, "error": message}, ensure_ascii=False, indent=2)
@@ -223,7 +242,8 @@ def _validate_schedule_range(hour_start: int, hour_end: int) -> None:
 def _normalize_schedule_patch(patch: dict, *, existing: PlanItem | None = None) -> dict:
     if not isinstance(patch, dict):
         raise ValueError("payload_json 必须是 JSON object")
-    unknown = sorted(set(patch) - _PLAN_ITEM_FIELDS)
+    allowed = _PLAN_ITEM_FIELDS | set(_PLAN_STRUCTURED_PAYLOAD_FIELDS)
+    unknown = sorted(set(patch) - allowed)
     if unknown:
         raise ValueError(f"不支持的字段：{', '.join(unknown)}")
     fields = {}
@@ -241,12 +261,28 @@ def _normalize_schedule_patch(patch: dict, *, existing: PlanItem | None = None) 
         if action_type not in _PLAN_ACTION_TYPES:
             raise ValueError("action_type 只能是 internal / web_search / npc_interaction")
         fields["action_type"] = action_type
+    # action_payload may be supplied as a nested object and/or via flat
+    # structured aliases (objective/thread_id/current_step/expected_steps/…)
+    # that the read side flattens to the top level. Fold both into one payload.
+    structured_overlay: dict = {}
+    for alias, payload_key in _PLAN_STRUCTURED_PAYLOAD_FIELDS.items():
+        if alias in patch:
+            structured_overlay[payload_key] = patch.get(alias)
     if "action_payload" in patch:
         payload = patch.get("action_payload")
         if payload is None:
             payload = {}
         if not isinstance(payload, dict):
             raise ValueError("action_payload 必须是 JSON object")
+    elif structured_overlay:
+        # Partial structured update on an existing item: merge into its current
+        # payload so unrelated keys aren't wiped. New items start from empty.
+        payload = _parse_plan_item_payload(existing.action_payload) if existing is not None else {}
+    else:
+        payload = None  # neither given → leave action_payload untouched
+    if payload is not None:
+        if structured_overlay:
+            payload = {**payload, **structured_overlay}
         fields["action_payload"] = json.dumps(_sanitize_schedule_payload(payload), ensure_ascii=False)
     if "status" in patch:
         status = str(patch.get("status") or "").strip()
@@ -336,7 +372,33 @@ async def _schedule_items_response(plan) -> tuple[dict | None, list[dict]]:
             payload["_fallback_reason"] = "current_plan_has_no_items_walked_replan_parent_chain"
             return payload, [_schedule_item_dict(item) for item in parent_items]
         cursor = parent_plan
-    # 链上全空 → 返回原始空 plan + 明确标记
+    # replan 父链全空（或根本没有父链——新生成的空日计划就没有 replan_parent_id，
+    # 单靠父链永远够不到昨天的计划）→ 再按日期回退：找最近一个有 items 的旧计划。
+    from datetime import datetime as _dt, timedelta as _td
+
+    plan_date = str(getattr(plan, "plan_date", "") or "").strip()
+    if plan_date:
+        try:
+            cur_date = _dt.fromisoformat(plan_date).date()
+        except ValueError:
+            cur_date = None
+        if cur_date is not None:
+            for back in range(1, 15):  # 回看最多 14 天
+                d = (cur_date - _td(days=back)).isoformat()
+                prior = await _state_machine.db.get_latest_daily_plan_for_date(d, status=None)
+                if prior is None or prior.id is None or int(prior.id) in visited:
+                    continue
+                if _plan_engine is not None:
+                    prior_items = await _plan_engine.get_effective_plan_items(prior)
+                else:
+                    prior_items = await _state_machine.db.list_plan_items(int(prior.id))
+                if prior_items:
+                    payload = prior.model_dump()
+                    payload["_fallback_from_plan_id"] = int(plan.id)
+                    payload["_fallback_reason"] = "current_plan_empty_fell_back_to_recent_dated_plan"
+                    payload["_fallback_from_plan_date"] = d
+                    return payload, [_schedule_item_dict(item) for item in prior_items]
+    # 父链与近 14 天均无可用计划项 → 返回原始空 plan + 明确标记
     payload = plan.model_dump()
     payload["_fallback_attempted"] = True
     payload["_fallback_reason"] = "no_ancestor_plan_with_items_found"
@@ -494,6 +556,14 @@ async def schedule_bundle(
       - edit_item: payload_json 为 patch object，直接更新 item_id 对应计划项。
       - replace_items: payload_json 为 items 数组或 {"items":[...]}，替换 plan_id 下全部计划项。
 
+    计划项字段：hour_start、hour_end、activity、action_type、action_payload、status、
+    outcome、source_kind、source_ref_id、executed_at。其中结构化推进字段
+    （objective/intended_objective、thread_id、current_step、expected_steps、
+    progress_status、closure_condition、progress_outline、replaces/replan_replaces）
+    既可嵌在 action_payload 里，也可直接放在条目顶层——与 breath_personal 读出的
+    扁平 shape 对称，顶层写入会自动折叠进 action_payload（edit_item 时与现有
+    payload 合并，不会清空其他键）。
+
     这是直接同步后台数据库的工具，不调用 LLM，不做角色判断式改写。
     """
     if _state_machine is None:
@@ -604,14 +674,19 @@ async def schedule_bundle(
 
 @mcp.tool()
 async def reflect_on_conversation(conversation_summary: str) -> str:
-    """对话结束时调用。基于对话内容生成新的对话结束状态快照。
+    """对话结束时调用。上传由你（前端模型）已生成好的「对话结束状态快照」最终正文。
+
+    后台不再二次调用 LLM 生成快照——你已直接读取完整上下文，请自行写好凯尔希的
+    第一人称记忆独白作为最终正文传入。后台只负责落库 + 向量化，因此上游 LLM 抖动
+    不会再影响本步骤。
 
     Args:
-        conversation_summary: 本次对话的摘要内容
+        conversation_summary: 已写好的对话结束快照「最终正文」（第一人称记忆独白），
+            而非待加工的摘要。后台原样存档，不再改写。
 
     Returns:
-        凯尔希的第一人称记忆独白，反映对话对她的影响。
-        注意：本工具不再自动生成事件；若对话中出现值得保留的叙事记忆，请显式调用 OB hold / hold_feel / grow。
+        实际落库的快照正文（通常即你传入的内容；命中重复上传则返回已存档内容）。
+        注意：本工具不自动生成事件；若对话中出现值得保留的叙事记忆，请显式调用 OB hold / hold_feel / grow。
     """
     if _state_machine is None:
         return "错误：状态机未初始化"
@@ -800,6 +875,81 @@ async def pulse(include_archive: bool = False) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+async def _hold_with_merge_flow(
+    content: str,
+    *,
+    bucket_type: str,
+    domain,
+    tags,
+    importance: int,
+    valence: float,
+    arousal: float,
+    name: str,
+    pinned: bool,
+    resolved: bool,
+    extra_metadata: dict | None,
+    merge_into: str,
+    force_new: bool,
+) -> tuple[dict, str | None]:
+    """Shared two-phase hold logic for hold() / hold_feel().
+
+    Returns (result_dict, persisted_bucket_id). persisted_bucket_id is None when
+    the call returns a pending-merge-decision (nothing written yet).
+
+    Flow:
+      1) merge_into set  → merge this content into that existing bucket.
+      2) otherwise, if a recent similar bucket exists (and not pinned/force_new)
+         → DON'T write; return candidates so the model decides.
+      3) else → write a new bucket.
+    """
+    content = str(content or "").strip()
+    if not content:
+        return {"error": "content 不能为空"}, None
+    norm_type = "permanent" if pinned else str(bucket_type or "dynamic").strip().lower()
+
+    if str(merge_into or "").strip():
+        res = await _ob_client.merge_content_into(
+            str(merge_into).strip(),
+            content,
+            bucket_type=norm_type,
+            importance=importance,
+            valence=valence,
+            arousal=arousal,
+        )
+        if not res.get("ok"):
+            return res, None
+        return {"bucket_id": res["target_id"], "merged_into": res["target_id"]}, res["target_id"]
+
+    if (not pinned) and (not force_new) and norm_type in {"dynamic", "feel"}:
+        candidates = await _ob_client.find_merge_candidates(content, bucket_type=norm_type)
+        if candidates:
+            return {
+                "status": "pending_merge_decision",
+                "merge_candidates": candidates,
+                "hint": (
+                    "发现近期相似 bucket，本次内容尚未写入。请判断：若与某条确为同一件事/"
+                    "同一种感受，再次调用本工具并传 merge_into=<候选id> 把它并进去；若其实是"
+                    "不同的具体事件或不可还原的 moment（哪怕措辞相近），再次调用并传 "
+                    "force_new=true 新建。宁可新建，也不要把不同的事压成一个。"
+                ),
+            }, None
+
+    bucket_id = await _ob_client.hold(
+        content,
+        domain=domain,
+        tags=tags,
+        importance=importance,
+        valence=valence,
+        arousal=arousal,
+        bucket_type=bucket_type,
+        name=name or None,
+        pinned=pinned,
+        resolved=resolved,
+        extra_metadata=extra_metadata,
+    )
+    return {"bucket_id": bucket_id}, bucket_id
+
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -812,23 +962,36 @@ async def hold(
     name: str = "",
     pinned: bool = False,
     resolved: bool = False,
+    merge_into: str = "",
+    force_new: bool = False,
 ) -> str:
-    """OB 写入：把值得留下的互动、事实、生活片段写成一个记忆 bucket。"""
+    """OB 写入：把值得留下的互动、事实、生活片段写成一个记忆 bucket。
+
+    去重内生于写入：正常调用 hold(content=...) 即可。若近 14 天内已有高度相似的同类
+    bucket，本工具**不会立刻写入**，而是返回 status="pending_merge_decision" 和
+    merge_candidates 候选清单，等你判断：
+      - 确为同一件事 → 再次调用 hold(content=..., merge_into="候选id")，把这条并进去；
+      - 确为不同的新事（哪怕措辞相近）→ 再次调用 hold(content=..., force_new=true) 新建。
+    没有相似候选时直接写入并返回 bucket_id。pinned 写入不触发去重。
+    """
     if _ob_client is None:
         return _ob_unavailable()
-    bucket_id = await _ob_client.hold(
+    result, _ = await _hold_with_merge_flow(
         content,
+        bucket_type=bucket_type,
         domain=domain,
         tags=tags,
         importance=importance,
         valence=valence,
         arousal=arousal,
-        bucket_type=bucket_type,
-        name=name or None,
+        name=name,
         pinned=pinned,
         resolved=resolved,
+        extra_metadata=None,
+        merge_into=merge_into,
+        force_new=force_new,
     )
-    return json.dumps({"bucket_id": bucket_id}, ensure_ascii=False, indent=2)
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -839,22 +1002,34 @@ async def hold_feel(
     arousal: float = 0.3,
     tags: list[str] | None = None,
     name: str = "",
+    merge_into: str = "",
+    force_new: bool = False,
 ) -> str:
-    """OB 感受沉淀：记录凯尔希对一段互动或生活片段的第一人称余波。"""
+    """OB 感受沉淀：记录凯尔希对一段互动或生活片段的第一人称余波。
+
+    与 hold 相同的两段式去重：正常调用即可。若近 14 天内有相似 feel，会先返回
+    pending_merge_decision + 候选，等你判断——确为同一种感受才传 merge_into 并入；
+    锚定不同 dynamic 的不同 moment 则传 force_new=true 新建，别把不可还原的具体感受
+    压成泛泛之谈。source_bucket 的 digested 标记只在内容真正落库（新建或并入）后才写。
+    """
     if _ob_client is None:
         return _ob_unavailable()
-    bucket_id = await _ob_client.hold(
+    result, persisted = await _hold_with_merge_flow(
         content,
+        bucket_type="feel",
         domain=[],
         tags=tags,
         importance=6,
         valence=valence,
         arousal=arousal,
-        bucket_type="feel",
-        name=name or None,
+        name=name,
+        pinned=False,
+        resolved=False,
         extra_metadata={"source_bucket": source_bucket} if source_bucket else None,
+        merge_into=merge_into,
+        force_new=force_new,
     )
-    if source_bucket:
+    if persisted and source_bucket:
         await _ob_client.update(
             source_bucket,
             digested=True,
@@ -862,7 +1037,7 @@ async def hold_feel(
             model_valence=valence,
             model_arousal=arousal,
         )
-    return json.dumps({"bucket_id": bucket_id}, ensure_ascii=False, indent=2)
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -1031,26 +1206,22 @@ async def resolve_bucket(bucket_id: str, reason: str = "") -> str:
 
 
 @mcp.tool()
-async def grow(
-    content: str,
-    query: str = "",
-    domain: str = "",
-    importance: int = 5,
-    valence: float = -1,
-    arousal: float = -1,
-) -> str:
-    """OB 生长：找到最接近的 bucket 并追加沉淀；找不到时新建。"""
+async def merge_buckets(source_id: str, target_id: str, reason: str = "") -> str:
+    """OB 合并：把 source bucket 并入 target bucket，然后删除 source。
+
+    用于你在 hold/hold_feel 返回的 merge_candidates 里确认"这两条确实是同一件事/同一种
+    感受"之后，主动把新写入的那条（source_id）并进既有的那条（target_id）。合并会追加
+    内容、取较高 importance、平均情感，并刷新 target 的活跃时间。
+
+    后台只做你指定的这一次合并，绝不自动并；两条类型必须一致，target 不能是
+    pinned/protected/permanent。判断不准就不要合并——保留两条独立永远比误并安全。
+    """
     if _ob_client is None:
         return _ob_unavailable()
-    bucket_id = await _ob_client.grow(
-        content,
-        query=query,
-        domain=domain or None,
-        importance=importance,
-        valence=valence if 0 <= float(valence) <= 1 else None,
-        arousal=arousal if 0 <= float(arousal) <= 1 else None,
-    )
-    return json.dumps({"bucket_id": bucket_id}, ensure_ascii=False, indent=2)
+    result = await _ob_client.merge_buckets(source_id, target_id)
+    if reason and result.get("ok"):
+        result["reason"] = reason
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
