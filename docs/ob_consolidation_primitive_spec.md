@@ -1,0 +1,221 @@
+# OB 记忆：统一整合原语 + 稳定层模型（规格 v2）
+
+> Status: **Phase 0 — 设计定稿（蓝图）**。本文件是后续 Phase 1–3 的实现依据。
+> 不含可执行代码；定义字段语义、不变量、交互协议与每层参数。
+>
+> 已完成前置（PR #3，已合并）：
+> - OB 写入去重改为**模型 gated 两段式**（`hold` pending → `merge_into`/`force_new` + `merge_buckets`）。
+> - **feel aging**：feel 不再恒 50，温和衰减并可被后台归档。
+> - 删除冗余的 `grow` MCP 工具（人工 web 面板 `/api/ob/grow` 保留）。
+
+---
+
+## 1. 背景与问题（简述）
+
+OB 的结构病：**写入无界、浮现有界、整合靠模型自觉（失灵）、recall 很少用** → 记忆沦为只写不读的沉积。
+- 衰减其实温柔（dynamic 半衰期 ~2 周）；"断崖"是类型台阶（permanent 999 / feel 50 / dynamic 个位数）。
+- `crystallize_feel` 只喂模型 5 条样本却把整簇标 `crystallized` 隐藏 → 抹掉不可还原的 moment。
+- `permanent` 层把多条正交的轴压成一团：`pinned`/`protected`/`type=permanent`/`domain` 语义重叠，无退役机制，注入纯按新近会挤掉基础原则。
+
+Layer 1（写入去重 + feel aging）已堵住下层积压。本规格解决**上层**：整合（feel → 稳定层）与稳定层自身的取舍，以及 `permanent` 的重新定位。
+
+---
+
+## 2. 二维模型（type × role）
+
+稳定层的混乱来自用 `pinned`/`protected`/`domain` 去近似多条独立属性。正解是把它们拆成两条正交轴。
+
+### 2.1 轴一 `type`：会遗忘 vs 豁免遗忘
+
+- `dynamic` / `feel`：**会遗忘**。相关性随时间衰减 → 最终归档（`archive` 改 `type=archived`、移入 archive 目录、退出 `list_buckets(include_archive=False)` 的全部活跃浮现/recall 路径）。文件与 embedding 不删，可 `restore`——是"冷存储/可被重新唤起的淡出"，不是删除。
+- `permanent`：**豁免遗忘**。相关性与时间无关 → 永不衰减、永不归档、永在活跃检索池。
+
+> **permanent 的本质不是"更珍贵的 dynamic"，而是"被判定为不随时间失效、因而豁免遗忘"。**
+
+### 2.2 轴二 `role`：主动注入 vs 仅检索
+
+`permanent` 内部**只用 `role` 这一个轴**再分类（不再用 pinned/protected/domain 表达行为）：
+
+| role | 内容 | 形态 | 注入策略 | 退役 |
+|---|---|---|---|---|
+| `evolving_principle` | 关系整体感受 / 当前相处模式 | feel 聚合 | get_current_state，**新近 N=5** | 被新结晶顶出窗 → **自动转 `anchor`**（保留可 recall） |
+| `standing_invariant` | 边界、稳定偏好、重大共识 | 准则/约定 | get_current_state，**始终注入、与年龄无关**（量少，全量） | 仅显式废止 |
+| `anchor` | 原汁原味的珍贵关键事件 | 原始 episodic | **不自动注入**；recall + 偶发 echo | 不退役、永不占注入 |
+
+要点：
+- `evolving_principle` 按新近合理——关系在演化，最新结晶最能代表"现在的关系"。
+- `standing_invariant` 与年龄无关——两年前定的边界/偏好也必须每次注入。这是与 evolving 的关键区别。
+- `anchor` = 被"豁免遗忘"的原始事件：从 dynamic 的衰减轨道里拎出、钉进永不淡出的池，但不重要到要每次注入。
+
+### 2.3 字段定义
+
+- 在 permanent bucket 的 metadata 增加 `role ∈ {evolving_principle, standing_invariant, anchor}`。
+- `role` 是 permanent 内部行为的**唯一**决定项：驱动注入与浮现。
+
+### 2.4 Legacy 兼容（pinned/protected 保留）
+
+`pinned`/`protected`/`domain` **保留**，不删除。未显式标注 `role` 的现存 permanent 走**回退推断**，保证迁移期不破坏行为：
+
+| 现存条件（无 `role`） | 回退视作 | 理由 |
+|---|---|---|
+| `pinned` 或 `protected` 为真 | `evolving_principle` | 接近当前"注入最近 5 条 pinned 原则"的行为 |
+| 既非 pinned 也非 protected 的 permanent | `anchor`（仅 recall） | 修复"非 pinned 高分却冒上来"的意外浮现 |
+
+- 一旦该 bucket 被**手动**赋了 `role`，回退推断不再生效，以显式 `role` 为准。
+- 迁移由用户在 **web 前端手动逐条标注**（不做自动迁移脚本）。Phase 1 需在 web 面板提供设置 `role` 的控件。
+
+---
+
+## 3. 不变量（所有接入层共享）
+
+- **I1 加法自动、有损 gated**：生成聚合是加法、可自动提示产出；任何隐藏/合并/退役/降权必须模型**显式点名**。
+- **I2 永不销毁、永远可 recall**：被聚合的源永远保留；最多降权或退出注入，绝不 `delete`。
+- **I3 模型判语义、后台做账**：keep/merge/retire 由模型基于**全文**判断；后台只供干净信号 + 机械应用。
+- **I4 分类信号年龄无关**：用 `arousal` / `importance` / `uniqueness`（到簇心距离），**不用**被时间污染的复合衰减分。
+- **I5 约束注入、不约束存储**：存储便宜、注入稀缺。无硬性条数上限；用 role + 注入窗控制进上下文的量。
+- **I6 自动度随层升高而降低**：feel 层可自动提示聚类；稳定层（principle）**manual-first**，原语是评审助手不是 autopilot。
+
+---
+
+## 4. 统一整合原语（Consolidation Primitive）
+
+### 4.1 概念
+
+一个层无关的"**聚类 → 迭代评审-综合 → keep/demote → 保留锚点**"操作。差异只在**内容**与**注入位置**。参数化用于两处应用（§5）。
+
+### 4.2 交互协议：迭代游标式（核心，所有应用共享）
+
+```
+review(job_id, cursor="")
+  → { items:[本批全文条目 + signals], size, cursor, next_cursor, has_more }
+
+commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
+  → 幂等 upsert 聚合体（用最新 synthesis 覆盖）；返回下一批；随时可停、部分结果即有效
+```
+
+- 每批限 **6 条全文**（保证综合质量靠分批全文阅读，不靠截断摘要）。
+- 批内排序：**uniqueness 降序**（先看最独特的离群项，模式骨架早定）。
+- **`demote_ids` 默认空 = 不隐藏任何东西**（纯加法）。
+- 模型在自己上下文里携带并逐轮精修 `synthesis`/`keep`/`demote`；后台无状态（状态在聚合体 + cursor）。
+- 预算友好：读两三批即可停，未读条目仍作为锚点保留、可 recall。
+
+### 4.3 数据形态
+
+**review packet item**
+```json
+{
+  "id": "f_ab12",
+  "full_text": "……该 feel 的完整正文……",
+  "arousal": 0.8, "importance": 7, "uniqueness": 0.91,
+  "source_dynamic": "d_77", "created": "..."
+}
+```
+
+**聚合体（crystal）bucket metadata（principle）**
+```json
+{
+  "type": "permanent",
+  "role": "evolving_principle",
+  "crystal_id": "c_55",
+  "principle_pattern": "模型写的那段综合",
+  "anchor_refs": [ {"id":"f_ab12","source_dynamic":"d_77","snippet":"一行短句"}, ... ],   // 全簇，含未读条目
+  "source_ids": ["f_ab12", ...],
+  "importance": 8
+}
+```
+- `anchor_refs` 覆盖**整簇**（不只是模型读过的批），作为保留指针 → I2。源 feel 本体不删。
+
+### 4.4 信号（年龄无关，后台预算）
+
+- `arousal` / `importance`：写入时的静态属性。
+- `uniqueness`：到簇心的距离（embedding 开时用向量；关时退化为文本新颖度，需标注）。
+- **不**把复合衰减分喂给分类——它被年龄污染（旧的鲜活 moment 分数天然低）。
+
+### 4.5 keep / demote 语义 + 晋升去向
+
+- **keep_ids**：受保护、不被降权的项。其中：
+  - 不可还原的 **moment** → 模型可将其**提升为 `anchor`**（占永不淡出池、仅 recall）。
+  - 形成持续约束的**共识** → 提升为 `standing_invariant`（始终注入）。
+- **demote_ids**（默认空）：冗余项退出自动浮现（仍可 recall），**绝不删除**。
+
+---
+
+## 5. 每应用参数表
+
+### 5.1 `feel → principle`
+| 维度 | 取值 |
+|---|---|
+| 触发 | dream 末尾轻提示（"有 N 簇成熟可结晶"），模型主动 |
+| 源 | feel 相似簇 |
+| 综合产物 | 一条 `evolving_principle` |
+| keep 去向 | moment→`anchor`、共识→`standing_invariant` |
+| demote 去向 | 冗余 feel 退出浮现（可 recall） |
+| 自动度 | 加法可自动提示；有损 gated |
+
+### 5.2 `principle-review`（稳定层评审）
+| 维度 | 取值 |
+|---|---|
+| 触发 | **dream 里检测到 principle 重叠时轻提示**（非硬上限触发） |
+| 源 | principle 重叠/相似簇 |
+| 综合产物 | 合并后的 principle |
+| keep 去向 | 保留更基础的原则 |
+| demote 去向 | 过时/被取代的 principle → `type=archived`（可 recall） |
+| 自动度 | **全程 gated、manual-first** |
+
+### 5.3 明确排除
+- `key_record`：保持**手动 + 新近注入**（与阶段性生活计划逻辑一致），**不接入**本原语；其 `update_if_exists` 自动去重**暂不改**。
+- `dynamic`：现有 dedup/decay/resolve/archive 流程**不重写**，仅概念映射（`resolve` ≈ demote；旧 `grow` ≈ 本原语退化的单条即时版）。
+
+---
+
+## 6. 注入策略（参数，非原语核心）
+
+| 来源 | 选择规则 |
+|---|---|
+| `evolving_principle` | 新近 N=5（保持现状） |
+| `standing_invariant` | 始终全量注入（量少） |
+| `anchor` | 不自动注入；recall + 偶发 echo |
+| `key_record` | 新近（不变） |
+
+原则：**约束注入窗，不约束底层存储条数**（I5）。permanent 长到几十上百也无妨，只要注入受 role + 窗控制。
+
+---
+
+## 7. 迁移（手动、web 驱动）
+
+- 现存 ~34 条 permanent 由用户在 **web 前端逐条手动标注 `role`**。
+- 未标注者走 §2.4 回退推断，行为不破。
+- Phase 1 交付物之一：web 面板增加 `role` 设置控件。
+
+---
+
+## 8. 已定决策（基线，实现以此为准）
+
+| # | 决策 |
+|---|---|
+| 1 | 二维模型（type=遗忘/豁免 × role=注入/检索）；permanent 内部仅用 `role` 分类 |
+| 2 | `pinned`/`protected` **保留兼容**，未标注 permanent 走回退推断 |
+| 3 | `standing_invariant` 全量始终注入 |
+| 4 | `evolving_principle` 新近 N=5 |
+| 5 | `evolving_principle` 顶出窗 → 自动转 `anchor` |
+| 6 | keep 去向：moment→anchor、共识→standing_invariant |
+| 7 | `principle-review` 触发 = dream 重叠轻提示 |
+| 8 | 批大小 6、批内 uniqueness 降序、`demote` 默认空 |
+| 9 | migration 手动（web 操作） |
+
+---
+
+## 9. 推迟到 Phase 4+（不在本规格实现范围）
+
+- `resolve` 软化（回归衰减而非硬删）+ dream 护栏。
+- 读取侧：activation^0.3 反馈阻尼、"旧回声"槽、高阈值环境式 recall。
+- 横切一致性：归档项 embedding 仍在向量库 → 将来纯语义 recall 要显式排除 archived；`key_record` 的 `update_if_exists` 与"模型 gated"哲学对齐。
+
+---
+
+## 10. 实现阶段（落地顺序）
+
+1. **Phase 1 — permanent 重定义**：引入 `role` 字段 + 回退推断 + 按 role 的注入/浮现分流 + web 面板 role 控件。修复"非 pinned 高分浮现""基础原则被挤出"等线上问题。
+2. **Phase 2 — 原语 on `feel → principle`**：迭代游标工具 + 锚点存储 + keep 晋升（anchor/standing）+ dream 轻提示。先验证原语。
+3. **Phase 3 — 同一原语 on `principle-review`**：合并/退役，全程 gated。必须 Phase 2 跑通后。
+4. **Phase 4 — resolve + 读取侧**（见 §9）。
