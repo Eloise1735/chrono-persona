@@ -12,7 +12,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from server.database import Database
-from server.llm_client import LLMClient
+from server.llm_client import (
+    LLMClient,
+    LLMTimeoutError,
+    LLMTransportError,
+    LLMUpstreamHTTPError,
+)
 from server.models import (
     CharacterNotification,
     DailyPlan,
@@ -47,6 +52,33 @@ from server.time_display import DISPLAY_TZ, shanghai_now
 from server.web_search import WebSearchClient
 
 logger = logging.getLogger(__name__)
+
+
+class PlanGenerationEmptyError(RuntimeError):
+    """Raised when daily plan generation yields no usable plan items.
+
+    The LLM either failed (e.g. upstream 502 returning an empty body) or
+    returned content we couldn't parse into items. We raise instead of
+    persisting a status='active' plan with an empty raw_plan / zero items,
+    because such an empty placeholder makes ensure_today_plan() see an
+    existing active plan and never retry for the rest of the day.
+    """
+
+    def __init__(self, plan_date: str):
+        super().__init__(f"daily plan generation produced no items for {plan_date}")
+        self.plan_date = plan_date
+
+
+# Upstream-LLM / generation failures that should NOT pause the life scheduler
+# loop or block same-day retry — they are transient and self-heal once the
+# upstream recovers, so ensure_today_plan() swallows them (with a warning) and
+# simply retries on the next tick.
+PLAN_TRANSIENT_GENERATION_ERRORS: tuple[type[BaseException], ...] = (
+    PlanGenerationEmptyError,
+    LLMTimeoutError,
+    LLMUpstreamHTTPError,
+    LLMTransportError,
+)
 
 NotificationDispatcher = Callable[[CharacterNotification], Awaitable[None]]
 PLAN_BASELINE_PLAN_ID_KEY = "plan_baseline_plan_id"
@@ -1076,7 +1108,21 @@ class PlanEngine:
         gen_hour = await self._int_setting(KEY_PLAN_GENERATION_HOUR, 6)
         if shanghai_now().hour < gen_hour:
             return
-        await self.generate_daily_plan(today)
+        try:
+            await self.generate_daily_plan(today)
+        except PLAN_TRANSIENT_GENERATION_ERRORS as exc:
+            # Transient upstream/parse failure: no active plan was written, so
+            # the next scheduler tick retries automatically. Log explicitly —
+            # previously this failed silently (empty plan, no signal) — but do
+            # NOT re-raise: that would abort the rest of the life tick (snapshot
+            # advance) and could pause the scheduler via its circuit breaker.
+            logger.warning(
+                "ensure_today_plan: daily plan generation for %s failed transiently "
+                "(%s: %s); leaving today's plan unset for retry on the next tick.",
+                today,
+                type(exc).__name__,
+                exc,
+            )
 
     async def get_current_item(self) -> PlanItem | None:
         if not await self.is_enabled():
@@ -1414,6 +1460,22 @@ class PlanEngine:
         )
         rows = _extract_json_array(response or "")
         raw_plan = (response or "").strip()
+
+        # Guard against writing an empty active plan placeholder. If the LLM
+        # returned nothing usable (upstream 502 with empty body, truncated /
+        # unparseable output, …), persisting a status='active' plan with zero
+        # items would block ensure_today_plan() from retrying for the rest of
+        # the day. Raise instead so the next scheduler tick regenerates.
+        if not rows:
+            logger.warning(
+                "Daily plan generation produced no usable items for %s "
+                "(response_chars=%d, parsed_rows=0); refusing to write an empty "
+                "active plan so the next tick can retry. raw_preview=%r",
+                plan_date,
+                len(response or ""),
+                (response or "")[:200],
+            )
+            raise PlanGenerationEmptyError(plan_date)
 
         existing = await self.db.get_latest_daily_plan_for_date(plan_date, status="active")
         ctx = _context_snapshot_with_version({"generated_for": plan_date})
