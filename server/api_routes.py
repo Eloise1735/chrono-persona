@@ -1555,7 +1555,20 @@ async def api_bulk_update_plan(plan_id: int, req: BulkUpdatePlanRequest):
 async def api_generate_plan(req: GeneratePlanRequest):
     if _plan_engine is None:
         raise HTTPException(503, "Plan engine is not initialized")
-    plan = await _plan_engine.generate_daily_plan(req.plan_date or shanghai_now().date().isoformat())
+    from server.plan_engine import PLAN_TRANSIENT_GENERATION_ERRORS
+
+    try:
+        plan = await _plan_engine.generate_daily_plan(
+            req.plan_date or shanghai_now().date().isoformat()
+        )
+    except PLAN_TRANSIENT_GENERATION_ERRORS as exc:
+        # Upstream LLM down / empty-or-unparseable output. No empty plan was
+        # written; surface a clear 502 so the caller knows to retry instead of
+        # receiving a silently-empty plan.
+        raise HTTPException(
+            502,
+            f"日程生成暂时失败（上游 LLM 不可用或返回无法解析）：{type(exc).__name__}: {exc}",
+        ) from exc
     items = await _db.list_plan_items(int(plan.id or 0))
     return {"plan": plan.model_dump(), "items": [item.model_dump() for item in items]}
 

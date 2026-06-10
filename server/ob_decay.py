@@ -75,12 +75,17 @@ class OBDecayEngine:
         for bucket in buckets:
             meta = bucket.metadata or {}
             bucket_type = self.ob_client._bucket_type(meta)
-            if bucket_type in {"permanent", "feel", "archived"} or meta.get("pinned") or meta.get("protected"):
+            # feel is now aged (see OBClient.calculate_score feel branch) so it
+            # participates in archival — it is no longer an immortal write-only
+            # pile. permanent/archived/pinned/protected stay exempt.
+            if bucket_type in {"permanent", "archived"} or meta.get("pinned") or meta.get("protected"):
                 skipped += 1
                 continue
 
             checked += 1
-            if not meta.get("resolved", False):
+            # auto-resolve only applies to dynamics (feel uses crystallized, not
+            # resolved); feel reaches archival purely via gentle score decay.
+            if bucket_type != "feel" and not meta.get("resolved", False):
                 importance = int(meta.get("importance", 5) or 5)
                 days_since = self.ob_client._days_since(meta.get("last_active") or meta.get("created"), now)
                 if importance <= 4 and days_since > 30:

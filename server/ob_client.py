@@ -47,6 +47,23 @@ class OBClient:
         self.decay_lambda = 0.05
         self.decay_emotion_base = 1.0
         self.decay_arousal_boost = 0.8
+        # feel aging: feel used to be a flat 50 plateau that never decayed nor
+        # archived (a pure write-only leak). It now decays gently from 50 so
+        # that genuinely old, un-recalled feel eventually drops below the decay
+        # archive threshold. Half-life ≈ 17 days; an uncrystallized feel reaches
+        # the 0.3 archive line around ~128 days, a crystallized one (×0.1) around
+        # ~70 days — both well past the 7-day crystallized protection window, so
+        # surfacing is unaffected (breath sets feel score to 50 at selection).
+        self.feel_decay_lambda = 0.04
+        # Merge SUGGESTIONS on hold(): the backend never merges on its own — it
+        # only surfaces recent similar same-type buckets as candidates and lets
+        # the frontend model decide (and call merge_buckets explicitly). The
+        # thresholds are deliberately a little permissive so the model gets to
+        # judge borderline cases rather than the backend silently dropping them.
+        self.merge_suggest_embedding_min_similarity = 0.82
+        self.merge_suggest_text_min_ratio = 0.72
+        self.merge_suggest_recency_days = 14.0
+        self.merge_suggest_top_k = 3
         self.permanent_dir = self.base_dir / "permanent"
         self.dynamic_dir = self.base_dir / "dynamic"
         self.archive_dir = self.base_dir / "archive"
@@ -115,6 +132,176 @@ class OBClient:
         path.write_text(self._dump_bucket(metadata, content), encoding="utf-8")
         self._schedule_embedding_upsert(bucket_id, content)
         return bucket_id
+
+    @staticmethod
+    def _normalize_for_dedupe(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+    def _merge_candidate_ok(
+        self, bucket: OBBucket, want_type: str, now: datetime, *, exclude_id: str | None
+    ) -> bool:
+        meta = bucket.metadata or {}
+        if exclude_id is not None and bucket.id == exclude_id:
+            return False
+        if self._bucket_type(meta) != want_type:
+            return False
+        if meta.get("pinned") or meta.get("protected"):
+            return False
+        if meta.get("resolved"):
+            return False
+        if want_type == "feel" and meta.get("crystallized"):
+            return False
+        # Never suggest folding a relational note into the character-life stream.
+        if self._is_character_life_bucket(bucket):
+            return False
+        age_days = self._bucket_age_days(meta, prefer_keys=("last_active", "created"))
+        return age_days <= float(self.merge_suggest_recency_days)
+
+    async def find_merge_candidates(
+        self,
+        content: str,
+        *,
+        bucket_type: str,
+        exclude_id: str | None = None,
+        top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent same-type buckets that look like merge candidates.
+
+        The backend NEVER merges on its own — this only proposes. The frontend
+        model inspects the candidates and decides whether to call merge_buckets.
+        Each entry: {id, name, similarity, created, excerpt}. Sorted desc by
+        similarity. Embedding similarity when available, else difflib text ratio.
+        """
+        norm_new = self._normalize_for_dedupe(content)
+        if not norm_new:
+            return []
+        limit = max(1, int(top_k if top_k is not None else self.merge_suggest_top_k))
+        now = datetime.utcnow()
+        scored: list[tuple[float, OBBucket]] = []
+
+        store = self.embedding_store
+        store_enabled = False
+        if store is not None:
+            try:
+                store_enabled = await store.is_enabled()
+            except Exception:
+                store_enabled = False
+        if store_enabled:
+            try:
+                pairs = await store.search_similar(content, top_k=max(10, limit * 4))
+            except Exception:
+                pairs = []
+            for bid, sim in pairs:
+                if float(sim) < float(self.merge_suggest_embedding_min_similarity):
+                    break  # search_similar is sorted desc
+                bucket = await self.get(str(bid))
+                if bucket is not None and self._merge_candidate_ok(bucket, bucket_type, now, exclude_id=exclude_id):
+                    scored.append((float(sim), bucket))
+        else:
+            import difflib
+
+            for bucket in await self.list_buckets(include_archive=False):
+                if not self._merge_candidate_ok(bucket, bucket_type, now, exclude_id=exclude_id):
+                    continue
+                ratio = difflib.SequenceMatcher(
+                    None, norm_new, self._normalize_for_dedupe(bucket.content)
+                ).ratio()
+                if ratio >= float(self.merge_suggest_text_min_ratio):
+                    scored.append((float(ratio), bucket))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        out: list[dict[str, Any]] = []
+        for sim, bucket in scored[:limit]:
+            meta = bucket.metadata or {}
+            out.append({
+                "id": bucket.id,
+                "name": meta.get("name") or bucket.id,
+                "similarity": round(sim, 4),
+                "created": meta.get("created", ""),
+                "excerpt": self._strip_wikilinks(bucket.content)[:240],
+            })
+        return out
+
+    async def merge_content_into(
+        self,
+        target_id: str,
+        content: str,
+        *,
+        bucket_type: str | None = None,
+        importance: int = 5,
+        valence: float = 0.5,
+        arousal: float = 0.3,
+    ) -> dict[str, Any]:
+        """Merge raw new content into an existing bucket (the write-time merge
+        path used by hold's two-phase flow). Validates type + that target is not
+        a stable principle. Returns {ok, target_id} or {ok: False, error}."""
+        target = await self.get(str(target_id))
+        if target is None:
+            return {"ok": False, "error": f"未找到 target bucket: {target_id}"}
+        t_type = self._bucket_type(target.metadata)
+        if bucket_type and t_type != str(bucket_type):
+            return {"ok": False, "error": f"类型不一致，拒绝合并：target={t_type} 期望={bucket_type}"}
+        if target.metadata.get("pinned") or target.metadata.get("protected") or t_type == "permanent":
+            return {"ok": False, "error": "target 是 pinned/protected/permanent，不能作为合并落点"}
+        await self._merge_into_bucket(
+            target, content, importance=importance, valence=valence, arousal=arousal
+        )
+        return {"ok": True, "target_id": str(target_id)}
+
+    async def merge_buckets(self, source_id: str, target_id: str) -> dict[str, Any]:
+        """Merge source bucket into target (model-directed), then delete source.
+
+        Validates that both exist and are the same type; refuses to merge into a
+        pinned/protected/permanent target (those are stable principles, not a
+        dynamic/feel sink). Returns {ok, target_id, ...} or {ok: False, error}.
+        """
+        if str(source_id) == str(target_id):
+            return {"ok": False, "error": "source 与 target 不能相同"}
+        source = await self.get(str(source_id))
+        target = await self.get(str(target_id))
+        if source is None:
+            return {"ok": False, "error": f"未找到 source bucket: {source_id}"}
+        if target is None:
+            return {"ok": False, "error": f"未找到 target bucket: {target_id}"}
+        s_type = self._bucket_type(source.metadata)
+        t_type = self._bucket_type(target.metadata)
+        if t_type != s_type:
+            return {"ok": False, "error": f"类型不一致，拒绝合并：source={s_type} target={t_type}"}
+        if target.metadata.get("pinned") or target.metadata.get("protected") or t_type == "permanent":
+            return {"ok": False, "error": "target 是 pinned/protected/permanent，不能作为合并落点"}
+        await self._merge_into_bucket(
+            target,
+            source.content,
+            importance=int(source.metadata.get("importance", 5) or 5),
+            valence=self._clamp_float(source.metadata.get("valence"), 0.0, 1.0, 0.5),
+            arousal=self._clamp_float(source.metadata.get("arousal"), 0.0, 1.0, 0.3),
+        )
+        await self.delete(str(source_id))
+        return {"ok": True, "target_id": str(target_id), "merged_source_id": str(source_id)}
+
+    async def _merge_into_bucket(
+        self,
+        bucket: OBBucket,
+        content: str,
+        *,
+        importance: int = 5,
+        valence: float = 0.5,
+        arousal: float = 0.3,
+    ) -> str:
+        """Append new content into an existing bucket, blending affect/importance."""
+        merged = f"{bucket.content.rstrip()}\n\n---\n{str(content or '').strip()}"
+        updates: dict[str, Any] = {
+            "content": merged,
+            "last_active": datetime.utcnow().isoformat(),
+        }
+        cur_importance = int(bucket.metadata.get("importance", 5) or 5)
+        updates["importance"] = max(cur_importance, int(importance or 5))
+        old_v = self._clamp_float(bucket.metadata.get("valence"), 0.0, 1.0, 0.5)
+        updates["valence"] = round((old_v + self._clamp_float(valence, 0.0, 1.0, 0.5)) / 2, 2)
+        old_a = self._clamp_float(bucket.metadata.get("arousal"), 0.0, 1.0, 0.3)
+        updates["arousal"] = round((old_a + self._clamp_float(arousal, 0.0, 1.0, 0.3)) / 2, 2)
+        await self.update(bucket.id, **updates)
+        return bucket.id
 
     async def breath(
         self,
@@ -1224,7 +1411,17 @@ class OBClient:
         if bucket_type == "permanent":
             return 999.0
         if bucket_type == "feel":
-            return 50.0
+            # Gentle aging from the historic flat 50. NOTE: breath surfacing
+            # (_feel_breath) overrides bucket.score back to 50.0 at selection
+            # time and orders feel by recency, so this score only governs the
+            # background decay/archive lifecycle — it does NOT change which feel
+            # surfaces. Crystallized feel sinks faster (its essence has been
+            # captured into a principle/key_record).
+            days_since = self._days_since(metadata.get("last_active") or metadata.get("created"), datetime.utcnow())
+            feel_score = 50.0 * math.exp(-float(self.feel_decay_lambda) * days_since)
+            if metadata.get("crystallized"):
+                feel_score *= 0.1
+            return round(feel_score, 4)
         if bucket_type == "archived":
             return 0.0
 

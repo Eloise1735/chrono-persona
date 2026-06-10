@@ -220,6 +220,65 @@ def test_schedule_bundle_replace_items_accepts_items_object_and_defaults_source_
     run(with_schedule_tool(scenario))
 
 
+def test_schedule_bundle_replace_items_accepts_flat_structured_fields():
+    """Write side accepts the flattened shape breath_personal reads out
+    (objective/thread_id/current_step/expected_steps/replaces at top level),
+    folding them into action_payload so read and write schemas are symmetric."""
+    async def scenario(db):
+        payload = json.dumps(
+            {
+                "items": [
+                    {
+                        "hour_start": 9,
+                        "hour_end": 11,
+                        "activity": "病例推进",
+                        "source_kind": "replan",
+                        "objective": "复核三号样本",
+                        "thread_id": "case-3",
+                        "current_step": 2,
+                        "expected_steps": 4,
+                        "replaces": [{"hour_start": 9, "activity": "原安排"}],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        raw = await mcp_tools.schedule_bundle("replace_items", plan_id=1, payload_json=payload)
+        result = json.loads(raw)
+        assert result["ok"] is True, result
+        item = result["items"][0]
+        assert item["activity"] == "病例推进"
+        # Flat structured fields are folded into action_payload (objective ->
+        # intended_objective, replaces -> replan_replaces).
+        assert item["action_payload"] == {
+            "intended_objective": "复核三号样本",
+            "thread_id": "case-3",
+            "current_step": 2,
+            "expected_steps": 4,
+            "replan_replaces": [{"hour_start": 9, "activity": "原安排"}],
+        }
+
+    run(with_schedule_tool(scenario))
+
+
+def test_schedule_bundle_edit_item_flat_field_merges_into_existing_payload():
+    """A partial flat structured update merges into the item's existing
+    action_payload rather than wiping unrelated keys."""
+    async def scenario(db):
+        # item 10 already has action_payload {"thread_id": "old"}.
+        raw = await mcp_tools.schedule_bundle(
+            "edit_item",
+            item_id=10,
+            payload_json=json.dumps({"current_step": 3}, ensure_ascii=False),
+        )
+        result = json.loads(raw)
+        assert result["ok"] is True, result
+        parsed = json.loads(db.items[10].action_payload)
+        assert parsed == {"thread_id": "old", "current_step": 3}
+
+    run(with_schedule_tool(scenario))
+
+
 def test_schedule_bundle_replace_items_accepts_array_payload():
     async def scenario(db):
         payload = json.dumps(
