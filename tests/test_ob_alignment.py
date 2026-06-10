@@ -1595,7 +1595,20 @@ def test_special_decay_scores():
         assert client.calculate_score({"type": "permanent"}) == 999.0
         assert client.calculate_score({"pinned": True}) == 999.0
         assert client.calculate_score({"protected": True}) == 999.0
-        assert client.calculate_score({"type": "feel"}) == 50.0
+        # feel aging: a fresh feel starts near the historic 50 plateau, decays
+        # gently with age, and a crystallized feel sinks faster than an
+        # uncrystallized one of the same age. (Surfacing is unaffected — breath
+        # overrides feel score to 50 at selection; this only drives archival.)
+        now_iso = datetime.utcnow().isoformat()
+        fresh_feel = client.calculate_score({"type": "feel", "created": now_iso, "last_active": now_iso})
+        assert abs(fresh_feel - 50.0) < 0.5
+        old_iso = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        old_feel = client.calculate_score({"type": "feel", "created": old_iso, "last_active": old_iso})
+        assert old_feel < fresh_feel
+        crystallized_old = client.calculate_score(
+            {"type": "feel", "created": old_iso, "last_active": old_iso, "crystallized": True}
+        )
+        assert crystallized_old < old_feel
         base = {
             "type": "dynamic",
             "importance": 7,
@@ -1609,6 +1622,180 @@ def test_special_decay_scores():
         both = client.calculate_score(base | {"resolved": True, "digested": True})
         assert resolved < normal
         assert both < resolved
+
+    run(scenario())
+
+
+def test_find_merge_candidates_surfaces_near_duplicate_but_does_not_merge():
+    async def scenario():
+        client = await _client("merge_suggest")
+        first = await client.hold("今天和阿米娅复核了三号样本的污染读数", domain=["工作"])
+        second = await client.hold("今天和阿米娅复核了三号样本的污染读数。", domain=["工作"])
+        # Both buckets exist — the backend never merges on its own.
+        assert first != second
+        assert len(await client.list_buckets(include_archive=False)) == 2
+        candidates = await client.find_merge_candidates(
+            "今天和阿米娅复核了三号样本的污染读数。", bucket_type="dynamic", exclude_id=second
+        )
+        ids = [c["id"] for c in candidates]
+        assert first in ids
+        assert second not in ids  # exclude_id respected
+
+    run(scenario())
+
+
+def test_find_merge_candidates_empty_for_distinct_content():
+    async def scenario():
+        client = await _client("merge_distinct")
+        await client.hold("和阿米娅讨论源石技艺的伦理边界", domain=["工作"])
+        cands = await client.find_merge_candidates(
+            "晚饭煮了关东煮，罗德岛的走廊很安静", bucket_type="dynamic"
+        )
+        assert cands == []
+
+    run(scenario())
+
+
+def test_find_merge_candidates_skips_pinned_and_crystallized():
+    async def scenario():
+        client = await _client("merge_gate")
+        await client.hold("一条会被钉住的原则", domain=["core"], pinned=True)
+        # pinned target must never be suggested.
+        assert await client.find_merge_candidates("一条会被钉住的原则", bucket_type="dynamic") == []
+        fid = await client.hold("这次对话后心里有种久违的松动", bucket_type="feel")
+        await client.update(fid, crystallized=True)
+        # crystallized feel must not be a merge target.
+        assert await client.find_merge_candidates("这次对话后心里有种久违的松动", bucket_type="feel") == []
+
+    run(scenario())
+
+
+def test_merge_buckets_merges_and_deletes_source():
+    async def scenario():
+        client = await _client("merge_apply")
+        target = await client.hold("和阿米娅复核三号样本", domain=["工作"], importance=5)
+        source = await client.hold("和阿米娅复核三号样本（补充读数）", domain=["工作"], importance=8)
+        result = await client.merge_buckets(source, target)
+        assert result["ok"] is True
+        assert result["target_id"] == target
+        # source removed, target retains merged content + max importance.
+        assert await client.get(source) is None
+        merged = await client.get(target)
+        assert "---" in merged.content
+        assert int(merged.metadata.get("importance")) == 8
+        assert len(await client.list_buckets(include_archive=False)) == 1
+
+    run(scenario())
+
+
+def test_merge_buckets_refuses_type_mismatch_and_pinned_target():
+    async def scenario():
+        client = await _client("merge_refuse")
+        dyn = await client.hold("一条 dynamic", domain=["工作"])
+        feel = await client.hold("一条 feel", bucket_type="feel")
+        mismatch = await client.merge_buckets(dyn, feel)
+        assert mismatch["ok"] is False and "类型不一致" in mismatch["error"]
+        pinned = await client.hold("钉住的原则", domain=["core"], pinned=True)
+        perm_dyn = await client.hold("另一条 dynamic", domain=["工作"])
+        refuse_pin = await client.merge_buckets(perm_dyn, pinned)
+        assert refuse_pin["ok"] is False
+        # nothing was deleted on a refused merge.
+        assert await client.get(dyn) is not None
+        assert await client.get(perm_dyn) is not None
+
+    run(scenario())
+
+
+async def _with_ob_tool(client, scenario):
+    from server import mcp_tools
+
+    old = mcp_tools._ob_client
+    try:
+        mcp_tools.set_ob_client(client)
+        return await scenario(mcp_tools)
+    finally:
+        mcp_tools._ob_client = old
+
+
+def test_hold_tool_pending_then_merge_into_is_single_bucket():
+    async def scenario():
+        client = await _client("hold_tool_merge")
+
+        async def inner(mcp_tools):
+            r1 = json.loads(await mcp_tools.hold(content="和阿米娅复核三号样本读数", domain=["工作"]))
+            first = r1["bucket_id"]
+            # near-duplicate → pending, nothing written yet
+            r2 = json.loads(await mcp_tools.hold(content="和阿米娅复核三号样本读数。", domain=["工作"]))
+            assert r2.get("status") == "pending_merge_decision"
+            assert first in [c["id"] for c in r2["merge_candidates"]]
+            assert len(await client.list_buckets(include_archive=False)) == 1  # not written on pending
+            # decide to merge
+            r3 = json.loads(
+                await mcp_tools.hold(content="和阿米娅复核三号样本读数。", domain=["工作"], merge_into=first)
+            )
+            assert r3.get("merged_into") == first
+            assert len(await client.list_buckets(include_archive=False)) == 1
+
+        await _with_ob_tool(client, inner)
+
+    run(scenario())
+
+
+def test_hold_tool_force_new_creates_despite_candidate():
+    async def scenario():
+        client = await _client("hold_tool_forcenew")
+
+        async def inner(mcp_tools):
+            json.loads(await mcp_tools.hold(content="走廊尽头那盏灯又坏了", domain=["生活"]))
+            pending = json.loads(await mcp_tools.hold(content="走廊尽头那盏灯又坏了", domain=["生活"]))
+            assert pending.get("status") == "pending_merge_decision"
+            forced = json.loads(
+                await mcp_tools.hold(content="走廊尽头那盏灯又坏了", domain=["生活"], force_new=True)
+            )
+            assert "bucket_id" in forced and "status" not in forced
+            assert len(await client.list_buckets(include_archive=False)) == 2
+
+        await _with_ob_tool(client, inner)
+
+    run(scenario())
+
+
+def test_hold_feel_tool_digests_source_only_after_persist():
+    async def scenario():
+        client = await _client("hold_feel_digest")
+
+        async def inner(mcp_tools):
+            src = await client.hold("一段值得回味的对话", domain=["关系"])
+            # first feel persists immediately (no similar feel yet) → source digested
+            json.loads(await mcp_tools.hold_feel(content="这次对话让我心里一松", source_bucket=src))
+            assert (await client.get(src)).metadata.get("digested") is True
+            # a second source + near-duplicate feel → pending, must NOT digest src2
+            src2 = await client.hold("另一段对话", domain=["关系"])
+            pending = json.loads(
+                await mcp_tools.hold_feel(content="这次对话让我心里一松。", source_bucket=src2)
+            )
+            assert pending.get("status") == "pending_merge_decision"
+            assert (await client.get(src2)).metadata.get("digested") in (None, False)
+
+        await _with_ob_tool(client, inner)
+
+    run(scenario())
+
+
+def test_decay_archives_old_feel():
+    async def scenario():
+        client = await _client("feel_aging")
+        old_iso = (datetime.utcnow() - timedelta(days=200)).isoformat()
+        fresh_iso = datetime.utcnow().isoformat()
+        old_feel = await client.hold("很久以前的一段感受", bucket_type="feel", created=old_iso)
+        fresh_feel = await client.hold("刚刚才有的一段感受", bucket_type="feel", created=fresh_iso)
+        engine = OBDecayEngine(client)
+        result = await engine.run_decay_cycle(dry_run=False)
+        # Old feel decays below the archive threshold; fresh feel stays.
+        assert old_feel in result["archived_ids"]
+        assert fresh_feel not in result["archived_ids"]
+        # Feel must NOT be auto-resolved (that lifecycle is dynamics-only).
+        assert old_feel not in result["auto_resolved_ids"]
 
     run(scenario())
 

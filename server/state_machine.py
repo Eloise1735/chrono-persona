@@ -15,7 +15,12 @@ from server.environment import (
     environment_text_for_prompt,
     environment_text_for_retrieval,
 )
-from server.llm_client import LLMClient
+from server.llm_client import (
+    LLMClient,
+    LLMTimeoutError,
+    LLMTransportError,
+    LLMUpstreamHTTPError,
+)
 from server.memory_store import MemoryStore
 from server.models import (
     ConversationTimeClaim,
@@ -136,11 +141,23 @@ class StateMachine:
         # failures. Exposed as instance attributes so admin endpoints (C3)
         # can read .snapshot() and call .resume() without restarting.
         from server.scheduler_breaker import SchedulerCircuitBreaker
+        # Upstream LLM outages (502/timeout/transport) are transient and
+        # self-heal once the provider recovers. They must NOT count toward the
+        # consecutive-failure pause, otherwise a multi-hour upstream blip would
+        # latch the loop OFF and require a manual resume long after the upstream
+        # is healthy again. They still get logged and surfaced via the tick.
+        _upstream_transient_errors = (
+            LLMTimeoutError,
+            LLMUpstreamHTTPError,
+            LLMTransportError,
+        )
         self.snapshot_scheduler_breaker = SchedulerCircuitBreaker(
-            name="snapshot_scheduler"
+            name="snapshot_scheduler",
+            non_failure_exception_types=_upstream_transient_errors,
         )
         self.life_scheduler_breaker = SchedulerCircuitBreaker(
-            name="life_scheduler"
+            name="life_scheduler",
+            non_failure_exception_types=_upstream_transient_errors,
         )
 
     def set_plan_engine(self, plan_engine) -> None:
@@ -2708,64 +2725,23 @@ class StateMachine:
             lock_held = True
             self.snapshot_llm.begin_usage_tracking()
             try:
-                latest_snapshot = await self._trace_await(
-                    tracer,
-                    "db.get_latest_snapshot",
-                    self.db.get_latest_snapshot(),
-                )
-                previous_content = (
-                    latest_snapshot.content if latest_snapshot else "（尚无历史状态记录）"
-                )
-
-                memory_results = await self._trace_await(
-                    tracer,
-                    "memory.search_for_reflection",
-                    self.memory.search(
-                        conversation_summary,
-                        top_k=self.DEFAULT_MEMORY_TOP_K,
-                    ),
-                    query_chars=len(conversation_summary or ""),
-                    top_k=self.DEFAULT_MEMORY_TOP_K,
-                )
-                memory_text, memory_meta = self._build_memory_context(memory_results)
-
-                with tracer.stage(
-                    "load_reflection_prompts_and_layers",
-                    memory_count=int(memory_meta.get("selected_count", 0)),
-                ):
-                    system_prompt = await self.prompt_manager.get_system_prompt()
-                    reflect_template = await self.prompt_manager.get_prompt(
-                        KEY_PROMPT_REFLECT_SNAPSHOT
+                # 前端模型已直接读取上下文并生成最终快照正文，conversation_summary
+                # 现在就是要原样落库的快照正文，不再是需要后台二次加工的摘要。
+                # 后台不再调用 snapshot_llm.chat 重新生成——那正是 502 的来源：
+                # 上游 chat 通路一断，整条 reflect 就挂在这里。后台只负责落库 + 向量化。
+                final_content = str(conversation_summary or "").strip()
+                if not final_content:
+                    raise ValueError(
+                        "reflect_on_conversation: 前端上传的快照正文为空，拒绝写入空快照。"
                     )
-                    character_background = await self.prompt_manager.get_layer_content(
-                        KEY_L1_CHARACTER_BACKGROUND
-                    )
-                    character_personality = await self.prompt_manager.get_layer_content(
-                        KEY_L2_CHARACTER_PERSONALITY
-                    )
-                    relationship_dynamics = "（关系动态已迁入 OB 记忆主干；后台反思不再读取 L2 关系结论。）"
-                    life_status = await self.prompt_manager.get_layer_content(
-                        KEY_L2_LIFE_STATUS
-                    )
+                new_content = final_content
 
-                reflect_prompt = reflect_template.format(
-                    character_background=character_background,
-                    character_personality=character_personality,
-                    relationship_dynamics=relationship_dynamics,
-                    life_status=life_status,
-                    previous_snapshot=previous_content,
-                    conversation_summary=conversation_summary,
-                    memory_context=memory_text,
-                )
-
-                # B2 idempotency barrier: a placeholder row is committed BEFORE
-                # the LLM call so that any failure during finalize/side-effects
-                # cannot cause the same prompt to be re-sent on the next tick.
-                # See docs/fix_plan_snapshot_loop.md B2.
+                # B2 idempotency barrier 仍保留：placeholder / in-flight / dead-letter
+                # 机制用于对重复上传去重，并让 finalize / side-effect 失败可追踪、可补偿。
+                # 幂等哈希改为基于上传正文本身，不再基于已废弃的 reflect prompt。
                 reflect_prompt_hash = self._compute_prompt_hash(
-                    "reflect_on_conversation",
-                    system_prompt,
-                    reflect_prompt,
+                    "reflect_on_conversation_upload",
+                    new_content,
                 )
                 await self._trace_await(
                     tracer,
@@ -2779,8 +2755,8 @@ class StateMachine:
                 )
                 if existing_done is not None:
                     logger.warning(
-                        "reflect_on_conversation: identical prompt already produced "
-                        "snapshot_id=%s; reusing cached content and skipping LLM call.",
+                        "reflect_on_conversation: identical uploaded snapshot already "
+                        "persisted snapshot_id=%s; reusing cached content.",
                         existing_done.id,
                     )
                     new_content = existing_done.content
@@ -2798,8 +2774,8 @@ class StateMachine:
                 )
                 if in_flight is not None:
                     raise RuntimeError(
-                        f"{self._IDEMPOTENCY_REASON_IN_FLIGHT}: identical reflect prompt "
-                        f"already in flight (snapshot_id={in_flight.id}); refusing duplicate LLM call."
+                        f"{self._IDEMPOTENCY_REASON_IN_FLIGHT}: identical reflect upload "
+                        f"already in flight (snapshot_id={in_flight.id}); refusing duplicate write."
                     )
                 failed_count = await self._trace_await(
                     tracer,
@@ -2808,7 +2784,7 @@ class StateMachine:
                 )
                 if failed_count >= 3:
                     raise RuntimeError(
-                        f"{self._IDEMPOTENCY_REASON_DEAD_LETTER}: reflect prompt has "
+                        f"{self._IDEMPOTENCY_REASON_DEAD_LETTER}: reflect upload has "
                         f"{failed_count} prior failures; manual intervention required."
                     )
                 snap_created_at = format_utc_instant_z(datetime.utcnow())
@@ -2824,20 +2800,6 @@ class StateMachine:
                 )
 
                 try:
-                    new_content = await self._trace_await(
-                        tracer,
-                        "snapshot_llm.reflect_snapshot",
-                        self.snapshot_llm.chat(
-                            [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": reflect_prompt},
-                            ],
-                            max_tokens=None,
-                        ),
-                        prompt_chars=len(reflect_prompt or ""),
-                        memory_chars=len(memory_text or ""),
-                    )
-
                     snap = StateSnapshot(
                         id=placeholder_id,
                         created_at=snap_created_at,
