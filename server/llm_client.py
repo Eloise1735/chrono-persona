@@ -210,8 +210,8 @@ class _BudgetTracker:
 
     _HOUR_SEC = 3600
     _DAY_SEC = 86400
-    _DEFAULT_HOURLY = 30000
-    _DEFAULT_DAILY = 200000
+    _DEFAULT_HOURLY = 80000
+    _DEFAULT_DAILY = 450000
 
     def __init__(self) -> None:
         self._enabled = True
@@ -541,8 +541,8 @@ class LLMClient:
             logger.exception("Failed to refresh prompt-dedup settings; keeping current values.")
         try:
             budget_enabled = (await self._get_setting("llm_budget_enabled", "1")).strip() == "1"
-            hourly = int(await self._get_setting("llm_hourly_token_limit", "30000") or 30000)
-            daily = int(await self._get_setting("llm_daily_token_limit", "200000") or 200000)
+            hourly = int(await self._get_setting("llm_hourly_token_limit", "80000") or 80000)
+            daily = int(await self._get_setting("llm_daily_token_limit", "450000") or 450000)
             _budget_tracker.configure(
                 enabled=budget_enabled,
                 hourly_limit=hourly,

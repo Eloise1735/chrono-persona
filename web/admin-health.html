@@ -189,6 +189,75 @@
       padding-bottom: 12px;
       border-bottom: 1px solid var(--border-subtle);
     }
+
+    /* ── LLM budget bars + config form ── */
+    .budget-meter { margin: 10px 0 4px; }
+    .budget-meter-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+    .budget-meter-label .bm-key { color: var(--text-dim); }
+    .budget-meter-label .bm-val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--text);
+    }
+    .budget-track {
+      height: 9px;
+      border-radius: 999px;
+      background: var(--surface3);
+      overflow: hidden;
+      border: 1px solid var(--border-subtle);
+    }
+    .budget-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.3s ease;
+      background: var(--success);
+    }
+    .budget-fill.warn { background: var(--amber); }
+    .budget-fill.bad  { background: var(--danger); }
+
+    .budget-config {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--border-subtle);
+    }
+    .budget-config-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+    .budget-config-row label {
+      color: var(--text-dim);
+      flex: 1;
+    }
+    .budget-config-row input[type="number"] {
+      width: 110px;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text);
+      text-align: right;
+    }
+    .budget-config-row input[type="checkbox"] { transform: scale(1.1); }
+    .budget-config-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 4px;
+    }
+    .budget-save-msg { font-size: 12px; color: var(--text-dim); }
+    .budget-save-msg.ok { color: var(--success); }
+    .budget-save-msg.error { color: var(--danger); }
   </style>
 </head>
 <body>
@@ -257,6 +326,57 @@
         </div>
         <div class="subcard-body" id="in-flight-wrap">
           <div class="empty">无在途占位。</div>
+        </div>
+      </div>
+
+      <div class="subcard">
+        <div class="subcard-header">
+          <span>LLM 预算与去重 (A2 / A3)</span>
+          <span class="subcard-meta" id="budget-badge"></span>
+        </div>
+        <div class="subcard-body">
+          <div class="budget-meter">
+            <div class="budget-meter-label">
+              <span class="bm-key">本小时用量</span>
+              <span class="bm-val" id="bm-hourly-val">—</span>
+            </div>
+            <div class="budget-track"><div class="budget-fill" id="bm-hourly-fill" style="width:0%"></div></div>
+          </div>
+          <div class="budget-meter">
+            <div class="budget-meter-label">
+              <span class="bm-key">今日用量</span>
+              <span class="bm-val" id="bm-daily-val">—</span>
+            </div>
+            <div class="budget-track"><div class="budget-fill" id="bm-daily-fill" style="width:0%"></div></div>
+          </div>
+          <div class="field-row">
+            <span class="field-key">去重拦截次数 / 当前缓存</span>
+            <span class="field-val" id="dedup-stats">—</span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">预算拒绝次数 / 最近原因</span>
+            <span class="field-val" id="budget-reject-stats">—</span>
+          </div>
+
+          <div class="budget-config">
+            <div class="budget-config-row">
+              <label for="cfg-hourly">每小时 token 上限</label>
+              <input type="number" id="cfg-hourly" min="1" step="1000">
+            </div>
+            <div class="budget-config-row">
+              <label for="cfg-daily">每日 token 上限</label>
+              <input type="number" id="cfg-daily" min="1" step="10000">
+            </div>
+            <div class="budget-config-row">
+              <label for="cfg-enabled">启用预算硬上限</label>
+              <input type="checkbox" id="cfg-enabled">
+            </div>
+            <div class="budget-config-actions">
+              <button class="resume-btn" onclick="saveBudgetConfig(this)">保存阈值</button>
+              <button class="btn btn-mini" onclick="resetBudgetCounters(this)">清空用量计数</button>
+              <span class="budget-save-msg" id="budget-save-msg"></span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -360,6 +480,135 @@ function escapeHtml(s) {
   ));
 }
 
+function fmtTokens(n) {
+  if (n == null || isNaN(n)) return "—";
+  n = Number(n);
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+// Don't clobber the config inputs while the admin is editing them.
+let budgetFormDirty = false;
+
+function fillClass(pct) {
+  if (pct >= 95) return "bad";
+  if (pct >= 80) return "warn";
+  return "";
+}
+
+function renderBudget(budget, dedup) {
+  const badge = document.getElementById('budget-badge');
+  if (!budget) {
+    badge.innerHTML = '<span class="badge badge-warn">N/A</span>';
+    return;
+  }
+  if (!budget.enabled) {
+    badge.innerHTML = '<span class="badge badge-warn">已禁用</span>';
+  } else {
+    badge.innerHTML = '<span class="badge badge-ok">启用中</span>';
+  }
+
+  const hPct = budget.hourly_limit ? (budget.hourly_used / budget.hourly_limit) * 100 : 0;
+  const dPct = budget.daily_limit ? (budget.daily_used / budget.daily_limit) * 100 : 0;
+
+  const hVal = document.getElementById('bm-hourly-val');
+  hVal.textContent = `${fmtTokens(budget.hourly_used)} / ${fmtTokens(budget.hourly_limit)} (${hPct.toFixed(0)}%)`;
+  const hFill = document.getElementById('bm-hourly-fill');
+  hFill.style.width = `${Math.min(100, hPct)}%`;
+  hFill.className = `budget-fill ${fillClass(hPct)}`;
+
+  const dVal = document.getElementById('bm-daily-val');
+  dVal.textContent = `${fmtTokens(budget.daily_used)} / ${fmtTokens(budget.daily_limit)} (${dPct.toFixed(0)}%)`;
+  const dFill = document.getElementById('bm-daily-fill');
+  dFill.style.width = `${Math.min(100, dPct)}%`;
+  dFill.className = `budget-fill ${fillClass(dPct)}`;
+
+  document.getElementById('budget-reject-stats').textContent =
+    `${budget.rejected_count ?? 0} 次 / ${budget.last_rejected_reason || '—'}`;
+
+  if (dedup) {
+    document.getElementById('dedup-stats').textContent =
+      `${dedup.rejected_count ?? 0} 次 / 缓存 ${dedup.tracked_prompts ?? 0} 条 (窗口 ${dedup.window_sec ?? '—'}s)`;
+  }
+
+  // Prefill the edit form unless the admin is actively editing.
+  if (!budgetFormDirty) {
+    const hi = document.getElementById('cfg-hourly');
+    const di = document.getElementById('cfg-daily');
+    const en = document.getElementById('cfg-enabled');
+    if (document.activeElement !== hi) hi.value = budget.hourly_limit ?? '';
+    if (document.activeElement !== di) di.value = budget.daily_limit ?? '';
+    if (document.activeElement !== en) en.checked = !!budget.enabled;
+  }
+}
+
+['cfg-hourly', 'cfg-daily', 'cfg-enabled'].forEach(id => {
+  document.getElementById(id).addEventListener('input', () => { budgetFormDirty = true; });
+});
+
+async function saveBudgetConfig(btn) {
+  const msg = document.getElementById('budget-save-msg');
+  const hourly = parseInt(document.getElementById('cfg-hourly').value, 10);
+  const daily = parseInt(document.getElementById('cfg-daily').value, 10);
+  const enabled = document.getElementById('cfg-enabled').checked;
+  if (!Number.isFinite(hourly) || hourly < 1 || !Number.isFinite(daily) || daily < 1) {
+    msg.className = 'budget-save-msg error';
+    msg.textContent = '阈值需为正整数';
+    return;
+  }
+  if (daily < hourly) {
+    msg.className = 'budget-save-msg error';
+    msg.textContent = '每日上限需 ≥ 每小时上限';
+    return;
+  }
+  btn.disabled = true;
+  msg.className = 'budget-save-msg';
+  msg.textContent = '保存中…';
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = localStorage.getItem('kelsey_admin_token');
+    if (token) headers['X-Kelsey-Admin-Token'] = token;
+    const r = await fetch('/api/admin/llm/budget/config', {
+      method: 'POST', headers,
+      body: JSON.stringify({ hourly_token_limit: hourly, daily_token_limit: daily, enabled }),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${r.status}`);
+    }
+    budgetFormDirty = false;
+    msg.className = 'budget-save-msg ok';
+    msg.textContent = '已保存并即时生效';
+    await loadHealth();
+  } catch (err) {
+    msg.className = 'budget-save-msg error';
+    msg.textContent = `保存失败：${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function resetBudgetCounters(btn) {
+  if (!confirm('确认清空当前小时/日用量计数？充值或调高阈值后用此重置。')) return;
+  const msg = document.getElementById('budget-save-msg');
+  btn.disabled = true;
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = localStorage.getItem('kelsey_admin_token');
+    if (token) headers['X-Kelsey-Admin-Token'] = token;
+    const r = await fetch('/api/admin/llm/budget/reset', { method: 'POST', headers });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    msg.className = 'budget-save-msg ok';
+    msg.textContent = '用量计数已清空';
+    await loadHealth();
+  } catch (err) {
+    msg.className = 'budget-save-msg error';
+    msg.textContent = `清空失败：${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function loadHealth() {
   const updatedEl = document.getElementById('updated-at');
   try {
@@ -390,6 +639,7 @@ async function loadHealth() {
     ageRefEl.className = `field-val ${ageClass(ageRef)}`;
 
     renderInFlight(payload.in_flight_snapshots || []);
+    renderBudget(payload.llm_budget, payload.llm_dedup);
 
     updatedEl.classList.remove('error');
     updatedEl.textContent =

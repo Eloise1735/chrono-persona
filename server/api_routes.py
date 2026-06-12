@@ -3513,6 +3513,106 @@ async def get_admin_health():
     }
 
 
+@router.get("/admin/llm/budget/config")
+async def get_llm_budget_config():
+    """Return the persisted budget thresholds plus the live tracker
+    snapshot. Used by web/admin-health.html to pre-fill the edit form."""
+    from server.llm_client import get_budget_tracker, get_prompt_dedup_tracker
+
+    async def _setting(key: str, default: str) -> str:
+        if _db is None:
+            return default
+        row = await _db.get_setting(key)
+        return str(row["value"]) if row and row.get("value") not in (None, "") else default
+
+    return {
+        "budget": {
+            "enabled": (await _setting("llm_budget_enabled", "1")).strip() == "1",
+            "hourly_token_limit": int(await _setting("llm_hourly_token_limit", "80000")),
+            "daily_token_limit": int(await _setting("llm_daily_token_limit", "450000")),
+        },
+        "dedup": {
+            "enabled": (await _setting("llm_dedup_enabled", "1")).strip() == "1",
+            "window_sec": float(await _setting("llm_dedup_window_sec", "60")),
+        },
+        "budget_live": get_budget_tracker().snapshot(),
+        "dedup_live": get_prompt_dedup_tracker().snapshot(),
+    }
+
+
+@router.post("/admin/llm/budget/config")
+async def set_llm_budget_config(payload: dict | None = Body(default=None)):
+    """Persist new budget thresholds AND reconfigure the live tracker
+    immediately (so the change takes effect without waiting for the 30s
+    settings-refresh cycle). Body fields (all optional):
+      - hourly_token_limit: int >= 1
+      - daily_token_limit:  int >= 1
+      - enabled:            bool
+    """
+    if _db is None:
+        raise HTTPException(500, "database not initialized")
+    from server.llm_client import get_budget_tracker
+
+    payload = payload or {}
+
+    async def _setting(key: str, default: str) -> str:
+        row = await _db.get_setting(key)
+        return str(row["value"]) if row and row.get("value") not in (None, "") else default
+
+    # Start from current persisted values, override with provided fields.
+    hourly = int(await _setting("llm_hourly_token_limit", "80000"))
+    daily = int(await _setting("llm_daily_token_limit", "450000"))
+    enabled = (await _setting("llm_budget_enabled", "1")).strip() == "1"
+
+    if "hourly_token_limit" in payload:
+        try:
+            hourly = int(payload["hourly_token_limit"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "hourly_token_limit must be an integer")
+        if hourly < 1:
+            raise HTTPException(400, "hourly_token_limit must be >= 1")
+    if "daily_token_limit" in payload:
+        try:
+            daily = int(payload["daily_token_limit"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "daily_token_limit must be an integer")
+        if daily < 1:
+            raise HTTPException(400, "daily_token_limit must be >= 1")
+    if "enabled" in payload:
+        enabled = bool(payload["enabled"])
+    if daily < hourly:
+        raise HTTPException(
+            400, f"daily_token_limit ({daily}) must be >= hourly_token_limit ({hourly})"
+        )
+
+    await _db.set_setting(
+        "llm_hourly_token_limit", str(hourly), category="runtime",
+        description="A2 LLM 预算：每小时累计 token 上限",
+    )
+    await _db.set_setting(
+        "llm_daily_token_limit", str(daily), category="runtime",
+        description="A2 LLM 预算：每日累计 token 上限",
+    )
+    await _db.set_setting(
+        "llm_budget_enabled", "1" if enabled else "0", category="runtime",
+        description="A2 LLM 预算开关（1=启用，0=禁用）",
+    )
+    # Apply to the live tracker right away (don't drain the counters — just
+    # update the thresholds; raising the cap should immediately unblock).
+    get_budget_tracker().configure(
+        enabled=enabled, hourly_limit=hourly, daily_limit=daily
+    )
+    return {
+        "ok": True,
+        "budget": {
+            "enabled": enabled,
+            "hourly_token_limit": hourly,
+            "daily_token_limit": daily,
+        },
+        "budget_live": get_budget_tracker().snapshot(),
+    }
+
+
 @router.post("/admin/llm/budget/reset")
 async def reset_llm_budget():
     """A2 admin reset: wipe the hourly/daily token counters. Use after
