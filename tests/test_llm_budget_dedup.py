@@ -474,3 +474,203 @@ def test_admin_reset_endpoints_clear_tracker_state():
         asyncio.run(db.close())
         get_budget_tracker().reset()
         get_prompt_dedup_tracker().reset()
+
+
+# ── Budget config endpoint (web threshold editor) ────────────────────
+
+
+def _make_app_with_db():
+    """Build (db, TestClient) wired with a skeletal StateMachine. Returns
+    a teardown closure too."""
+    import asyncio
+    import aiosqlite
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from server.api_routes import router as api_router, set_dependencies
+    from server.database import Database
+    from server.scheduler_breaker import SchedulerCircuitBreaker
+    from server.state_machine import StateMachine
+
+    async def _make_db():
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            """CREATE TABLE system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT 'system',
+                description TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await conn.execute(
+            """CREATE TABLE state_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                inserted_at TEXT,
+                type TEXT NOT NULL DEFAULT 'daily',
+                content TEXT NOT NULL DEFAULT '',
+                environment TEXT NOT NULL DEFAULT '{}',
+                referenced_events TEXT NOT NULL DEFAULT '[]',
+                embedding_vector_id TEXT,
+                status TEXT NOT NULL DEFAULT 'done',
+                prompt_hash TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                side_effects_status TEXT NOT NULL DEFAULT '{}'
+            )"""
+        )
+        await conn.commit()
+        db = Database(":memory:")
+        db._conn = conn
+        return db
+
+    db = asyncio.run(_make_db())
+    sm = object.__new__(StateMachine)
+    sm.snapshot_scheduler_breaker = SchedulerCircuitBreaker(name="snapshot_scheduler")
+    sm.life_scheduler_breaker = SchedulerCircuitBreaker(name="life_scheduler")
+    app = FastAPI()
+    app.include_router(api_router)
+    set_dependencies(db, sm, memory_store=None)
+    return db, TestClient(app)
+
+
+def test_get_budget_config_returns_defaults_when_unset():
+    import asyncio
+
+    get_budget_tracker().reset()
+    db, client = _make_app_with_db()
+    try:
+        with client:
+            body = client.get("/api/admin/llm/budget/config").json()
+            # No DB rows yet → the requested production defaults.
+            assert body["budget"]["hourly_token_limit"] == 80000
+            assert body["budget"]["daily_token_limit"] == 450000
+            assert body["budget"]["enabled"] is True
+            assert "budget_live" in body
+            assert "dedup_live" in body
+    finally:
+        asyncio.run(db.close())
+        get_budget_tracker().reset()
+
+
+def test_post_budget_config_persists_and_applies_immediately():
+    import asyncio
+
+    get_budget_tracker().reset()
+    db, client = _make_app_with_db()
+    try:
+        with client:
+            r = client.post(
+                "/api/admin/llm/budget/config",
+                json={"hourly_token_limit": 80000, "daily_token_limit": 450000},
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["ok"] is True
+            assert body["budget"]["hourly_token_limit"] == 80000
+            assert body["budget"]["daily_token_limit"] == 450000
+            # The live tracker was reconfigured immediately (no 30s wait).
+            assert body["budget_live"]["hourly_limit"] == 80000
+            assert body["budget_live"]["daily_limit"] == 450000
+
+            # Persisted: a GET reflects the new values.
+            getter = client.get("/api/admin/llm/budget/config").json()
+            assert getter["budget"]["hourly_token_limit"] == 80000
+            assert getter["budget"]["daily_token_limit"] == 450000
+
+        # And the DB rows are actually written.
+        async def _read():
+            row_h = await db.get_setting("llm_hourly_token_limit")
+            row_d = await db.get_setting("llm_daily_token_limit")
+            return row_h["value"], row_d["value"]
+
+        h, d = asyncio.run(_read())
+        assert h == "80000"
+        assert d == "450000"
+    finally:
+        asyncio.run(db.close())
+        get_budget_tracker().reset()
+
+
+def test_post_budget_config_rejects_daily_below_hourly():
+    import asyncio
+
+    get_budget_tracker().reset()
+    db, client = _make_app_with_db()
+    try:
+        with client:
+            r = client.post(
+                "/api/admin/llm/budget/config",
+                json={"hourly_token_limit": 100000, "daily_token_limit": 50000},
+            )
+            assert r.status_code == 400
+            assert "daily_token_limit" in r.json()["detail"]
+    finally:
+        asyncio.run(db.close())
+        get_budget_tracker().reset()
+
+
+def test_post_budget_config_rejects_non_positive_and_non_integer():
+    import asyncio
+
+    get_budget_tracker().reset()
+    db, client = _make_app_with_db()
+    try:
+        with client:
+            assert client.post(
+                "/api/admin/llm/budget/config", json={"hourly_token_limit": 0}
+            ).status_code == 400
+            assert client.post(
+                "/api/admin/llm/budget/config", json={"daily_token_limit": "lots"}
+            ).status_code == 400
+    finally:
+        asyncio.run(db.close())
+        get_budget_tracker().reset()
+
+
+def test_post_budget_config_can_disable_budget():
+    import asyncio
+
+    get_budget_tracker().reset()
+    db, client = _make_app_with_db()
+    try:
+        with client:
+            r = client.post(
+                "/api/admin/llm/budget/config",
+                json={"hourly_token_limit": 80000, "daily_token_limit": 450000, "enabled": False},
+            )
+            assert r.status_code == 200
+            assert r.json()["budget"]["enabled"] is False
+            assert r.json()["budget_live"]["enabled"] is False
+    finally:
+        asyncio.run(db.close())
+        get_budget_tracker().reset()
+
+
+def test_post_budget_config_partial_update_preserves_other_field():
+    """Sending only hourly must not reset daily to a default."""
+    import asyncio
+
+    get_budget_tracker().reset()
+    db, client = _make_app_with_db()
+    try:
+        with client:
+            # Establish a baseline.
+            client.post(
+                "/api/admin/llm/budget/config",
+                json={"hourly_token_limit": 80000, "daily_token_limit": 450000},
+            )
+            # Now bump only hourly.
+            r = client.post(
+                "/api/admin/llm/budget/config",
+                json={"hourly_token_limit": 90000},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["budget"]["hourly_token_limit"] == 90000
+            assert body["budget"]["daily_token_limit"] == 450000  # preserved
+    finally:
+        asyncio.run(db.close())
+        get_budget_tracker().reset()
