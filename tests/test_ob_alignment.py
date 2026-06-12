@@ -1842,6 +1842,55 @@ def test_surface_breath_excludes_anchor_from_core():
     run(scenario())
 
 
+def _fake_principle(bid, text, created):
+    return type("B", (), {
+        "id": bid,
+        "content": text,
+        "metadata": {"id": bid, "name": bid, "principle_injection": text, "created": created},
+    })()
+
+
+def _sm_with_principles(standing, evolving):
+    from server.state_machine import StateMachine
+
+    class FakeOB:
+        async def list_injectable_principles(self):
+            return {"standing": list(standing), "evolving": list(evolving)}
+
+    sm = StateMachine.__new__(StateMachine)
+    sm.ob_client = FakeOB()
+    return sm
+
+
+def test_principle_injection_renders_standing_full_and_trims_evolving_over_budget():
+    async def scenario():
+        # 8 standing × ~300 chars > 2400 budget → standing all full, evolving dropped.
+        standing = [_fake_principle(f"s{i}", "标" * 300, f"2026-01-0{i}T00:00:00") for i in range(1, 9)]
+        evolving = [_fake_principle(f"e{i}", "演" * 100, f"2026-02-0{i}T00:00:00") for i in range(1, 4)]
+        sm = _sm_with_principles(standing, evolving)
+        text = await sm._build_pinned_principles_context()
+        for i in range(1, 9):
+            assert f"s{i}" in text                      # every standing rendered
+        assert ("标" * 300) in text                     # standing NOT truncated (cap 480 > 300)
+        assert "〔当前相处模式·新近〕" not in text       # evolving trimmed by budget
+
+    run(scenario())
+
+
+def test_principle_injection_shows_evolving_and_caps_it_when_under_budget():
+    async def scenario():
+        standing = [_fake_principle("s1", "边界一", "2026-01-01T00:00:00")]
+        evolving = [_fake_principle("e1", "演" * 400, "2026-02-01T00:00:00")]  # 400 > evolving cap 240
+        sm = _sm_with_principles(standing, evolving)
+        text = await sm._build_pinned_principles_context()
+        assert "〔当前相处模式·新近〕" in text
+        assert "e1" in text
+        assert ("演" * 240) in text          # evolving rendered up to its cap
+        assert ("演" * 241) not in text       # but capped at 240
+
+    run(scenario())
+
+
 def test_decay_archives_old_feel():
     async def scenario():
         client = await _client("feel_aging")
