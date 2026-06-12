@@ -1782,6 +1782,66 @@ def test_hold_feel_tool_digests_source_only_after_persist():
     run(scenario())
 
 
+def test_effective_role_explicit_and_legacy_fallback():
+    async def scenario():
+        client = await _client("role_resolve")
+        rid = await client.hold("一条原则", bucket_type="permanent", extra_metadata={"role": "standing_invariant"})
+        assert client.effective_role((await client.get(rid)).metadata) == "standing_invariant"
+        # legacy fallback: pinned/protected permanent → evolving_principle
+        pid = await client.hold("钉住的原则", bucket_type="permanent", pinned=True)
+        assert client.effective_role((await client.get(pid)).metadata) == "evolving_principle"
+        # legacy fallback: bare permanent → anchor (recall-only)
+        bid = await client.hold("裸 permanent 关键事件", bucket_type="permanent")
+        assert client.effective_role((await client.get(bid)).metadata) == "anchor"
+        # non-permanent → None
+        did = await client.hold("一条 dynamic", domain=["x"])
+        assert client.effective_role((await client.get(did)).metadata) is None
+
+    run(scenario())
+
+
+def test_list_injectable_principles_groups_by_role():
+    async def scenario():
+        client = await _client("role_inject")
+        s = await client.hold("一条边界", bucket_type="permanent", extra_metadata={"role": "standing_invariant"})
+        evolving_ids = []
+        for i in range(7):
+            eid = await client.hold(
+                f"相处模式 {i}", bucket_type="permanent", pinned=True,
+                created=f"2026-01-0{i + 1}T00:00:00",
+            )
+            evolving_ids.append(eid)
+        anchor = await client.hold("珍贵原始事件", bucket_type="permanent")  # bare → anchor
+        grouped = await client.list_injectable_principles()
+        assert [b.id for b in grouped["standing"]] == [s]  # all standing injected
+        ev_ids = [b.id for b in grouped["evolving"]]
+        assert len(ev_ids) == 5  # newest 5 of 7
+        assert evolving_ids[6] in ev_ids and evolving_ids[0] not in ev_ids
+        # anchor never enters injection
+        assert anchor not in {b.id for b in grouped["standing"] + grouped["evolving"]}
+
+    run(scenario())
+
+
+def test_surface_breath_excludes_anchor_from_core():
+    async def scenario():
+        client = await _client("role_surface")
+        anchor_pinned = await client.hold(
+            "珍贵但不该自动浮现", bucket_type="permanent", pinned=True,
+            extra_metadata={"role": "anchor"},
+        )
+        evolving = await client.hold(
+            "演化中的相处模式", bucket_type="permanent", pinned=True,
+            extra_metadata={"role": "evolving_principle"},
+        )
+        surfaced = await client._surface_breath(limit=8, domains=set(), include_core=True)
+        ids = {b.id for b in surfaced}
+        assert anchor_pinned not in ids  # anchor stays recall-only
+        assert evolving in ids           # evolving/standing still eligible for core
+
+    run(scenario())
+
+
 def test_decay_archives_old_feel():
     async def scenario():
         client = await _client("feel_aging")

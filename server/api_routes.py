@@ -1248,6 +1248,10 @@ async def ob_hold(payload: dict | None = Body(default=None)):
         bucket_type = "dynamic"
     source_bucket = str(payload.get("source_bucket") or "").strip()
     extra_metadata = {"source_bucket": source_bucket} if bucket_type == "feel" and source_bucket else None
+    role = str(payload.get("role") or "").strip()
+    valid_roles = getattr(_ob_client, "PERMANENT_ROLES", {"evolving_principle", "standing_invariant", "anchor"})
+    if role and role in valid_roles:
+        extra_metadata = {**(extra_metadata or {}), "role": role}
     bucket_id = await _ob_client.hold(
         content,
         name=str(payload.get("name") or "").strip() or None,
@@ -1327,6 +1331,13 @@ async def update_ob_bucket(bucket_id: str, payload: dict | None = Body(default=N
     for key in ("pinned", "protected", "resolved", "crystallized", "digested"):
         if key in payload:
             updates[key] = bool(payload.get(key))
+    if "role" in payload:
+        role = str(payload.get("role") or "").strip()
+        valid_roles = getattr(_ob_client, "PERMANENT_ROLES", {"evolving_principle", "standing_invariant", "anchor"})
+        if role and role not in valid_roles:
+            raise HTTPException(400, "Unsupported role")
+        # "" clears the explicit role → effective_role falls back to legacy.
+        updates["role"] = role
     if "importance" in payload:
         updates["importance"] = _ob_payload_int(payload.get("importance"), 5, 1, 10)
     if "valence" in payload:

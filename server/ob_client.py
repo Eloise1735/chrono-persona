@@ -41,6 +41,16 @@ class OBClient:
 
     ARCHIVE_TYPES = {"archive", "archived"}
 
+    # ── stable-layer role model (spec v2) ──────────────────────────────
+    # permanent buckets are "exempt from forgetting"; within permanent, a
+    # single `role` axis decides behaviour. See
+    # docs/ob_consolidation_primitive_spec.md §2.
+    ROLE_EVOLVING = "evolving_principle"   # 关系整体感受/相处模式；注入按新近 N
+    ROLE_STANDING = "standing_invariant"   # 边界/稳定偏好/重大共识；始终注入
+    ROLE_ANCHOR = "anchor"                 # 原汁原味关键事件；仅 recall，不自动注入
+    PERMANENT_ROLES = {ROLE_EVOLVING, ROLE_STANDING, ROLE_ANCHOR}
+    EVOLVING_PRINCIPLE_INJECT_LIMIT = 5    # evolving 注入窗（新近）
+
     def __init__(self, buckets_dir: str | Path, *, embedding_store: Any | None = None):
         self.base_dir = Path(buckets_dir)
         self.embedding_store = embedding_store
@@ -525,11 +535,18 @@ class OBClient:
         pinned_core: list[OBBucket] = []
         protected_core: list[OBBucket] = []
         if include_core:
-            pinned_core = [b for b in buckets if b.metadata.get("pinned")]
+            # anchor-role permanent is recall-only: it must never take an
+            # auto-surfacing core slot (spec §2.2). evolving/standing still may.
+            pinned_core = [
+                b for b in buckets
+                if b.metadata.get("pinned")
+                and self.effective_role(b.metadata) != self.ROLE_ANCHOR
+            ]
             protected_core = [
                 b for b in buckets
                 if b.metadata.get("protected")
                 and not b.metadata.get("pinned")
+                and self.effective_role(b.metadata) != self.ROLE_ANCHOR
                 and (
                     self._bucket_type(b.metadata) == "permanent"
                     or "core" in {str(d).strip() for d in b.metadata.get("domain", [])}
@@ -853,6 +870,49 @@ class OBClient:
         for bucket in buckets:
             bucket.score = self.calculate_score(bucket.metadata)
         return buckets[: max(1, min(50, int(limit or 5)))]
+
+    def effective_role(self, meta: dict) -> str | None:
+        """Resolve the stable-layer role of a permanent bucket.
+
+        Returns None for non-permanent buckets. For permanent buckets, an
+        explicit valid `role` wins; otherwise the legacy fallback applies
+        (spec §2.4): pinned/protected → evolving_principle; bare permanent →
+        anchor. `pinned`/`protected` are kept for compatibility and never
+        removed by this resolution.
+        """
+        if not isinstance(meta, dict):
+            return None
+        if self._bucket_type(meta) != "permanent":
+            return None
+        explicit = str(meta.get("role") or "").strip()
+        if explicit in self.PERMANENT_ROLES:
+            return explicit
+        if meta.get("pinned") or meta.get("protected"):
+            return self.ROLE_EVOLVING
+        return self.ROLE_ANCHOR
+
+    async def list_injectable_principles(self) -> dict[str, list[OBBucket]]:
+        """Group permanent buckets for get_current_state injection by role.
+
+        Returns {"standing": [...all standing_invariant...],
+                 "evolving": [...newest EVOLVING_PRINCIPLE_INJECT_LIMIT...]}.
+        anchor-role buckets are intentionally excluded (recall-only).
+        """
+        standing: list[OBBucket] = []
+        evolving: list[OBBucket] = []
+        for bucket in await self.list_buckets(include_archive=False):
+            role = self.effective_role(bucket.metadata)
+            if role == self.ROLE_STANDING:
+                standing.append(bucket)
+            elif role == self.ROLE_EVOLVING:
+                evolving.append(bucket)
+        key_created = lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or "")
+        standing.sort(key=key_created, reverse=True)
+        evolving.sort(key=key_created, reverse=True)
+        evolving = evolving[: max(1, int(self.EVOLVING_PRINCIPLE_INJECT_LIMIT))]
+        for bucket in standing + evolving:
+            bucket.score = self.calculate_score(bucket.metadata)
+        return {"standing": standing, "evolving": evolving}
 
     async def _query_breath(
         self,
