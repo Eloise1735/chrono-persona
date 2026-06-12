@@ -5316,28 +5316,23 @@ class StateMachine:
         if self.ob_client is None:
             return "（暂无稳定原则结晶）"
         try:
-            if hasattr(self.ob_client, "recent_pinned"):
-                buckets = await self.ob_client.recent_pinned(limit=max(1, int(limit or 5)))
-            else:
-                all_buckets = await self.ob_client.list_buckets(include_archive=False)
-                buckets = [bucket for bucket in all_buckets if (getattr(bucket, "metadata", {}) or {}).get("pinned")]
-                buckets.sort(key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""), reverse=True)
-                buckets = buckets[: max(1, int(limit or 5))]
+            grouped = await self.ob_client.list_injectable_principles()
         except Exception:
-            logger.exception("Failed to load pinned OB principles for injectable context.")
+            logger.exception("Failed to load injectable principles for context.")
             return "（稳定原则结晶暂时无法读取）"
-        if not buckets:
+        standing = grouped.get("standing") or []
+        evolving = grouped.get("evolving") or []
+        if not standing and not evolving:
             return "（暂无稳定原则结晶）"
 
-        lines: list[str] = []
-        for bucket in buckets[: max(1, int(limit or 5))]:
+        def format_line(bucket) -> str:
             meta = getattr(bucket, "metadata", {}) or {}
             bucket_id = str(meta.get("id") or getattr(bucket, "id", "") or "").strip()
             title = (
                 str(meta.get("principle_title") or "").strip()
                 or str(meta.get("name") or "").strip()
                 or bucket_id
-                or "pinned principle"
+                or "principle"
             )
             domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip())
             tags = ", ".join(str(t) for t in meta.get("tags", [])[:4] if str(t).strip())
@@ -5354,11 +5349,18 @@ class StateMachine:
             if not injection:
                 injection = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
             injection = self._compact_structured_memory_text(injection)[:260]
-            if injection:
-                lines.append(f"- {title}{label}: {injection}")
-            else:
-                lines.append(f"- {title}{label}")
-        return "\n".join(lines)
+            return f"- {title}{label}: {injection}" if injection else f"- {title}{label}"
+
+        # standing_invariant：始终成立的边界/偏好/共识（全量）。
+        # evolving_principle：演化中的相处模式（新近窗）。anchor 不注入。
+        sections: list[str] = []
+        if standing:
+            sections.append("〔长期准则·始终成立〕")
+            sections.extend(format_line(b) for b in standing)
+        if evolving:
+            sections.append("〔当前相处模式·新近〕")
+            sections.extend(format_line(b) for b in evolving)
+        return "\n".join(sections)
 
     async def _build_injectable_context(self, snapshot_text: str) -> str:
         key_records_text = await self._build_recent_key_records_context(limit=5)
