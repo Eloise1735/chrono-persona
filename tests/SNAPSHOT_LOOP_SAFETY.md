@@ -240,6 +240,37 @@ defensive regardless.
   - `test_repair_leaves_clean_rows_untouched`
   - `test_admin_repair_text_endpoint`
 
+### D2 — enum-drift graceful degradation (NPC 500 incident)
+
+**Invariant.** A DB row whose Literal/enum column holds an out-of-range
+value (empty string from a manual edit / external import / partial
+insert) must never 500 a list endpoint. Root cause of the GET /api/npcs
+500: an npc_entities row had `status=''` / `spawn_source=''`; the strict
+Literal fields rejected them and `[NPCEntity(**dict(r)) for r in rows]`
+propagated one row's `ValidationError` to the whole endpoint. Two layers:
+`models._DomainModel` (a `model_validator(mode="before")` base shared by
+all 14 domain models) coerces any out-of-range Literal value to the
+field default; `database._rows_to_models` skips rows that STILL fail
+(e.g. NULL in a required non-Literal column). API request models stay on
+plain `BaseModel` so bad client input is still rejected.
+
+- [`test_model_enum_resilience.py`](test_model_enum_resilience.py)
+  - `test_literal_options_*` (3 — plain / optional / non-literal)
+  - `test_npc_empty_enums_coerce_to_default`
+    *(the exact failing /api/npcs payload)*
+  - `test_npc_unknown_enum_value_coerces_to_default`
+  - `test_valid_enum_values_pass_through_unchanged`
+  - `test_coercion_does_not_touch_non_enum_fields`
+  - `test_coercion_applies_across_domain_models`
+    *(DailyPlan / PlanItem too, not just NPCEntity)*
+  - `test_required_literal_with_no_default_uses_first_option`
+  - `test_api_request_model_still_rejects_bad_enum`
+    *(strict request models are NOT degraded)*
+  - `test_rows_to_models_skips_unparseable_row`
+  - `test_rows_to_models_empty_input`
+  - `test_list_npc_entities_survives_empty_enum_row`
+    *(reproduces the /api/npcs 500 end-to-end)*
+
 ## Deferred phases
 
 These phases of [`docs/fix_plan_snapshot_loop.md`](../docs/fix_plan_snapshot_loop.md)
@@ -267,10 +298,11 @@ pytest tests/test_database_snapshot_ordering.py \
        tests/test_admin_health_endpoint.py \
        tests/test_llm_budget_dedup.py \
        tests/test_db_non_utf8_text.py \
+       tests/test_model_enum_resilience.py \
        tests/test_snapshot_loop_safety_incident_replay.py -v
 ```
 
-As of the D1 commit this suite is 97 tests; the full repo suite is 183.
+As of the D2 commit this suite is 110 tests; the full repo suite is 196.
 Either should be green before merging anything that touches
 `server/database.py`, `server/state_machine.py`,
 `server/scheduler_breaker.py`, `server/llm_client.py`,
