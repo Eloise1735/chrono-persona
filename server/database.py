@@ -10,6 +10,34 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+
+def _lenient_text_factory(raw: bytes) -> str:
+    """SQLite TEXT decoder that never crashes a query on a corrupt row.
+
+    SQLite's default text_factory decodes TEXT columns as strict UTF-8 and
+    raises `OperationalError: Could not decode to UTF-8 column ...` if a row
+    contains non-UTF-8 bytes. Those bytes can only get in when something
+    *outside* this app wrote them — a DB GUI, a manual SQL/import script, or
+    a paste of model output saved in a non-UTF-8 encoding (on Windows the
+    default is GBK). A single such row would otherwise 500 an entire
+    endpoint (e.g. GET /api/plans/history calling fetchall()).
+
+    The clean fast path (valid UTF-8) is unaffected; only genuinely corrupt
+    bytes hit the replacement path, with a one-time warning so the operator
+    knows to run Database.repair_non_utf8_text(). See the daily-plan UTF-8
+    incident notes in docs/fix_plan_snapshot_loop.md.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning(
+            "Non-UTF-8 bytes in a TEXT column (row written by an external "
+            "tool / non-UTF-8 upload); decoding with replacement. Run the "
+            "repair utility to clean it permanently. preview=%r",
+            raw[:60],
+        )
+        return raw.decode("utf-8", errors="replace")
+
 from server.models import (
     CharacterNotification,
     ConversationTimeClaim,
@@ -317,6 +345,9 @@ class Database:
         os.makedirs(Path(self._db_path).parent, exist_ok=True)
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
+        # Tolerate non-UTF-8 bytes in TEXT columns (see _lenient_text_factory).
+        # Must be set before any query so corrupt legacy rows can't 500 a read.
+        self._conn.text_factory = _lenient_text_factory
 
         # temp_store=MEMORY: keep sort/group spill buffers in process memory
         # instead of writing them to the OS temp directory. The dataset is
@@ -2237,6 +2268,79 @@ class Database:
             return [dict(r) for r in rows]
 
     # ── Daily Plans ──
+
+    # Text columns most likely to hold externally-written / pasted content
+    # that could carry non-UTF-8 bytes. Used by repair_non_utf8_text().
+    _NON_UTF8_REPAIR_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("daily_plans", ("raw_plan", "context_snapshot")),
+        ("state_snapshots", ("content", "environment")),
+        ("event_anchors", ("description",)),
+        ("key_records", ("content_text", "content_json")),
+        ("world_books", ("content",)),
+    )
+
+    async def repair_non_utf8_text(self, *, dry_run: bool = False) -> dict:
+        """Permanently clean rows whose TEXT columns hold non-UTF-8 bytes.
+
+        With _lenient_text_factory installed, such rows already read back as
+        str with U+FFFD where the bad bytes were — so reads no longer 500.
+        This rewrites those rows so the *stored* bytes become valid UTF-8,
+        removing the corruption at the source. Idempotent: a clean DB makes
+        zero writes. Safe to run on startup or via an admin endpoint.
+
+        Detection heuristic: a value containing U+FFFD (replacement char) is
+        treated as corrupt. A genuine, intentionally-stored U+FFFD would be
+        rewritten to the identical bytes — harmless.
+        """
+        report: dict = {"scanned": 0, "repaired": 0, "by_table": {}, "dry_run": dry_run}
+        for table, cols in self._NON_UTF8_REPAIR_TARGETS:
+            # Skip tables that don't exist in this DB.
+            try:
+                async with self.conn.execute(
+                    f"SELECT * FROM {table} LIMIT 0"
+                ) as cur:
+                    available = {d[0] for d in cur.description}
+            except Exception:
+                continue
+            target_cols = [c for c in cols if c in available]
+            if not target_cols:
+                continue
+            # Read each target column as a BLOB so we get the RAW stored bytes
+            # (text_factory is bypassed for BLOB). Strict-decoding those bytes
+            # is the precise corruption test — and it's idempotent: once a row
+            # is rewritten as valid UTF-8, its bytes strict-decode cleanly and
+            # it's never flagged again. (The earlier "contains U+FFFD" string
+            # heuristic mis-fired forever, since a repaired row legitimately
+            # holds a U+FFFD char.)
+            blob_cols = ", ".join(f"CAST({c} AS BLOB) AS {c}" for c in target_cols)
+            async with self.conn.execute(f"SELECT id, {blob_cols} FROM {table}") as cur:
+                rows = await cur.fetchall()
+            table_repaired = 0
+            for row in rows:
+                report["scanned"] += 1
+                updates: dict[str, str] = {}
+                for c in target_cols:
+                    raw = row[c]
+                    if not isinstance(raw, (bytes, bytearray)):
+                        continue  # NULL, or already a clean str under some driver
+                    try:
+                        raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        updates[c] = bytes(raw).decode("utf-8", errors="replace")
+                if updates and not dry_run:
+                    set_clause = ", ".join(f"{c} = ?" for c in updates)
+                    await self.conn.execute(
+                        f"UPDATE {table} SET {set_clause} WHERE id = ?",
+                        [*updates.values(), row["id"]],
+                    )
+                if updates:
+                    table_repaired += 1
+            if table_repaired:
+                report["by_table"][table] = table_repaired
+                report["repaired"] += table_repaired
+        if report["repaired"] and not dry_run:
+            await self.conn.commit()
+        return report
 
     async def insert_daily_plan(self, plan: DailyPlan) -> int:
         cursor = await self.conn.execute(

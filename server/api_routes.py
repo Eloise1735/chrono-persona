@@ -3513,6 +3513,19 @@ async def get_admin_health():
     }
 
 
+@router.post("/admin/db/repair-text")
+async def repair_db_text(payload: dict | None = Body(default=None)):
+    """Clean rows whose TEXT columns hold non-UTF-8 bytes (e.g. a daily-plan
+    uploaded in a non-UTF-8 encoding). Pass {"dry_run": true} to preview.
+    With the lenient text_factory installed, reads already survive corrupt
+    rows; this makes the stored bytes valid UTF-8 permanently."""
+    if _db is None:
+        raise HTTPException(500, "database not initialized")
+    dry_run = bool((payload or {}).get("dry_run", False))
+    report = await _db.repair_non_utf8_text(dry_run=dry_run)
+    return {"ok": True, **report}
+
+
 @router.get("/admin/llm/budget/config")
 async def get_llm_budget_config():
     """Return the persisted budget thresholds plus the live tracker
