@@ -11,6 +11,36 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 
+def _rows_to_models(model_cls, rows, *, context: str = ""):
+    """Materialize DB rows into pydantic models, skipping (not crashing on)
+    any individual row that still fails to validate.
+
+    Domain models already coerce out-of-range Literal values to defaults
+    (see models._DomainModel), so this is the second line of defense for
+    rarer corruption — a NULL in a required non-Literal column, a type
+    mismatch from a manual edit, etc. One bad row must never 500 a whole
+    list endpoint (this is what crashed GET /api/npcs and /api/plans/history).
+    """
+    out = []
+    for r in rows:
+        try:
+            out.append(model_cls(**dict(r)))
+        except Exception as exc:
+            rid = None
+            try:
+                rid = dict(r).get("id")
+            except Exception:
+                pass
+            logger.warning(
+                "Skipping unparseable %s row (id=%s) in %s: %s",
+                getattr(model_cls, "__name__", model_cls),
+                rid,
+                context or "list query",
+                exc,
+            )
+    return out
+
+
 def _lenient_text_factory(raw: bytes) -> str:
     """SQLite TEXT decoder that never crashes a query on a corrupt row.
 
@@ -2401,7 +2431,7 @@ class Database:
         params.extend([limit, offset])
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-            return [DailyPlan(**dict(r)) for r in rows]
+            return _rows_to_models(DailyPlan, rows, context="list_daily_plans")
 
     async def update_daily_plan(self, plan_id: int, **fields) -> None:
         if not fields:
@@ -3087,7 +3117,7 @@ class Database:
         params.extend([limit, offset])
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-            return [NPCEntity(**dict(r)) for r in rows]
+            return _rows_to_models(NPCEntity, rows, context="list_npc_entities")
 
     async def update_npc_entity(self, npc_id: int, **fields) -> None:
         if not fields:
