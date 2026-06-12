@@ -208,6 +208,38 @@ smoke alarm for the whole subsystem.
     *(mid-flight tick is observable on the dashboard but does not
     corrupt last_snapshot_at)*
 
+### D1 — non-UTF-8 TEXT resilience (daily-plan corruption incident)
+
+**Invariant.** A TEXT column holding non-UTF-8 bytes must never 500 a
+read. SQLite's default text_factory strict-decodes TEXT and raises
+`OperationalError: Could not decode to UTF-8 column ...`; a single such
+row (written from outside the app — a non-UTF-8/GBK upload, a manual SQL
+edit, or a truncated multibyte paste) would take down an entire endpoint
+(`GET /api/plans/history` → `list_daily_plans` → `fetchall()`).
+`_lenient_text_factory` decodes with replacement so reads survive;
+`Database.repair_non_utf8_text()` rewrites the offending rows to valid
+UTF-8 permanently (detected precisely via `CAST(col AS BLOB)` +
+strict-decode, so it's idempotent). Exposed as `POST
+/api/admin/db/repair-text` and `migrate/repair_non_utf8_text.py`.
+
+The app's own write paths bind Python `str` (always valid UTF-8), so this
+corruption can only originate outside the app — but the read path must be
+defensive regardless.
+
+- [`test_db_non_utf8_text.py`](test_db_non_utf8_text.py)
+  - `test_lenient_factory_passes_valid_utf8_unchanged`
+  - `test_lenient_factory_replaces_invalid_bytes_without_raising`
+  - `test_list_daily_plans_survives_corrupt_row`
+    *(reproduces the exact /api/plans/history 500)*
+  - `test_default_factory_would_have_crashed`
+    *(guards the premise — strict factory DOES raise on the same row)*
+  - `test_repair_rewrites_corrupt_row_to_valid_utf8`
+    *(post-repair, a STRICT-factory connection reads it cleanly)*
+  - `test_repair_is_idempotent_and_clean_db_is_noop`
+  - `test_repair_dry_run_reports_without_writing`
+  - `test_repair_leaves_clean_rows_untouched`
+  - `test_admin_repair_text_endpoint`
+
 ## Deferred phases
 
 These phases of [`docs/fix_plan_snapshot_loop.md`](../docs/fix_plan_snapshot_loop.md)
@@ -234,11 +266,12 @@ pytest tests/test_database_snapshot_ordering.py \
        tests/test_scheduler_circuit_breaker.py \
        tests/test_admin_health_endpoint.py \
        tests/test_llm_budget_dedup.py \
+       tests/test_db_non_utf8_text.py \
        tests/test_snapshot_loop_safety_incident_replay.py -v
 ```
 
-As of the A2+A3 commit this suite is 88 tests; the full repo suite is
-156. Either should be green before merging anything that touches
+As of the D1 commit this suite is 97 tests; the full repo suite is 183.
+Either should be green before merging anything that touches
 `server/database.py`, `server/state_machine.py`,
 `server/scheduler_breaker.py`, `server/llm_client.py`,
 `server/main.py` scheduler loops, or `server/api_routes.py` admin
