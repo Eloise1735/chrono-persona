@@ -152,6 +152,64 @@ def _extract_json_array(text: str) -> list[Any]:
     return []
 
 
+def _salvage_json_array(text: str) -> list[dict]:
+    """Recover complete top-level objects from a JSON array that was cut off
+    mid-stream (the classic `finish_reason=length` truncation).
+
+    `_extract_json_array` needs a balanced `[...]`; a response truncated at
+    the token cap has no closing bracket, so it returns [] and the caller
+    raises PlanGenerationEmptyError → the scheduler retries forever. This
+    scanner instead walks the text from the first `[`, tracking string and
+    brace state, and json.loads each balanced top-level `{...}` object. A
+    16-hour plan truncated at hour 13 still yields 12 usable items — far
+    better than discarding the whole (expensive) response and looping.
+
+    See the daily-plan truncation root-cause in the fix notes.
+    """
+    raw = text or ""
+    start = raw.find("[")
+    if start < 0:
+        return []
+    items: list[dict] = []
+    depth = 0
+    in_str = False
+    escape = False
+    obj_start: int | None = None
+    i = start + 1
+    n = len(raw)
+    while i < n:
+        c = raw[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif c == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and obj_start is not None:
+                        try:
+                            obj = json.loads(raw[obj_start : i + 1])
+                            if isinstance(obj, dict):
+                                items.append(obj)
+                        except Exception:
+                            pass
+                        obj_start = None
+            elif c == "]" and depth == 0:
+                break
+        i += 1
+    return items
+
+
 def _bool_from_setting(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -684,6 +742,14 @@ class PlanEngine:
         self._execute_lock = asyncio.Lock()
         self._web_search: WebSearchClient | None = None
         self._last_drift_at: datetime | None = None
+        # Per-day daily-plan generation failure cap (structural loop-killer).
+        # Keyed by plan_date ISO string. Even if generation keeps failing
+        # (truncation, quota, upstream 5xx), ensure_today_plan must NOT retry
+        # every 60s for the whole day. After N failures for a given date we
+        # stop trying until the date rolls over. In-memory by design: a
+        # process restart is a deliberate manual intervention and may retry.
+        self._plan_gen_attempts: dict[str, int] = {}
+        self._plan_gen_giveup_logged: dict[str, bool] = {}
 
     def set_notification_dispatcher(self, dispatcher: NotificationDispatcher | None) -> None:
         self._notify = dispatcher
@@ -1110,25 +1176,66 @@ class PlanEngine:
         today = shanghai_now().date().isoformat()
         existing = await self.db.get_latest_daily_plan_for_date(today, status="active")
         if existing is not None:
+            # Success (or a plan already exists) — clear any failure bookkeeping
+            # so a future bad day starts from a clean counter.
+            self._plan_gen_attempts.pop(today, None)
+            self._plan_gen_giveup_logged.pop(today, None)
             return
         gen_hour = await self._int_setting(KEY_PLAN_GENERATION_HOUR, 6)
         if shanghai_now().hour < gen_hour:
             return
+
+        # Per-day failure cap (structural loop-killer). Without this, a
+        # persistent generation failure (the max_tokens-truncation bug, a
+        # quota 403, malformed output) retried every 60s for the whole day,
+        # which is exactly how the gemini-3-flash money loop happened.
+        max_attempts = await self._int_setting("plan_generation_max_attempts_per_day", 3)
+        attempts = self._plan_gen_attempts.get(today, 0)
+        if attempts >= max_attempts:
+            if not self._plan_gen_giveup_logged.get(today):
+                logger.error(
+                    "ensure_today_plan: GIVING UP daily plan generation for %s after "
+                    "%d failed attempts; will not retry until the date rolls over. "
+                    "Check plan_generation_max_tokens and upstream quota. Use the "
+                    "settings UI to raise the cap, then it retries next day.",
+                    today, attempts,
+                )
+                self._plan_gen_giveup_logged[today] = True
+            return
+
+        self._prune_plan_gen_attempts(today)
         try:
             await self.generate_daily_plan(today)
+            # Success — clear the counter for today.
+            self._plan_gen_attempts.pop(today, None)
+            self._plan_gen_giveup_logged.pop(today, None)
         except PLAN_TRANSIENT_GENERATION_ERRORS as exc:
-            # Transient upstream/parse failure: no active plan was written, so
-            # the next scheduler tick retries automatically. Log explicitly —
-            # previously this failed silently (empty plan, no signal) — but do
-            # NOT re-raise: that would abort the rest of the life tick (snapshot
-            # advance) and could pause the scheduler via its circuit breaker.
+            # Transient upstream/parse failure: no active plan was written. We
+            # bump the per-day counter and allow a bounded number of retries on
+            # subsequent ticks; once max_attempts is hit we stop for the day
+            # (see the guard above). Do NOT re-raise: that would abort the rest
+            # of the life tick (snapshot advance) and could pause the scheduler
+            # via its circuit breaker.
+            self._plan_gen_attempts[today] = attempts + 1
             logger.warning(
-                "ensure_today_plan: daily plan generation for %s failed transiently "
-                "(%s: %s); leaving today's plan unset for retry on the next tick.",
+                "ensure_today_plan: daily plan generation for %s failed (%s: %s); "
+                "attempt %d/%d. Leaving today's plan unset for a bounded retry.",
                 today,
                 type(exc).__name__,
                 exc,
+                attempts + 1,
+                max_attempts,
             )
+
+    def _prune_plan_gen_attempts(self, keep_date: str) -> None:
+        """Drop failure bookkeeping for any date other than today so the
+        in-memory dicts can't grow without bound in a long-running process."""
+        for d in list(self._plan_gen_attempts.keys()):
+            if d != keep_date:
+                self._plan_gen_attempts.pop(d, None)
+        for d in list(self._plan_gen_giveup_logged.keys()):
+            if d != keep_date:
+                self._plan_gen_giveup_logged.pop(d, None)
 
     async def get_current_item(self) -> PlanItem | None:
         if not await self.is_enabled():
@@ -1456,16 +1563,41 @@ class PlanEngine:
             hour_end=h1,
         )
         system_prompt = await self.prompt_manager.get_system_prompt()
+        # ROOT-CAUSE FIX: the daily-plan prompt asks for ~20 structured fields
+        # per hourly block across the full waking day (h0..h1, up to ~16
+        # blocks). That is 6k–12k output tokens. The old max_tokens=4000 cap
+        # truncated gemini-3-flash mid-array on EVERY call (completion≈3996),
+        # so _extract_json_array always returned [] → PlanGenerationEmptyError
+        # → ensure_today_plan swallowed it → the 60s scheduler retried all day,
+        # burning ~14k tokens/tick. Raise the cap (configurable) so a normal
+        # full-day plan fits, and salvage partial output if it still truncates.
+        gen_max_tokens = await self._int_setting("plan_generation_max_tokens", 12000)
         response = await self.llm.chat(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.55,
-            max_tokens=4000,
+            max_tokens=gen_max_tokens,
         )
         rows = _extract_json_array(response or "")
         raw_plan = (response or "").strip()
+
+        # Truncation safety net: if strict parsing failed (no balanced
+        # bracket), try to salvage the complete leading objects from a
+        # cut-off array. A partial plan (e.g. 12 of 16 hours) is still a
+        # valid active plan and — crucially — stops the retry loop.
+        if not rows:
+            salvaged = _salvage_json_array(response or "")
+            if salvaged:
+                logger.warning(
+                    "Daily plan for %s: strict JSON parse failed but salvaged %d "
+                    "complete item(s) from a likely-truncated response "
+                    "(response_chars=%d, max_tokens=%d). Using partial plan. "
+                    "Consider raising plan_generation_max_tokens.",
+                    plan_date, len(salvaged), len(response or ""), gen_max_tokens,
+                )
+                rows = salvaged
 
         # Guard against writing an empty active plan placeholder. If the LLM
         # returned nothing usable (upstream 502 with empty body, truncated /
