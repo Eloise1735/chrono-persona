@@ -16,6 +16,8 @@ from server.environment import (
     environment_text_for_retrieval,
 )
 from server.llm_client import (
+    BudgetExceeded,
+    DuplicatePromptError,
     LLMClient,
     LLMTimeoutError,
     LLMTransportError,
@@ -150,14 +152,26 @@ class StateMachine:
             LLMTimeoutError,
             LLMUpstreamHTTPError,
             LLMTransportError,
+            # A3 dedup is intentional skip behavior, not a real failure —
+            # the cooldown window will lapse on its own. Counting it would
+            # let a dup storm pause the loop unnecessarily.
+            DuplicatePromptError,
         )
+        # A2 BudgetExceeded is the opposite: it must short-circuit straight
+        # to paused. The dedup-and-budget pair is the last-line backstop
+        # for any future silent loop — once daily budget is hit, the
+        # scheduler stops until manual reset, so the proxy balance can't
+        # be drained.
+        _budget_kill_errors = (BudgetExceeded,)
         self.snapshot_scheduler_breaker = SchedulerCircuitBreaker(
             name="snapshot_scheduler",
             non_failure_exception_types=_upstream_transient_errors,
+            pause_immediately_exception_types=_budget_kill_errors,
         )
         self.life_scheduler_breaker = SchedulerCircuitBreaker(
             name="life_scheduler",
             non_failure_exception_types=_upstream_transient_errors,
+            pause_immediately_exception_types=_budget_kill_errors,
         )
 
     def set_plan_engine(self, plan_engine) -> None:

@@ -14,6 +14,76 @@ when in doubt.
 
 ## Layered defenses and their tests
 
+### A2 — LLM budget hard cap (last-line backstop)
+
+**Invariant.** Every `LLMClient.chat()` call computes an estimated token
+spend (prompt chars + `max_tokens` ceiling) and consults the
+process-wide `_BudgetTracker` BEFORE any HTTP request. Hourly and daily
+sliding windows; if the next call would exceed either, `BudgetExceeded`
+is raised. **`BudgetExceeded` inherits from `BaseException`**, so
+scattered `except Exception` blocks (in side-effect helpers, in
+`_merge_environment_event_summary`, in legacy retry loops) do NOT
+silently swallow it — it must propagate to the scheduler loop, where
+C1's `pause_immediately_exception_types=(BudgetExceeded,)` clamps the
+loop to paused. Limits are runtime-tunable via DB settings
+`llm_budget_enabled`, `llm_hourly_token_limit`, `llm_daily_token_limit`.
+
+- [`test_llm_budget_dedup.py`](test_llm_budget_dedup.py)
+  - `test_budget_allows_calls_under_hourly_limit`
+  - `test_budget_blocks_when_hourly_limit_would_be_exceeded`
+  - `test_budget_blocks_when_daily_limit_would_be_exceeded`
+  - `test_budget_window_eviction_lets_calls_through_after_an_hour`
+  - `test_budget_can_be_disabled_via_configure`
+  - `test_budget_snapshot_reports_used_remaining_and_rejections`
+  - `test_budget_reset_clears_counters`
+  - `test_budget_exceeded_is_not_caught_by_except_exception`
+    *(the headline A2 invariant — locks the BaseException inheritance)*
+  - `test_breaker_pauses_immediately_on_budget_exceeded`
+    *(C1 integration)*
+
+### A3 — Prompt-hash dedup at LLMClient layer
+
+**Invariant.** Every `LLMClient.chat()` call computes a sha256 of
+(model, messages, temperature) and consults the process-wide
+`_PromptDedupTracker`. If the same hash was sent inside the cooldown
+window (default 60s, configurable via `llm_dedup_window_sec`), it
+raises `DuplicatePromptError` before any HTTP request. The dup
+storm gets absorbed silently — C1 classifies `DuplicatePromptError`
+as `non_failure_exception_types` so the breaker doesn't pause on
+intentional skips, and `plan_engine.PLAN_TRANSIENT_GENERATION_ERRORS`
+includes it so `ensure_today_plan` swallows it naturally for the next
+tick to retry once the window expires. **This is the layer that catches
+calls B2's per-call-site wraps miss**: plan_engine, npc_engine, evolution,
+the merge helper, and any future caller — all protected without
+per-site changes.
+
+- [`test_llm_budget_dedup.py`](test_llm_budget_dedup.py)
+  - `test_hash_is_stable_for_same_inputs`
+  - `test_hash_changes_when_model_changes`
+  - `test_hash_changes_when_messages_change`
+  - `test_hash_changes_when_temperature_changes`
+  - `test_dedup_blocks_identical_hash_inside_window`
+  - `test_dedup_allows_after_window_expires`
+  - `test_dedup_does_not_block_distinct_hashes`
+  - `test_dedup_can_be_disabled_via_configure`
+  - `test_dedup_rejection_counters_tick_up`
+  - `test_dedup_reset_clears_state`
+  - `test_dedup_lru_eviction_caps_memory`
+    *(long-running process never accumulates unbounded state)*
+  - `test_duplicate_prompt_error_IS_caught_by_except_exception`
+    *(symmetric to A2 — dups are RuntimeError so legacy fallback
+    paths absorb them)*
+  - `test_breaker_classifies_duplicate_prompt_as_non_failure`
+    *(C1 integration)*
+
+Both A2 and A3 also surface state on `/api/admin/health` under
+`llm_budget` and `llm_dedup`, and expose `POST
+/api/admin/llm/budget/reset` and `POST /api/admin/llm/dedup/reset` for
+one-click recovery after a top-up or tuning change:
+
+- `test_admin_health_includes_llm_budget_and_dedup_blocks`
+- `test_admin_reset_endpoints_clear_tracker_state`
+
 ### B1 — snapshot ordering by real UTC instant
 
 **Invariant.** `state_snapshots.created_at` rows in either `...Z` or
@@ -145,18 +215,14 @@ were NOT implemented (the team opted to ship the highest-value layers
 first) and have no tests yet. If you implement them later, add the
 corresponding tests here so the registry stays current.
 
-- **A2** — LLM hard budget cap (`BudgetExceeded` exception). Designed to
-  plug into `SchedulerCircuitBreaker.pause_immediately_exception_types`
-  without re-touching `server/main.py`.
-- **A3** — Prompt-hash 60 s dedup at the `LLMClient.chat` level.
-  Designed to plug into `non_failure_exception_types` so duplicate-prompt
-  skips don't trip C1.
 - **B4** — `idempotency_key` on `reflect_on_conversation` for client-side
   retry de-duplication. Skipped because the current production deployment
   generates reflects in the front-end model directly and does not call
   the backend reflect endpoint.
-- **C2** — Hourly/daily budget threshold alerts at 80% / 95%. Depends on
-  A2's tracker.
+- **C2** — Hourly/daily budget threshold alerts at 80% / 95%. A2's
+  tracker is already in place; C2 would add an event-stream alert when
+  `hourly_used / hourly_limit` crosses 0.80 and again at 0.95 so the
+  admin sees the warning BEFORE the tracker actually raises.
 
 ## Running just the safety suite
 
@@ -167,11 +233,13 @@ pytest tests/test_database_snapshot_ordering.py \
        tests/test_snapshot_side_effect_isolation.py \
        tests/test_scheduler_circuit_breaker.py \
        tests/test_admin_health_endpoint.py \
+       tests/test_llm_budget_dedup.py \
        tests/test_snapshot_loop_safety_incident_replay.py -v
 ```
 
-As of the C4 commit this suite is 60 tests; the full repo suite is 111.
-Either should be green before merging anything that touches
+As of the A2+A3 commit this suite is 88 tests; the full repo suite is
+156. Either should be green before merging anything that touches
 `server/database.py`, `server/state_machine.py`,
-`server/scheduler_breaker.py`, `server/main.py` scheduler loops, or
-`server/api_routes.py` admin endpoints.
+`server/scheduler_breaker.py`, `server/llm_client.py`,
+`server/main.py` scheduler loops, or `server/api_routes.py` admin
+endpoints.

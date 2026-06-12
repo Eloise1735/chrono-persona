@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json as _json
 import logging
+import time
+from collections import OrderedDict, deque
 from contextvars import ContextVar
 
 import httpx
@@ -32,6 +36,296 @@ class LLMTransportError(RuntimeError):
     def __init__(self, message: str, status_code: int = 502):
         super().__init__(message)
         self.status_code = int(status_code)
+
+
+# ── A3: prompt-hash dedup ────────────────────────────────────────────
+
+
+class DuplicatePromptError(RuntimeError):
+    """Raised when an identical prompt was sent within the dedup window.
+
+    The original 21-hour incident burned the same prompt every ~90 seconds.
+    A3 catches that at the LLMClient layer: every chat() entry hashes
+    (model, messages, temperature) and refuses to send if the same hash
+    was sent inside `llm_dedup_window_sec` (default 60).
+
+    Inherits from RuntimeError (so legacy `except Exception` blocks catch
+    it and use their fallback paths). C1's circuit breaker treats it as
+    non_failure so a dup storm doesn't pause the loop — the dedup window
+    naturally expires.
+    """
+
+    def __init__(self, prompt_hash: str, last_sent_at: float, window_sec: float):
+        self.prompt_hash = prompt_hash
+        self.last_sent_at = last_sent_at
+        self.window_sec = float(window_sec)
+        super().__init__(
+            f"identical prompt sent {time.time() - last_sent_at:.1f}s ago "
+            f"(window {window_sec:.0f}s); refusing duplicate call. hash={prompt_hash[:12]}"
+        )
+
+
+# ── A2: hourly + daily token budget cap ──────────────────────────────
+
+
+class BudgetExceeded(BaseException):
+    """Raised when the projected token spend would exceed the hourly or
+    daily budget.
+
+    **Inherits from BaseException, not RuntimeError**, so `except Exception`
+    blocks scattered around the codebase do NOT swallow it. Budget
+    exhaustion is like asyncio.CancelledError: it must propagate to the
+    scheduler loop where C1 catches it via pause_immediately_exception_types
+    and stops the loop entirely. That's the last-line backstop — if any
+    future bug introduces a new silent loop, BudgetExceeded short-circuits
+    it before the proxy balance is drained.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: str,
+        used_tokens: int,
+        limit_tokens: int,
+        est_tokens: int,
+    ):
+        self.window = window
+        self.used_tokens = int(used_tokens)
+        self.limit_tokens = int(limit_tokens)
+        self.est_tokens = int(est_tokens)
+        super().__init__(
+            f"LLM {window} budget would be exceeded "
+            f"(used={used_tokens}, est_new={est_tokens}, limit={limit_tokens}); "
+            f"refusing call until window resets."
+        )
+
+
+def _hash_messages(model: str, messages: list[dict], temperature: float) -> str:
+    """Stable sha256 across the prompt payload. NUL-separated parts so
+    `"a"+"b"` and `"ab"+""` don't collide."""
+    h = hashlib.sha256()
+    h.update((model or "").encode("utf-8", errors="replace"))
+    h.update(b"\x00")
+    h.update(f"t={float(temperature):.4f}".encode("utf-8"))
+    h.update(b"\x00")
+    # Sort keys so dict ordering differences don't fragment the hash.
+    h.update(_json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _estimate_prompt_tokens(messages: list[dict]) -> int:
+    """Rough pre-flight estimate. Tokens ≈ chars / 3 for mixed CJK/English,
+    plus a 500-token safety margin so we don't ship a request that would
+    push us over the limit only to refund the difference afterwards."""
+    total_chars = 0
+    for m in messages:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            total_chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    total_chars += len(str(part.get("text") or ""))
+                elif isinstance(part, str):
+                    total_chars += len(part)
+    return max(1, total_chars // 3) + 500
+
+
+class _PromptDedupTracker:
+    """Single process-wide instance shared by every LLMClient (proxy
+    balance is per-account, so dedup must be global). Settings are loaded
+    lazily from the first DB-bound client; until then, defaults apply."""
+
+    _DEFAULT_WINDOW_SEC = 60.0
+    _MAX_ENTRIES = 256
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[str, float] = OrderedDict()
+        self._enabled = True
+        self._window_sec = self._DEFAULT_WINDOW_SEC
+        self._rejected_count = 0
+        self._last_rejected_hash: str | None = None
+        self._last_rejected_at: float | None = None
+
+    def configure(self, *, enabled: bool, window_sec: float) -> None:
+        self._enabled = bool(enabled)
+        self._window_sec = max(1.0, float(window_sec))
+
+    def check_or_raise(self, prompt_hash: str, *, now: float | None = None) -> None:
+        if not self._enabled:
+            return
+        ts = now if now is not None else time.time()
+        # Lazy eviction of expired entries (cheap: at most _MAX_ENTRIES).
+        cutoff = ts - self._window_sec
+        while self._entries:
+            oldest_hash, oldest_ts = next(iter(self._entries.items()))
+            if oldest_ts < cutoff:
+                self._entries.popitem(last=False)
+            else:
+                break
+        last_sent = self._entries.get(prompt_hash)
+        if last_sent is not None and (ts - last_sent) < self._window_sec:
+            self._rejected_count += 1
+            self._last_rejected_hash = prompt_hash
+            self._last_rejected_at = ts
+            raise DuplicatePromptError(prompt_hash, last_sent, self._window_sec)
+
+    def record(self, prompt_hash: str, *, now: float | None = None) -> None:
+        if not self._enabled:
+            return
+        ts = now if now is not None else time.time()
+        # Move-to-end so LRU eviction makes sense if we hit _MAX_ENTRIES.
+        if prompt_hash in self._entries:
+            self._entries.move_to_end(prompt_hash)
+        self._entries[prompt_hash] = ts
+        while len(self._entries) > self._MAX_ENTRIES:
+            self._entries.popitem(last=False)
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self._enabled,
+            "window_sec": self._window_sec,
+            "tracked_prompts": len(self._entries),
+            "rejected_count": self._rejected_count,
+            "last_rejected_hash_short": (self._last_rejected_hash or "")[:12] or None,
+            "last_rejected_at": self._last_rejected_at,
+        }
+
+    def reset(self) -> None:
+        """Admin reset — clears history and rejection counters."""
+        self._entries.clear()
+        self._rejected_count = 0
+        self._last_rejected_hash = None
+        self._last_rejected_at = None
+
+
+class _BudgetTracker:
+    """Sliding hourly + daily token windows. Process-wide singleton.
+
+    Pre-flight check uses estimated prompt tokens (`_estimate_prompt_tokens`)
+    plus a `max_tokens` ceiling for completion (or a 2000-token default if
+    the caller passed None). After the upstream returns real usage, the
+    actual numbers replace the estimate via `record_actual`.
+    """
+
+    _HOUR_SEC = 3600
+    _DAY_SEC = 86400
+    _DEFAULT_HOURLY = 30000
+    _DEFAULT_DAILY = 200000
+
+    def __init__(self) -> None:
+        self._enabled = True
+        self._hourly_limit = self._DEFAULT_HOURLY
+        self._daily_limit = self._DEFAULT_DAILY
+        # Each deque entry is (timestamp, tokens).
+        self._hourly: deque[tuple[float, int]] = deque()
+        self._daily: deque[tuple[float, int]] = deque()
+        self._hourly_used = 0
+        self._daily_used = 0
+        self._rejected_count = 0
+        self._last_rejected_at: float | None = None
+        self._last_rejected_reason: str | None = None
+
+    def configure(
+        self,
+        *,
+        enabled: bool,
+        hourly_limit: int,
+        daily_limit: int,
+    ) -> None:
+        self._enabled = bool(enabled)
+        self._hourly_limit = max(1, int(hourly_limit))
+        self._daily_limit = max(1, int(daily_limit))
+
+    def _evict_expired(self, now: float) -> None:
+        cutoff_hour = now - self._HOUR_SEC
+        while self._hourly and self._hourly[0][0] < cutoff_hour:
+            _, n = self._hourly.popleft()
+            self._hourly_used -= n
+        cutoff_day = now - self._DAY_SEC
+        while self._daily and self._daily[0][0] < cutoff_day:
+            _, n = self._daily.popleft()
+            self._daily_used -= n
+
+    def check_or_raise(self, est_tokens: int, *, now: float | None = None) -> None:
+        if not self._enabled:
+            return
+        ts = now if now is not None else time.time()
+        self._evict_expired(ts)
+        if self._hourly_used + est_tokens > self._hourly_limit:
+            self._record_rejection(ts, "hourly")
+            raise BudgetExceeded(
+                window="hourly",
+                used_tokens=self._hourly_used,
+                limit_tokens=self._hourly_limit,
+                est_tokens=est_tokens,
+            )
+        if self._daily_used + est_tokens > self._daily_limit:
+            self._record_rejection(ts, "daily")
+            raise BudgetExceeded(
+                window="daily",
+                used_tokens=self._daily_used,
+                limit_tokens=self._daily_limit,
+                est_tokens=est_tokens,
+            )
+
+    def _record_rejection(self, ts: float, window: str) -> None:
+        self._rejected_count += 1
+        self._last_rejected_at = ts
+        self._last_rejected_reason = window
+
+    def record_actual(self, tokens: int, *, now: float | None = None) -> None:
+        if not self._enabled or tokens <= 0:
+            return
+        ts = now if now is not None else time.time()
+        self._evict_expired(ts)
+        self._hourly.append((ts, int(tokens)))
+        self._daily.append((ts, int(tokens)))
+        self._hourly_used += int(tokens)
+        self._daily_used += int(tokens)
+
+    def snapshot(self) -> dict:
+        # Don't mutate state during a read; report what's currently in the
+        # windows (may include some technically-expired entries but the
+        # caller doesn't care about <1s precision).
+        return {
+            "enabled": self._enabled,
+            "hourly_limit": self._hourly_limit,
+            "hourly_used": self._hourly_used,
+            "hourly_remaining": max(0, self._hourly_limit - self._hourly_used),
+            "daily_limit": self._daily_limit,
+            "daily_used": self._daily_used,
+            "daily_remaining": max(0, self._daily_limit - self._daily_used),
+            "rejected_count": self._rejected_count,
+            "last_rejected_at": self._last_rejected_at,
+            "last_rejected_reason": self._last_rejected_reason,
+        }
+
+    def reset(self) -> None:
+        """Admin reset — wipes counters. Use after raising hourly/daily
+        limits or after balance top-up."""
+        self._hourly.clear()
+        self._daily.clear()
+        self._hourly_used = 0
+        self._daily_used = 0
+        self._rejected_count = 0
+        self._last_rejected_at = None
+        self._last_rejected_reason = None
+
+
+# Module-level singletons. Shared by every LLMClient instance because the
+# proxy account balance and the duplicate-prompt risk are global, not
+# per-client.
+_prompt_dedup_tracker = _PromptDedupTracker()
+_budget_tracker = _BudgetTracker()
+
+
+def get_prompt_dedup_tracker() -> _PromptDedupTracker:
+    return _prompt_dedup_tracker
+
+
+def get_budget_tracker() -> _BudgetTracker:
+    return _budget_tracker
 
 
 def _extract_chat_message_content(message: dict) -> str:
@@ -95,6 +389,25 @@ class LLMClient:
                 else (runtime.get("timeout_sec") or self.DEFAULT_TIMEOUT_SEC)
             ),
         )
+
+        # ── A3 + A2 last-line defenses (see docs/fix_plan_snapshot_loop.md) ──
+        # Refresh tracker config from runtime settings (cheap: cached at the
+        # tracker, only the DB lookup costs anything). Then:
+        #   1. Check prompt-hash dedup: same prompt within window → refuse.
+        #   2. Estimate prompt + max_tokens for budget pre-flight.
+        #   3. Check hourly/daily budget. Exhausted → raise BudgetExceeded
+        #      (BaseException → propagates through `except Exception`).
+        # On a successful upstream response we record the hash AND the real
+        # token usage (see _consume_usage). Failed calls record neither —
+        # caller can adjust the prompt and retry immediately.
+        await self._refresh_safety_trackers_from_settings()
+        prompt_hash = _hash_messages(model, messages, temperature)
+        _prompt_dedup_tracker.check_or_raise(prompt_hash)
+        est_tokens = _estimate_prompt_tokens(messages) + int(
+            max_tokens if max_tokens is not None else 2000
+        )
+        _budget_tracker.check_or_raise(est_tokens)
+
         url = f"{api_base}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -172,7 +485,20 @@ class LLMClient:
             )
         if "choices" not in data or not data["choices"]:
             raise RuntimeError(f"Unexpected LLM API response format: {data}")
-        self._consume_usage(data.get("usage") or {}, model=model)
+        usage_dict = data.get("usage") or {}
+        self._consume_usage(usage_dict, model=model)
+        # A3: only record the hash after a successful response. If the
+        # upstream rejected the call (e.g. 4xx malformed prompt) the
+        # caller wants to fix and retry immediately, not wait out a 60s
+        # cooldown. A2: same logic — only count real token spend.
+        _prompt_dedup_tracker.record(prompt_hash)
+        actual_total = int(
+            usage_dict.get("total_tokens")
+            or (int(usage_dict.get("prompt_tokens") or 0) + int(usage_dict.get("completion_tokens") or 0))
+            or 0
+        )
+        if actual_total > 0:
+            _budget_tracker.record_actual(actual_total)
         choice0 = data["choices"][0]
         msg = choice0.get("message") or {}
         content = _extract_chat_message_content(msg)
@@ -186,6 +512,44 @@ class LLMClient:
                 usage,
             )
         return content
+
+    # ── A2/A3 lazy settings refresh ──────────────────────────────────
+    #
+    # The trackers are process-wide singletons but their thresholds come
+    # from runtime settings (so they can be tuned without a redeploy).
+    # We refresh at most once per 30 seconds — well under any meaningful
+    # tick interval, and cheap enough that bursts of LLM calls don't
+    # hammer the DB.
+    _SAFETY_REFRESH_INTERVAL_SEC = 30.0
+    _safety_last_refresh_at: float = 0.0
+
+    async def _refresh_safety_trackers_from_settings(self) -> None:
+        if self._db is None:
+            return
+        now = time.time()
+        # Class-level last-refresh timestamp — shared by every LLMClient.
+        if now - LLMClient._safety_last_refresh_at < self._SAFETY_REFRESH_INTERVAL_SEC:
+            return
+        LLMClient._safety_last_refresh_at = now
+        try:
+            dedup_enabled = (await self._get_setting("llm_dedup_enabled", "1")).strip() == "1"
+            dedup_window = float(await self._get_setting("llm_dedup_window_sec", "60") or 60.0)
+            _prompt_dedup_tracker.configure(
+                enabled=dedup_enabled, window_sec=dedup_window
+            )
+        except Exception:
+            logger.exception("Failed to refresh prompt-dedup settings; keeping current values.")
+        try:
+            budget_enabled = (await self._get_setting("llm_budget_enabled", "1")).strip() == "1"
+            hourly = int(await self._get_setting("llm_hourly_token_limit", "30000") or 30000)
+            daily = int(await self._get_setting("llm_daily_token_limit", "200000") or 200000)
+            _budget_tracker.configure(
+                enabled=budget_enabled,
+                hourly_limit=hourly,
+                daily_limit=daily,
+            )
+        except Exception:
+            logger.exception("Failed to refresh budget settings; keeping current values.")
 
     async def close(self):
         await self._client.aclose()

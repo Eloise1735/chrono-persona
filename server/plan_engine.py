@@ -14,6 +14,7 @@ from typing import Any
 from server.database import Database
 from server.llm_client import (
     LLMClient,
+    DuplicatePromptError,
     LLMTimeoutError,
     LLMTransportError,
     LLMUpstreamHTTPError,
@@ -78,6 +79,11 @@ PLAN_TRANSIENT_GENERATION_ERRORS: tuple[type[BaseException], ...] = (
     LLMTimeoutError,
     LLMUpstreamHTTPError,
     LLMTransportError,
+    # A3: an identical plan-generation prompt was sent inside the dedup
+    # window. This was the headline gap in the second incident — the same
+    # 10239-token gemini call kept re-firing every tick. Swallowing it
+    # here lets the next tick (after the window expires) actually try.
+    DuplicatePromptError,
 )
 
 NotificationDispatcher = Callable[[CharacterNotification], Awaitable[None]]

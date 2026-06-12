@@ -3486,6 +3486,19 @@ async def get_admin_health():
         logger.exception("admin/health: get_latest_reflect_created_at failed")
         last_reflect_at = None
 
+    # A2/A3 trackers — the last-line defenses. Surfacing them here lets an
+    # admin notice the next silent loop within minutes: a rising
+    # rejected_count means a dup storm is being absorbed; an hourly_used
+    # bar near the limit warns before the budget tripwire fires.
+    llm_budget = None
+    llm_dedup = None
+    try:
+        from server.llm_client import get_budget_tracker, get_prompt_dedup_tracker
+        llm_budget = get_budget_tracker().snapshot()
+        llm_dedup = get_prompt_dedup_tracker().snapshot()
+    except Exception:
+        logger.exception("admin/health: llm tracker snapshot failed")
+
     return {
         "now": now_iso,
         "schedulers": schedulers,
@@ -3495,7 +3508,35 @@ async def get_admin_health():
         "last_reflect_at": last_reflect_at,
         "age_since_last_snapshot_s": _seconds_between_iso_z(last_snap_at, now_iso),
         "age_since_last_reflect_s": _seconds_between_iso_z(last_reflect_at, now_iso),
+        "llm_budget": llm_budget,
+        "llm_dedup": llm_dedup,
     }
+
+
+@router.post("/admin/llm/budget/reset")
+async def reset_llm_budget():
+    """A2 admin reset: wipe the hourly/daily token counters. Use after
+    raising limits or topping up the proxy balance — the counters are
+    process-memory only, so they're also wiped on restart."""
+    from server.llm_client import get_budget_tracker
+    tracker = get_budget_tracker()
+    before = tracker.snapshot()
+    tracker.reset()
+    after = tracker.snapshot()
+    return {"ok": True, "before": before, "after": after}
+
+
+@router.post("/admin/llm/dedup/reset")
+async def reset_llm_dedup():
+    """A3 admin reset: clear the prompt-hash dedup table and rejection
+    counters. Lets a stuck dup-loop retry immediately instead of waiting
+    out the cooldown window."""
+    from server.llm_client import get_prompt_dedup_tracker
+    tracker = get_prompt_dedup_tracker()
+    before = tracker.snapshot()
+    tracker.reset()
+    after = tracker.snapshot()
+    return {"ok": True, "before": before, "after": after}
 
 
 @router.post("/admin/scheduler/{name}/resume")
