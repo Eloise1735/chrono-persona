@@ -5377,13 +5377,15 @@ class StateMachine:
         return "\n".join(sections)
 
     async def _build_injectable_context(self, snapshot_text: str) -> str:
-        key_records_text = await self._build_recent_key_records_context(limit=5)
+        # 顺序：稳定原则结晶（standing → evolving）在前，阶段性生活状态的
+        # key_record 在后。key_record 仍按新近注入（与当前生活计划逻辑一致）。
         pinned_principles_text = await self._build_pinned_principles_context(limit=5)
+        key_records_text = await self._build_recent_key_records_context(limit=5)
         return (
-            "【近期关键记录】\n"
-            f"{key_records_text}\n\n"
             "【稳定原则结晶】\n"
-            f"{pinned_principles_text}"
+            f"{pinned_principles_text}\n\n"
+            "【近期关键记录·阶段性生活状态】\n"
+            f"{key_records_text}"
         )
 
     async def _build_recent_events_text(self, limit: int = 2) -> str:
