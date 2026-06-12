@@ -5326,6 +5326,13 @@ class StateMachine:
                 lines.append(f"- [{record_type}] {title}{suffix}")
         return "\n".join(lines)
 
+    # Injection rendering caps (tunable). standing_invariant gets a larger
+    # per-entry cap and is always rendered in full (faithful); evolving is more
+    # expendable and trimmed first when the combined budget is reached.
+    PRINCIPLE_INJECT_CHARS_STANDING = 480
+    PRINCIPLE_INJECT_CHARS_EVOLVING = 240
+    PRINCIPLE_INJECT_TOTAL_BUDGET = 2400  # ~ combined principle chars before trimming evolving
+
     async def _build_pinned_principles_context(self, limit: int = 5) -> str:
         if self.ob_client is None:
             return "（暂无稳定原则结晶）"
@@ -5339,7 +5346,7 @@ class StateMachine:
         if not standing and not evolving:
             return "（暂无稳定原则结晶）"
 
-        def format_line(bucket) -> str:
+        def format_line(bucket, max_chars: int) -> str:
             meta = getattr(bucket, "metadata", {}) or {}
             bucket_id = str(meta.get("id") or getattr(bucket, "id", "") or "").strip()
             title = (
@@ -5362,18 +5369,38 @@ class StateMachine:
                 injection = "；".join(part for part in [principle, response_rule, f"避免：{avoid}" if avoid else ""] if part)
             if not injection:
                 injection = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
-            injection = self._compact_structured_memory_text(injection)[:260]
+            injection = self._compact_structured_memory_text(injection)[:max_chars]
             return f"- {title}{label}: {injection}" if injection else f"- {title}{label}"
 
-        # standing_invariant：始终成立的边界/偏好/共识（全量）。
-        # evolving_principle：演化中的相处模式（新近窗）。anchor 不注入。
+        # standing_invariant：边界/偏好/共识，必须忠实传达——每条上限更大、且始终
+        # 全量渲染（截断一条边界是危险的）。evolving_principle 更可替代，总预算超出时
+        # 先砍 evolving。若 standing 单独超预算，打一条 warning（信号：该走 Phase 3 的
+        # principle-review 合并/退役，而不是靠注入端硬塞）。
         sections: list[str] = []
+        total = 0
         if standing:
             sections.append("〔长期准则·始终成立〕")
-            sections.extend(format_line(b) for b in standing)
+            for b in standing:
+                line = format_line(b, self.PRINCIPLE_INJECT_CHARS_STANDING)
+                sections.append(line)
+                total += len(line)
+            if total > self.PRINCIPLE_INJECT_TOTAL_BUDGET:
+                logger.warning(
+                    "standing_invariant injection over budget: %d chars across %d entries "
+                    "(budget=%d). Consider consolidating via principle-review (Phase 3).",
+                    total, len(standing), self.PRINCIPLE_INJECT_TOTAL_BUDGET,
+                )
         if evolving:
-            sections.append("〔当前相处模式·新近〕")
-            sections.extend(format_line(b) for b in evolving)
+            ev_lines: list[str] = []
+            for b in evolving:
+                if total >= self.PRINCIPLE_INJECT_TOTAL_BUDGET:
+                    break  # standing already consumed the budget; trim evolving first
+                line = format_line(b, self.PRINCIPLE_INJECT_CHARS_EVOLVING)
+                ev_lines.append(line)
+                total += len(line)
+            if ev_lines:
+                sections.append("〔当前相处模式·新近〕")
+                sections.extend(ev_lines)
         return "\n".join(sections)
 
     async def _build_injectable_context(self, snapshot_text: str) -> str:
