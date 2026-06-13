@@ -80,11 +80,26 @@ class OBClient:
         # feel aging: feel used to be a flat 50 plateau that never decayed nor
         # archived (a pure write-only leak). It now decays gently from 50 so
         # that genuinely old, un-recalled feel eventually drops below the decay
-        # archive threshold. Half-life ≈ 17 days; an uncrystallized feel reaches
-        # the 0.3 archive line around ~128 days, a crystallized one (×0.1) around
-        # ~70 days — both well past the 7-day crystallized protection window, so
-        # surfacing is unaffected (breath sets feel score to 50 at selection).
+        # archive threshold.
+        #
+        # Unlike dynamic (whose decay also drives surfacing priority and so
+        # carries importance/activation/resolved shaping), feel decay governs
+        # ONLY archival lifecycle — surfacing sets feel score to 50 at selection.
+        # So feel keeps a deliberately minimal curve and borrows exactly one
+        # mechanism from dynamic that fits: emotional weighting. Feelings fade by
+        # intensity (a deep moment lingers; a mild one washes out), independent
+        # of whether their source event was resolved — a different forgetting law
+        # than events, which fade by closure.
+        #
+        # effective_λ = base_λ · (1 − k·arousal), k=0.6. Half-life and archive
+        # point (0.3 line, from the 50 plateau):
+        #   arousal 0.0 → λ 0.040, t½ ≈ 17d, archive ≈ 128d
+        #   arousal 0.3 → λ 0.033, t½ ≈ 21d, archive ≈ 155d
+        #   arousal 0.9 → λ 0.018, t½ ≈ 38d, archive ≈ 277d (~9 months)
+        # k<1 guarantees λ>0, so a deep mark lingers far longer but is never
+        # immortal (that is what permanent is for).
         self.feel_decay_lambda = 0.04
+        self.feel_decay_arousal_k = 0.6
         # Merge SUGGESTIONS on hold(): the backend never merges on its own — it
         # only surfaces recent similar same-type buckets as candidates and lets
         # the frontend model decide (and call merge_buckets explicitly). The
@@ -1811,16 +1826,38 @@ class OBClient:
         out: list[dict[str, Any]] = []
         for bucket in buckets:
             meta = dict(bucket.metadata)
-            out.append(
-                {
-                    "id": bucket.id,
-                    "score": bucket.score,
-                    "content": bucket.content,
-                    "metadata": meta,
-                    "path": bucket.path,
-                }
-            )
+            row: dict[str, Any] = {
+                "id": bucket.id,
+                "score": bucket.score,
+                "content": bucket.content,
+                "metadata": meta,
+                "path": bucket.path,
+            }
+            if self._bucket_type(meta) == "feel":
+                # Dashboard diagnostic: how arousal stretches this feel's lifespan.
+                row["feel_decay"] = self.feel_decay_diagnostic(meta)
+            out.append(row)
         return out
+
+    def feel_decay_diagnostic(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Per-feel aging readout for the dashboard: how arousal-weighted decay
+        stretches this feel's half-life and archive horizon."""
+        arousal = self._clamp_float(metadata.get("arousal"), 0.0, 1.0, 0.3)
+        eff = float(self.feel_decay_lambda) * (1.0 - float(self.feel_decay_arousal_k) * arousal)
+        mult = 1.0
+        if metadata.get("crystallized"):
+            mult *= 0.1
+        if metadata.get("demoted"):
+            mult *= 0.1
+        base = 50.0 * mult
+        half_life = (math.log(2.0) / eff) if eff > 0 else None
+        archive_days = (math.log(base / 0.3) / eff) if (eff > 0 and base > 0.3) else None
+        return {
+            "arousal": round(arousal, 3),
+            "effective_lambda": round(eff, 5),
+            "half_life_days": round(half_life, 1) if half_life is not None else None,
+            "archive_days": round(archive_days, 1) if archive_days is not None else None,
+        }
 
     def calculate_score(self, metadata: dict[str, Any]) -> float:
         if not isinstance(metadata, dict):
@@ -1837,8 +1874,13 @@ class OBClient:
             # background decay/archive lifecycle — it does NOT change which feel
             # surfaces. Crystallized feel sinks faster (its essence has been
             # captured into a principle/key_record).
+            #
+            # Emotional weighting (the one mechanism borrowed from dynamic):
+            # intense feelings decay slower. effective_λ = base_λ·(1−k·arousal).
             days_since = self._days_since(metadata.get("last_active") or metadata.get("created"), datetime.utcnow())
-            feel_score = 50.0 * math.exp(-float(self.feel_decay_lambda) * days_since)
+            arousal = self._clamp_float(metadata.get("arousal"), 0.0, 1.0, 0.3)
+            effective_lambda = float(self.feel_decay_lambda) * (1.0 - float(self.feel_decay_arousal_k) * arousal)
+            feel_score = 50.0 * math.exp(-effective_lambda * days_since)
             if metadata.get("crystallized"):
                 feel_score *= 0.1
             # Demoted feels (a crystal judged them redundant) sink out of
