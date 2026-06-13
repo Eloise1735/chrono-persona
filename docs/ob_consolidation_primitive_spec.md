@@ -243,8 +243,8 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
    - **防卡死/真实性（Q1/Q3）**：Gate 1 单簇封顶+递归切分；Gate 2 review 天花板 18 条 + 尾部统计摘要；salience 排序使深痕前置；`demote` 对 arousal>0.7 软否决。详见决策表 #8/#10/#11/#12。
    - **第四档 settled（反复读问题）**：源 feel 既不晋升也不 demote 时，过去毫无标记 → 同一簇每晚复读。现 commit 给整簇盖 `consolidated_into` 回指，已覆盖簇静默；攒够新材料才重新浮现并并回同一结晶。详见决策表 #13。
    - **遗留待办（✅ 已落地）**：feel 衰减改 arousal 加权（`effective_λ = 0.04·(1-0.6·arousal)`，深痕半衰期 17d→38d）+ dashboard 半衰期诊断。
-3. **Phase 3 — 稳定层代谢**：standing 无界增长饿死 evolving、anchor 堆积稀释召回。分三块：
+3. **Phase 3 — 稳定层代谢**（✅ 已落地）：standing 无界增长饿死 evolving、anchor 堆积稀释召回。分三块：
    - **块1（✅ 已落地）— evolving 注入保底 + 软预算**：`EVOLVING_INJECT_FLOOR=3` 始终渲染；standing 全量不截断；溢出 = 触发 standing-review 的信号，而非丢 evolving。
    - **块3（✅ 已落地）— anchor 相册**：anchor 退出普通 recall（`_query_breath` 排除），get_current_state 注入"相册目录"（主题关键词，按 salience=arousal×最近翻看 封顶 `ANCHOR_INDEX_CAP=50`，超出退索引仍可检索）；独立 `recall_anchors(query)` 路径按相关度×情感排序，翻看 bump `last_revisited`。anchor 不 merge（不可还原），偶发重复靠 promote 时去重兜底。
-   - **块2（待办）— standing-review**：阈值触发 → get_current_state 提醒 → **通读全部 standing**（不采样）→ 模型写新合并条目（与用户确认）→ 原条目转 `type=dynamic`（打 `retired_from=standing`）自然衰减。最重 gated，最后做。
+   - **块2（✅ 已落地）— standing-review**：standing 条数 > `STANDING_REVIEW_THRESHOLD=8` → get_current_state 注入提醒 → `review_standing()` **通读全部 standing**（不采样、无天花板）→ 模型读完写合并正文 → `commit_standing_merge(merged_content, retired_ids, user_confirmed=True)` 建新 standing、原条目转 `type=dynamic`（打 `retired_from=standing`、importance=4）自然衰减、仍可 recall。`user_confirmed` 强制用户确认门（最重 gated）。一次一组，多组多次调用。
 4. **Phase 4 — resolve + 读取侧**（见 §9、§9.1 breath_bundle 槽位改造）。

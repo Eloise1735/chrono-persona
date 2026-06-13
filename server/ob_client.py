@@ -1058,6 +1058,89 @@ class OBClient:
             })
         return out
 
+    async def review_standing(self) -> dict[str, Any]:
+        """Read ALL standing_invariant entries in full (no sampling, no ceiling).
+
+        Unlike feel review, standing entries are already highly refined, highly
+        important boundaries/consensus — a faithful merge must be built on having
+        read every one. The model reads all, then proposes a merged rewrite via
+        commit_standing_merge (gated on user confirmation)."""
+        standing = [
+            b for b in await self.list_buckets(include_archive=False)
+            if self.effective_role(b.metadata) == self.ROLE_STANDING
+        ]
+        standing.sort(key=lambda b: str((b.metadata or {}).get("created") or ""))
+        items = []
+        for bucket in standing:
+            meta = bucket.metadata or {}
+            items.append({
+                "id": bucket.id,
+                "name": meta.get("name") or bucket.id,
+                "full_text": self._strip_wikilinks(bucket.content).strip(),
+                "created": meta.get("created", ""),
+                "domain": meta.get("domain", []),
+                "tags": meta.get("tags", []),
+            })
+        return {"items": items, "count": len(items)}
+
+    async def commit_standing_merge(
+        self,
+        *,
+        merged_content: str,
+        retired_ids: list[str],
+        title: str = "",
+        domain: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create ONE new merged standing_invariant absorbing several originals,
+        then retire those originals to type=dynamic (auto-decay, still recallable).
+
+        The new entry is the model's faithful rewrite built after reading ALL
+        standing (review_standing). Retired originals are NOT deleted — they drop
+        to dynamic with a `retired_from=standing` marker and fade naturally (I2).
+        Non-merged standing entries are simply left out of retired_ids and stay.
+        """
+        merged_content = str(merged_content or "").strip()
+        if not merged_content:
+            raise ValueError("merged_content 不能为空")
+        retired_ids = list(dict.fromkeys(
+            self._safe_id(x) for x in (retired_ids or []) if str(x or "").strip()
+        ))
+        now = datetime.utcnow().isoformat()
+        new_id = await self.hold(
+            merged_content,
+            tags=["standing_merge"],
+            importance=10,
+            domain=domain or ["core"],
+            bucket_type="permanent",
+            name=str(title or "").strip() or "合并准则",
+            extra_metadata={
+                "role": self.ROLE_STANDING,
+                "source_kind": "standing_merge",
+                "merged_from": retired_ids,
+            },
+        )
+        retired: list[str] = []
+        for rid in retired_ids:
+            bucket = await self.get(rid)
+            if bucket and self.effective_role(bucket.metadata) == self.ROLE_STANDING:
+                await self.update(
+                    rid,
+                    type="dynamic",
+                    pinned=False,
+                    protected=False,
+                    role="",
+                    importance=4,  # fade in weeks, not months; still recallable
+                    retired_from="standing",
+                    retired_into=new_id,
+                    retired_at=now,
+                )
+                retired.append(rid)
+        return {
+            "new_standing_id": new_id,
+            "retired": retired,
+            "retired_count": len(retired),
+        }
+
     async def _query_breath(
         self,
         query: str,
