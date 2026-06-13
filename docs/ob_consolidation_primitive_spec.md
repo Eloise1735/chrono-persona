@@ -200,8 +200,11 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
 | 5 | `evolving_principle` 顶出窗 → 自动转 `anchor` |
 | 6 | keep 去向：moment→anchor、共识→standing_invariant |
 | 7 | `principle-review` 触发 = dream 重叠轻提示 |
-| 8 | 批大小 6、批内 uniqueness 降序、`demote` 默认空 |
+| 8 | 批大小 6、批内 **salience 降序**（uniqueness⊕arousal⊕importance）、`demote` 默认空 |
 | 9 | migration 手动（web 操作） |
+| 10 | **Gate 1**：单簇超 30 条时在更紧相似度上递归二次切分（防 review job 无界、保结晶聚焦） |
+| 11 | **Gate 2**：review 天花板 = 3 批×batch；超出尾部只给统计摘要(count+时间跨度)，commit 仍整簇保留 anchor_refs |
+| 12 | **Q3 深痕**：review 排序融合 arousal/importance，使情绪深痕前置可晋升；`demote` 对 arousal>0.7 软否决，需 `force_demote=True` 覆盖 |
 
 ---
 
@@ -217,8 +220,10 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
 
 1. **Phase 1 — permanent 重定义**（✅ 已落地）：引入 `role` 字段 + 回退推断 + 按 role 的注入/浮现分流 + web 面板 role 控件。修复"非 pinned 高分浮现""基础原则被挤出"等线上问题。
 2. **Phase 2 — 原语 on `feel → principle`**（✅ 已落地）：迭代游标工具 + 锚点存储 + keep 晋升（anchor/standing）+ dream 轻提示。先验证原语。
-   - 工具：`review_feel_cluster(cluster_id, cursor)` 分批 6 条全文（uniqueness 降序）；`commit_feel_crystal(synthesis, anchor_ids, standing_ids, demote_ids, crystal_id)` 幂等 upsert。
+   - 工具：`review_feel_cluster(cluster_id, cursor)` 分批 6 条全文（**salience 降序**）；`commit_feel_crystal(synthesis, anchor_ids, standing_ids, demote_ids, crystal_id, force_demote)` 幂等 upsert。
    - 源 feel **不再标 crystallized**：纯加法结晶 + anchor_refs 覆盖整簇，源靠 feel aging 自然淡出；`demote_ids` 退出浮现（score×0.1）仍可 recall；keep → moment 升 `anchor` / 共识升 `standing_invariant`。
    - 旧 MCP `crystallize_feel` 工具已删除（web `/ob/crystallize-feel` 手动端点保留）；dream 末尾 `_dream_crystal_hint` 改为「有 N 簇成熟可结晶」并指向新流程。
+   - **防卡死/真实性（Q1/Q3）**：Gate 1 单簇封顶+递归切分；Gate 2 review 天花板 18 条 + 尾部统计摘要；salience 排序使深痕前置；`demote` 对 arousal>0.7 软否决。详见决策表 #8/#10/#11/#12。
+   - **遗留待办**：feel 衰减改 arousal 加权（`effective_λ = λ·(1-k·arousal)`，k≈0.6，深痕半衰期延长 2-3 倍）——独立 commit + 测试 + dashboard 诊断；并讨论 breath_bundle free 槽是否开放给高 arousal bucket。
 3. **Phase 3 — 同一原语 on `principle-review`**：合并/退役，全程 gated。必须 Phase 2 跑通后。
 4. **Phase 4 — resolve + 读取侧**（见 §9）。

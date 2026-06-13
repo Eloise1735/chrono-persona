@@ -2277,3 +2277,124 @@ def test_demoted_feel_excluded_from_clusters():
 
     run(scenario())
 
+
+def test_oversized_component_is_split_into_subclusters():
+    async def scenario():
+        client = await _client("oversized_split")
+        client.FEEL_CLUSTER_MAX_SIZE = 3  # force the split path with few buckets
+        ids = []
+        for idx in range(6):
+            ids.append(await client.hold(
+                f"group feel {idx}", bucket_type="feel", domain=["relationship"],
+                created=f"2026-01-0{idx + 1}T00:00:00",
+            ))
+        # Two tight triplets (intra cos ~0.999) connected across at cos ~0.85:
+        # one component of 6 at min_similarity=0.7, splits at a tighter threshold.
+        client.set_embedding_store(FakeEmbeddingStore({
+            ids[0]: [1.0, 0.0, 0.0],
+            ids[1]: [0.999, 0.04, 0.0],
+            ids[2]: [0.998, 0.06, 0.0],
+            ids[3]: [0.85, 0.527, 0.0],
+            ids[4]: [0.86, 0.510, 0.0],
+            ids[5]: [0.845, 0.535, 0.0],
+        }))
+        page = await client.feel_crystals(limit=5, min_cluster_size=3, min_similarity=0.7)
+        # Without the cap this is one component of 6; the cap splits it into two.
+        assert page["total_clusters"] == 2
+        for cluster in page["clusters"]:
+            assert len(cluster["feel_ids"]) == 3
+
+    run(scenario())
+
+
+def test_review_ceiling_summarises_tail_and_blocks_reading_it():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("review_ceiling")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+        # batch=2, REVIEW_MAX_BATCHES=3 -> readable_cap=6; 7 members -> tail of 1.
+        first = await client.review_feel_cluster(
+            cluster_id=cluster_id, batch_size=2, min_cluster_size=3, min_similarity=0.8,
+        )
+        assert first["total"] == 7
+        assert first["readable_total"] == 6
+        assert first["tail"]["count"] == 1
+        # Walk to the end of the readable window; the 7th item is never reachable.
+        seen = list(first["items"])
+        cursor = first["next_cursor"]
+        while cursor:
+            nxt = await client.review_feel_cluster(
+                cluster_id=cluster_id, cursor=cursor, batch_size=2,
+                min_cluster_size=3, min_similarity=0.8,
+            )
+            seen.extend(nxt["items"])
+            cursor = nxt["next_cursor"]
+        assert len(seen) == 6
+
+    run(scenario())
+
+
+def test_review_orders_by_salience_not_pure_uniqueness():
+    async def scenario():
+        client = await _client("salience_order")
+        # Four near-identical feels (uniqueness ~0 for all) so arousal decides order.
+        ids = []
+        arousals = [0.2, 0.9, 0.3, 0.25]
+        for idx, ar in enumerate(arousals):
+            ids.append(await client.hold(
+                f"near identical feel {idx}", bucket_type="feel", domain=["relationship"],
+                created=f"2026-01-0{idx + 1}T00:00:00",
+                extra_metadata={"arousal": ar},
+            ))
+        client.set_embedding_store(FakeEmbeddingStore({
+            ids[0]: [1.0, 0.000, 0.0],
+            ids[1]: [0.9999, 0.002, 0.0],
+            ids[2]: [0.9998, 0.003, 0.0],
+            ids[3]: [0.9997, 0.004, 0.0],
+        }))
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.9)
+        cluster_id = page["clusters"][0]["cluster_id"]
+        review = await client.review_feel_cluster(
+            cluster_id=cluster_id, batch_size=4, min_cluster_size=3, min_similarity=0.9,
+        )
+        # The high-arousal item leads despite ~equal uniqueness (deep mark surfaces).
+        assert review["items"][0]["id"] == ids[1]
+
+    run(scenario())
+
+
+def test_demote_vetoes_high_arousal_unless_forced():
+    async def scenario():
+        client = await _client("demote_veto")
+        ids = []
+        for idx in range(3):
+            ids.append(await client.hold(
+                f"intense feel {idx}", bucket_type="feel", domain=["relationship"],
+                created=f"2026-01-0{idx + 1}T00:00:00",
+                extra_metadata={"arousal": 0.9},  # above DEMOTE_AROUSAL_VETO
+            ))
+        client.set_embedding_store(FakeEmbeddingStore({
+            ids[0]: [1.0, 0.0, 0.0],
+            ids[1]: [0.999, 0.02, 0.0],
+            ids[2]: [0.998, 0.03, 0.0],
+        }))
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.9)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        soft = await client.commit_feel_crystal(
+            synthesis="综合。", cluster_id=cluster_id,
+            demote_ids=[ids[0]], min_cluster_size=3, min_similarity=0.9,
+        )
+        assert soft["demoted"] == []
+        assert soft["demote_vetoed"] == [ids[0]]
+        assert not (await client.get(ids[0])).metadata.get("demoted")
+
+        forced = await client.commit_feel_crystal(
+            synthesis="综合。", crystal_id=soft["crystal_id"], source_ids=ids,
+            demote_ids=[ids[0]], force_demote=True,
+        )
+        assert forced["demoted"] == [ids[0]]
+        assert (await client.get(ids[0])).metadata.get("demoted") is True
+
+    run(scenario())
+

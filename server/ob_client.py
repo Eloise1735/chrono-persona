@@ -51,6 +51,26 @@ class OBClient:
     PERMANENT_ROLES = {ROLE_EVOLVING, ROLE_STANDING, ROLE_ANCHOR}
     EVOLVING_PRINCIPLE_INJECT_LIMIT = 5    # evolving 注入窗（新近）
 
+    # --- Consolidation primitive bounds (spec Phase 2, Q1/Q3) -------------
+    # Gate 1: cap a single cluster so no review job is unbounded. Oversized
+    # connected components are re-partitioned at a tighter similarity until
+    # each sub-cluster fits (or the threshold ceiling is hit).
+    FEEL_CLUSTER_MAX_SIZE = 30
+    FEEL_CLUSTER_SPLIT_STEP = 0.04
+    FEEL_CLUSTER_SPLIT_MAX_THRESHOLD = 0.95
+    # Gate 2: review ceiling — the model never needs to read past this many of
+    # the most salient items; the near-centroid tail is summarised, not read,
+    # and still retained as anchor_refs by commit.
+    REVIEW_MAX_BATCHES = 3
+    # Q3: review ordering blends distinctiveness with emotional depth so deep
+    # marks surface early and become promotion candidates, not buried tail.
+    SALIENCE_W_UNIQUENESS = 0.5
+    SALIENCE_W_AROUSAL = 0.3
+    SALIENCE_W_IMPORTANCE = 0.2
+    # Q3: a feel this emotionally intense is not auto-demoted (a deep mark is
+    # not "redundant"); demoting it requires an explicit force flag.
+    DEMOTE_AROUSAL_VETO = 0.7
+
     def __init__(self, buckets_dir: str | Path, *, embedding_store: Any | None = None):
         self.base_dir = Path(buckets_dir)
         self.embedding_store = embedding_store
@@ -1090,11 +1110,17 @@ class OBClient:
         """Iterative review packet for one feel cluster (consolidation primitive).
 
         Returns up to `batch_size` FULL-TEXT items (no truncation), ordered by
-        uniqueness desc (distance to cluster centroid — age-independent, I4), so
-        the model reads the most distinctive outliers first and builds the
-        synthesis batch by batch. Backend is stateless: state lives in the
-        crystal + cursor. Read a couple batches then stop; unread items remain
-        anchors (retained, recallable) — see commit_feel_crystal.
+        SALIENCE desc — a blend of uniqueness (distance to centroid, I4),
+        arousal and importance. This front-loads both the most distinctive
+        outliers AND the emotionally deepest marks, so the early batches already
+        surface the items worth promoting to anchor; the near-centroid
+        low-salience tail is increasingly redundant. Backend is stateless: state
+        lives in the crystal + cursor.
+
+        Gate 2 (anti-stall): only the top REVIEW_MAX_BATCHES*batch items are
+        readable; beyond that `tail` summarises the remainder (count + date
+        span) instead of paging it. commit_feel_crystal still retains the WHOLE
+        cluster as anchor_refs, so the tail is never lost — just not read.
         """
         batch = max(1, min(20, int(batch_size or 6)))
         normalized_scope = self._normalize_scope(scope)
@@ -1114,6 +1140,8 @@ class OBClient:
                 "next_cursor": "",
                 "has_more": False,
                 "total": 0,
+                "readable_total": 0,
+                "tail": {},
                 "all_ids": [],
                 "degraded": degraded,
                 "scope": normalized_scope,
@@ -1122,20 +1150,23 @@ class OBClient:
         buckets: list[OBBucket] = list(cluster.get("buckets") or [])
         uniqueness: dict[str, float] = dict(cluster.get("uniqueness") or {})
         if degraded or not uniqueness:
+            # Degraded (no embeddings): no centroid distance, so rank by
+            # emotional depth alone (arousal + importance) — still surfaces deep
+            # marks ahead of arbitrary order.
             degraded = True
-            ordered = sorted(
-                buckets,
-                key=lambda b: len(self._strip_wikilinks(b.content)),
-                reverse=True,
-            )
+            ordered = sorted(buckets, key=lambda b: self._feel_salience(b), reverse=True)
         else:
             ordered = sorted(
                 buckets,
-                key=lambda b: float(uniqueness.get(b.id, 0.0)),
+                key=lambda b: self._feel_salience(b, uniqueness.get(b.id, 0.0)),
                 reverse=True,
             )
+        # Gate 2: readable window vs summarised tail.
+        readable_cap = max(batch, int(self.REVIEW_MAX_BATCHES) * batch)
+        readable = ordered[:readable_cap]
+        tail_buckets = ordered[readable_cap:]
         offset = self._cursor_offset(cursor)
-        page = ordered[offset : offset + batch]
+        page = readable[offset : offset + batch]
         items = []
         for bucket in page:
             meta = bucket.metadata or {}
@@ -1145,11 +1176,23 @@ class OBClient:
                 "arousal": self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3),
                 "importance": max(1, min(10, int(meta.get("importance", 5) or 5))),
                 "uniqueness": float(uniqueness.get(bucket.id, 0.0)),
+                "salience": round(self._feel_salience(bucket, uniqueness.get(bucket.id, 0.0)), 4),
                 "source_dynamic": str(meta.get("source_bucket") or ""),
                 "created": str(meta.get("created") or ""),
             })
         next_offset = offset + len(page)
-        has_more = next_offset < len(ordered)
+        has_more = next_offset < len(readable)
+        tail: dict[str, Any] = {}
+        if tail_buckets:
+            created = sorted(
+                str((b.metadata or {}).get("created") or "") for b in tail_buckets
+            )
+            tail = {
+                "count": len(tail_buckets),
+                "earliest": created[0] if created else "",
+                "latest": created[-1] if created else "",
+                "note": "近簇心的冗余尾部，已超出 review 天花板；不必逐条读，commit 会作为 anchor_refs 整体保留。",
+            }
         return {
             "cluster_id": cluster.get("id"),
             "items": items,
@@ -1158,10 +1201,24 @@ class OBClient:
             "next_cursor": str(next_offset) if has_more else "",
             "has_more": has_more,
             "total": len(ordered),
+            "readable_total": len(readable),
+            "tail": tail,
             "all_ids": [bucket.id for bucket in ordered],
             "degraded": degraded,
             "scope": normalized_scope,
         }
+
+    def _feel_salience(self, bucket: OBBucket, uniqueness: float = 0.0) -> float:
+        """Blend distinctiveness with emotional depth (Q3) so deep marks surface
+        early and become promotion candidates, not buried tail."""
+        meta = bucket.metadata or {}
+        arousal = self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3)
+        importance = max(1.0, min(10.0, float(meta.get("importance", 5) or 5))) / 10.0
+        return (
+            self.SALIENCE_W_UNIQUENESS * float(uniqueness)
+            + self.SALIENCE_W_AROUSAL * arousal
+            + self.SALIENCE_W_IMPORTANCE * importance
+        )
 
     async def _find_crystal_bucket(self, crystal_id: str) -> OBBucket | None:
         if not crystal_id:
@@ -1184,6 +1241,7 @@ class OBClient:
         source_ids: list[str] | None = None,
         crystal_id: str = "",
         importance: int = 9,
+        force_demote: bool = False,
         min_cluster_size: int = 3,
         min_similarity: float = 0.7,
         scope: str = "relational",
@@ -1199,6 +1257,10 @@ class OBClient:
         recall-only) and `standing_ids` (durable consensus → standing_invariant,
         always injected). `demote_ids` (default empty) exit auto-surfacing but
         stay recallable — never deleted (I2).
+
+        Q3 deep-mark guard: a feel with arousal > DEMOTE_AROUSAL_VETO is NOT
+        auto-demoted (emotional weight is not "redundancy"); it is reported in
+        `demote_vetoed`. Pass force_demote=True to override deliberately.
 
         Pass back `crystal_id` from a prior commit to keep refining the same
         crystal across batches (state lives in the crystal, backend stateless).
@@ -1291,19 +1353,27 @@ class OBClient:
 
         promoted_set = set(promoted_anchor) | set(promoted_standing)
         demoted_ids: list[str] = []
+        demote_vetoed: list[str] = []
         for bid in (demote_ids or []):
             sid = self._safe_id(bid)
             if sid in promoted_set:
                 continue
             bucket = await self.get(sid)
-            if bucket and self._bucket_type(bucket.metadata) == "feel":
-                await self.update(
-                    bucket.id,
-                    demoted=True,
-                    consolidated_into=crystal_bucket_id,
-                    demoted_at=now,
-                )
-                demoted_ids.append(bucket.id)
+            if not bucket or self._bucket_type(bucket.metadata) != "feel":
+                continue
+            # Q3 deep-mark guard: do not auto-bury an emotionally intense feel as
+            # "redundant"; surface it for an explicit decision unless forced.
+            arousal = self._clamp_float(bucket.metadata.get("arousal"), 0.0, 1.0, 0.3)
+            if arousal > self.DEMOTE_AROUSAL_VETO and not force_demote:
+                demote_vetoed.append(bucket.id)
+                continue
+            await self.update(
+                bucket.id,
+                demoted=True,
+                consolidated_into=crystal_bucket_id,
+                demoted_at=now,
+            )
+            demoted_ids.append(bucket.id)
 
         return {
             "crystal_id": crystal_id,
@@ -1315,6 +1385,7 @@ class OBClient:
             "promoted_to_anchor": promoted_anchor,
             "promoted_to_standing": promoted_standing,
             "demoted": demoted_ids,
+            "demote_vetoed": demote_vetoed,
             "scope": normalized_scope,
         }
 
@@ -1964,41 +2035,109 @@ class OBClient:
             seen |= component
             if len(component) < min_cluster_size:
                 continue
-            ordered = sorted(
-                component,
-                key=lambda bid: str(by_id[bid].metadata.get("created") or ""),
-                reverse=True,
-            )
-            sims = [
-                score for (a, b), score in edge_scores.items()
-                if a in component and b in component
-            ]
-            avg = sum(sims) / len(sims) if sims else 0.0
-            # uniqueness = distance to cluster centroid (age-independent signal, I4).
-            # centroid = mean of member embeddings; uniqueness = 1 - cos(member, centroid).
-            member_ids = list(component)
-            dim = len(embeddings[member_ids[0]]) if member_ids else 0
-            centroid = [0.0] * dim
-            for bid in member_ids:
-                vec = embeddings[bid]
-                for i in range(dim):
-                    centroid[i] += float(vec[i])
-            if member_ids:
-                centroid = [c / len(member_ids) for c in centroid]
-            uniqueness = {
-                bid: round(1.0 - self._cosine_similarity(embeddings[bid], centroid), 4)
-                for bid in member_ids
-            }
-            clusters.append({
-                "id": self._cluster_id(ordered),
-                "ids": ordered,
-                "avg_similarity": round(avg, 4),
-                "latest_created": str(by_id[ordered[0]].metadata.get("created") or "") if ordered else "",
-                "buckets": [by_id[bid] for bid in ordered],
-                "uniqueness": uniqueness,
-            })
+            # Gate 1: bound the worst case. An oversized component is split at a
+            # tighter similarity into coherent sub-clusters so no review job is
+            # unbounded and each crystal stays about one repeated thing.
+            for sub in self._split_oversized_component(component, embeddings, min_similarity):
+                if len(sub) < min_cluster_size:
+                    continue
+                clusters.append(self._build_feel_cluster(sub, embeddings, by_id, edge_scores))
         clusters.sort(key=lambda item: (len(item["ids"]), item["latest_created"]), reverse=True)
         return clusters
+
+    def _connected_components(
+        self, ids, embeddings: dict[str, list[float]], threshold: float
+    ) -> list[set[str]]:
+        """Connected components over `ids` with edges where cosine >= threshold."""
+        id_list = list(ids)
+        adjacency: dict[str, set[str]] = {bid: set() for bid in id_list}
+        for idx, left in enumerate(id_list):
+            for right in id_list[idx + 1:]:
+                if self._cosine_similarity(embeddings[left], embeddings[right]) >= threshold:
+                    adjacency[left].add(right)
+                    adjacency[right].add(left)
+        seen: set[str] = set()
+        components: list[set[str]] = []
+        for start in id_list:
+            if start in seen:
+                continue
+            stack = [start]
+            comp: set[str] = set()
+            while stack:
+                current = stack.pop()
+                if current in comp:
+                    continue
+                comp.add(current)
+                stack.extend(adjacency[current] - comp)
+            seen |= comp
+            components.append(comp)
+        return components
+
+    def _split_oversized_component(
+        self, component: set[str], embeddings: dict[str, list[float]], threshold: float
+    ) -> list[set[str]]:
+        """Recursively tighten the similarity threshold until each sub-cluster
+        fits FEEL_CLUSTER_MAX_SIZE (best effort). A genuinely tight blob that
+        won't separate even at the ceiling is returned whole — the review
+        ceiling then bounds reading and the synthesis is legitimately one topic.
+        """
+        if (
+            len(component) <= self.FEEL_CLUSTER_MAX_SIZE
+            or threshold >= self.FEEL_CLUSTER_SPLIT_MAX_THRESHOLD
+        ):
+            return [component]
+        next_threshold = min(
+            threshold + self.FEEL_CLUSTER_SPLIT_STEP,
+            self.FEEL_CLUSTER_SPLIT_MAX_THRESHOLD,
+        )
+        subs = self._connected_components(component, embeddings, next_threshold)
+        if len(subs) <= 1:
+            # Tightening did not separate it; keep climbing the threshold.
+            return self._split_oversized_component(component, embeddings, next_threshold)
+        out: list[set[str]] = []
+        for sub in subs:
+            out.extend(self._split_oversized_component(sub, embeddings, next_threshold))
+        return out
+
+    def _build_feel_cluster(
+        self,
+        component: set[str],
+        embeddings: dict[str, list[float]],
+        by_id: dict[str, OBBucket],
+        edge_scores: dict[tuple[str, str], float],
+    ) -> dict[str, Any]:
+        ordered = sorted(
+            component,
+            key=lambda bid: str(by_id[bid].metadata.get("created") or ""),
+            reverse=True,
+        )
+        sims = [
+            score for (a, b), score in edge_scores.items()
+            if a in component and b in component
+        ]
+        avg = sum(sims) / len(sims) if sims else 0.0
+        # uniqueness = distance to cluster centroid (age-independent signal, I4).
+        member_ids = list(component)
+        dim = len(embeddings[member_ids[0]]) if member_ids else 0
+        centroid = [0.0] * dim
+        for bid in member_ids:
+            vec = embeddings[bid]
+            for i in range(dim):
+                centroid[i] += float(vec[i])
+        if member_ids:
+            centroid = [c / len(member_ids) for c in centroid]
+        uniqueness = {
+            bid: round(1.0 - self._cosine_similarity(embeddings[bid], centroid), 4)
+            for bid in member_ids
+        }
+        return {
+            "id": self._cluster_id(ordered),
+            "ids": ordered,
+            "avg_similarity": round(avg, 4),
+            "latest_created": str(by_id[ordered[0]].metadata.get("created") or "") if ordered else "",
+            "buckets": [by_id[bid] for bid in ordered],
+            "uniqueness": uniqueness,
+        }
 
     async def _get_feel_cluster_by_id(
         self,

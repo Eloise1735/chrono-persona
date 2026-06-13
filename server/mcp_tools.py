@@ -1079,14 +1079,18 @@ async def review_feel_cluster(
 ) -> str:
     """逐批阅读一个 feel 簇的全文，用于结晶前的综合（整合原语·review 步）。
 
-    每批返回最多 batch_size 条**完整正文**（不截断），按 uniqueness 降序——先看最
-    独特的离群项，模式骨架早定。每条附 arousal / importance / uniqueness / source_dynamic
-    等年龄无关信号，供你判断哪些是不可还原的 moment、哪些是冗余。
+    每批返回最多 batch_size 条**完整正文**（不截断），按 salience 降序——salience 融合
+    uniqueness(到簇心距离)、arousal(情绪强度)、importance，既把最独特的离群项、也把情绪
+    最深的痕迹排在前面，让最该晋升为 anchor 的项早被看见。每条附这些年龄无关信号，供你
+    判断哪些是不可还原的 moment、哪些是冗余。
+
+    防卡死(Gate 2)：只有最靠前的 readable_total 条可逐批读，超出的进 tail（只给数量+
+    时间跨度，不必逐条读）。因 salience 降序使信号前置，读到天花板即足够；commit 仍会把
+    整簇(含 tail)保留为 anchor_refs，未读的绝不丢失。
 
     用法：feel_crystals() 选簇 → review_feel_cluster(cluster_id) 读第一批 → 若 has_more，
     用 next_cursor 续读 → 在你自己的上下文里逐轮精修综合 → commit_feel_crystal(...) 落地。
-    预算友好：读两三批就停也行，未读条目仍作为锚点保留、可 recall，绝不丢失。
-    scope 必须与 feel_crystals 一致，才能复原同一 cluster_id。
+    预算友好：读两三批就停也行。scope 必须与 feel_crystals 一致，才能复原同一 cluster_id。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -1112,6 +1116,7 @@ async def commit_feel_crystal(
     demote_ids: list[str] | None = None,
     source_ids: list[str] | None = None,
     crystal_id: str = "",
+    force_demote: bool = False,
     scope: str = "relational",
 ) -> str:
     """把一个 feel 簇综合成一条 evolving_principle（整合原语·commit 步），幂等可多轮精修。
@@ -1123,10 +1128,14 @@ async def commit_feel_crystal(
     - anchor_ids：判定为不可还原的珍贵 moment → 提升为 role=anchor（永不淡出、仅 recall）。
     - standing_ids：判定为持续成立的边界/共识 → 提升为 standing_invariant（始终注入）。
     - demote_ids（默认空）：判定冗余的 feel → 退出自动浮现，但仍可 recall，绝不删除。
+      情绪极强(arousal>0.7)的 feel 不会被自动 demote（深痕不是冗余），会回报在
+      demote_vetoed 里；确实要降权请传 force_demote=True 显式覆盖。
 
     多轮精修：把上一次返回的 crystal_id 传回来，就会覆盖更新同一条结晶（后台无状态，
     状态在结晶本体 + cursor）。不传 crystal_id 时按 cluster_id+scope 确定性去重。
     至少要能定位整簇：传 cluster_id（推荐）或显式 source_ids 之一。scope 须与上游一致。
+    review 返回的 items 已按 salience(独特性⊕情绪⊕重要性)降序，前几批即含最该晋升的项；
+    超出 review 天花板的尾部不必读，commit 仍会整簇保留为 anchor_refs。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -1141,6 +1150,7 @@ async def commit_feel_crystal(
             demote_ids=demote_ids or [],
             source_ids=source_ids or [],
             crystal_id=crystal_id,
+            force_demote=force_demote,
             scope=scope,
         )
     except ValueError as exc:
