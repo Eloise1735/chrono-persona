@@ -714,6 +714,32 @@ async def recall_memories(query: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
+async def recall_anchors(query: str = "", top_k: int = 5) -> str:
+    """翻开"珍贵记忆相册"：只检索 anchor（不可还原的珍贵关键事件），与普通记忆检索分开。
+
+    【何时调用】
+    get_current_state 里会注入一份「珍贵记忆·相册目录」（只有主题关键词，没有细节）。
+    当对话聊到目录里提示的某个主题、或触及你们之间一段珍贵的共同经历时，**主动**调用
+    这里把那段记忆的完整内容翻出来——就像和对方一起翻开相册的某一页。
+
+    【与 recall_memories 的区别】
+    - recall_memories：日常事件/感受的工作记忆检索。
+    - recall_anchors：专门翻看被珍藏的、永不淡出的关键时刻；按"相关度×情感分量"排序，
+      不受普通衰减影响。翻看本身会让这条记忆更"鲜活"（更可能继续留在相册目录里）。
+
+    Args:
+        query: 主题关键词（空格分隔）；留空则按情感分量返回最珍贵的几条。
+        top_k: 返回条数上限。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    results = await _ob_client.recall_anchors(query, top_k=top_k)
+    if not results:
+        return "相册里还没有相关的珍贵记忆。"
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def breath(
     query: str = "",
     top_k: int = 0,
