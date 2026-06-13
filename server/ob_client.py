@@ -55,6 +55,7 @@ class OBClient:
     # 提示模型在相关话题上自检索；细节走独立的 recall_anchors 路径。目录名额自动按
     # salience(arousal × 最近翻看)封顶，超出的退出目录但仍可检索（深存储）。
     ANCHOR_INDEX_CAP = 50                  # 进入相册目录的 anchor 名额上限
+    ANCHOR_RECALL_BOOST = 1.3              # anchor 是特权记忆：关键词召回时小幅加权
 
     # --- Consolidation primitive bounds (spec Phase 2, Q1/Q3) -------------
     # Gate 1: cap a single cluster so no review job is unbounded. Oversized
@@ -1159,9 +1160,6 @@ class OBClient:
             if self._bucket_type(b.metadata) != "feel"
             and not b.metadata.get("pinned")
             and not b.metadata.get("protected")
-            # anchors have their own album index + recall_anchors path; keep them
-            # out of normal recall so they stop diluting dynamic retrieval.
-            and self.effective_role(b.metadata) != self.ROLE_ANCHOR
         ]
         if domains:
             buckets = [b for b in buckets if self._matches_domains(b, domains)]
@@ -1184,6 +1182,11 @@ class OBClient:
             score = self._search_score(bucket, query, valence, arousal, now)
             if bucket.id in vector_scores and vector_scores[bucket.id] > 0.5:
                 score = max(score, vector_scores[bucket.id] * 100.0)
+            # anchors are privileged precious memories: when relevant they should
+            # surface MORE readily, not less — keyword recall is a kept channel,
+            # the album index is just an extra direct lane (the two coexist).
+            if self.effective_role(bucket.metadata) == self.ROLE_ANCHOR:
+                score *= self.ANCHOR_RECALL_BOOST
             if score < 18:
                 continue
             bucket.score = round(score, 2)

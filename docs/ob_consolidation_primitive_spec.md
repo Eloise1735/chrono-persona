@@ -213,7 +213,7 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
 
 - `resolve` 软化（回归衰减而非硬删）+ dream 护栏。
 - 读取侧：activation^0.3 反馈阻尼、**"旧回声"槽**、高阈值环境式 recall。
-  - **回声槽定案（讨论结论）**：breath_bundle 2 个 free 槽分工——槽一保持纯随机（自由联想 + 抗反刍安全阀）；槽二做"回声"，从**已淡出正常浮现的老 bucket**里按 **arousal 加权随机**（非取最高）抽一条，模拟非自主记忆（age×arousal）。加权用**原始 arousal**（非 score，因 feel 浮现时 score 被拍回 50 会抹掉 arousal 差异）。加权随机同时保住随机性与抗反刍：最痛那条不会每次必中。理由：最近的强烈情绪 relational 槽已覆盖，free 槽硬偏高 arousal 会冗余且诱发反刍；真正缺的是"又老又深"的记忆不期然浮现。落地前需先观察 arousal 加权衰减上线后老高-arousal 池的实况。
+  - **回声槽定案（讨论结论）**：breath_bundle 2 个 free 槽分工——槽一保持纯随机（自由联想 + 抗反刍安全阀）；槽二做"回声"，**只从 anchor 池**按 **arousal ×（久未翻看）加权随机**抽一条，模拟非自主记忆。锁定 anchor 而非"任意古老高-arousal bucket"：后者基本已衰减归档，只有 anchor 作为 permanent 持久存在，所以 anchor 既是材料所在、又更干净；且配 `last_revisited` 实现"很久没翻到的那页突然翻开"。加权随机同时保住随机性与抗反刍：最珍贵那条不会每次必中。理由：最近的强烈情绪 relational 槽已覆盖，真正缺的是珍贵旧记忆不期然浮现。
 
 ### 9.1 breath_bundle 槽位改造计划（待办，Phase 4 读取侧）
 
@@ -223,7 +223,7 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
 |---|---|---|---|---|
 | 前台 | 每轮 | personal 3 + relational 8 | 近期事件/感受/我的生活（连续性主体 ~85%） | feel 排序：纯新近 → **新近 ⊕ arousal**（改 `_feel_breath`，让有分量的近期感受多赖几轮；不加槽） |
 | 背景 | 每轮 | free 槽 A | 漫游/自由联想 + 抗反刍安全阀 | 保持现状（随机 top-N 取 1） |
-| 深处 | ~每三轮 | free 槽 B | 古老深记忆不期然浮现（含 anchor/旧feel/旧dynamic） | **概率回声 p≈0.35**：命中→褪色池 age×arousal 加权随机；未命中→退化为漫游 |
+| 深处 | ~每三轮 | free 槽 B | 珍贵旧记忆不期然浮现（**仅 anchor**） | **概率回声 p≈0.35**：命中→**只从 anchor 池**按 arousal × (久未翻看) 加权随机；未命中→退化为漫游。理由：除 anchor 外的古老高-arousal bucket 基本已衰减归档，只有 anchor 作为 permanent 持久存在；锁定 anchor 更干净、正是材料所在，且配 last_revisited 实现"很久没翻到的那页突然翻开"。回声命中也 bump last_revisited。 |
 
 - **anchor 不占固定 breath 槽**：其常态露出靠 get_current_state 的"相册目录"关键词（Phase 3 块3）；breath 里的回声只是偶发惊喜。
 - **两类情绪记忆各归其位**：近期重感受 → relational feel 排序（新近⊕arousal，前台稳定）；古老深记忆 → 槽 B 回声（age×arousal，偶发）。
@@ -245,6 +245,6 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
    - **遗留待办（✅ 已落地）**：feel 衰减改 arousal 加权（`effective_λ = 0.04·(1-0.6·arousal)`，深痕半衰期 17d→38d）+ dashboard 半衰期诊断。
 3. **Phase 3 — 稳定层代谢**（✅ 已落地）：standing 无界增长饿死 evolving、anchor 堆积稀释召回。分三块：
    - **块1（✅ 已落地）— evolving 注入保底 + 软预算**：`EVOLVING_INJECT_FLOOR=3` 始终渲染；standing 全量不截断；溢出 = 触发 standing-review 的信号，而非丢 evolving。
-   - **块3（✅ 已落地）— anchor 相册**：anchor 退出普通 recall（`_query_breath` 排除），get_current_state 注入"相册目录"（主题关键词，按 salience=arousal×最近翻看 封顶 `ANCHOR_INDEX_CAP=50`，超出退索引仍可检索）；独立 `recall_anchors(query)` 路径按相关度×情感排序，翻看 bump `last_revisited`。anchor 不 merge（不可还原），偶发重复靠 promote 时去重兜底。
+   - **块3（✅ 已落地）— anchor 相册**：anchor 是**特权记忆**，三条通道并存而非互斥——①普通关键词 recall **保留**且**加权**（`ANCHOR_RECALL_BOOST=1.3`，相关时更易浮现，而非被排除）；②get_current_state 注入"相册目录"（主题关键词，按 salience=arousal×最近翻看 封顶 `ANCHOR_INDEX_CAP=50`，超出退索引仍可检索）作为直通车；③独立 `recall_anchors(query)` 路径按相关度×情感排序，翻看 bump `last_revisited`。anchor 不 merge（不可还原），偶发重复靠 promote 时去重兜底。「堆积稀释」由相册目录名额封顶（管 top-of-mind）解决，不靠砍召回。
    - **块2（✅ 已落地）— standing-review**：standing 条数 > `STANDING_REVIEW_THRESHOLD=8` → get_current_state 注入提醒 → `review_standing()` **通读全部 standing**（不采样、无天花板）→ 模型读完写合并正文 → `commit_standing_merge(merged_content, retired_ids, user_confirmed=True)` 建新 standing、原条目转 `type=dynamic`（打 `retired_from=standing`、importance=4）自然衰减、仍可 recall。`user_confirmed` 强制用户确认门（最重 gated）。一次一组，多组多次调用。
 4. **Phase 4 — resolve + 读取侧**（见 §9、§9.1 breath_bundle 槽位改造）。

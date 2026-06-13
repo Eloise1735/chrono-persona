@@ -2539,9 +2539,9 @@ def test_resurfaced_cluster_folds_into_same_crystal():
 # --- Phase 3 block 3: anchor album --------------------------------------------
 
 
-def test_anchor_excluded_from_normal_recall():
+def test_anchor_recallable_via_keyword_and_privileged():
     async def scenario():
-        client = await _client("anchor_recall_exclude")
+        client = await _client("anchor_recall_priv")
         anchor = await client.hold(
             "我们在初雪那天许下的约定", bucket_type="permanent", name="初雪约定",
             extra_metadata={"role": "anchor"},
@@ -2550,9 +2550,11 @@ def test_anchor_excluded_from_normal_recall():
             "我们在初雪那天许下的约定", bucket_type="dynamic", name="初雪约定_dyn",
         )
         results = await client.breath(query="初雪 约定")
-        ids = {b.id for b in results}
-        assert anchor not in ids   # anchor stays out of normal recall
-        assert dyn in ids          # the dynamic still surfaces
+        by_id = {b.id: b for b in results}
+        assert anchor in by_id   # anchor IS recallable via normal keyword search
+        assert dyn in by_id      # so is the dynamic
+        # privilege: identical content => anchor outranks the plain dynamic (boost).
+        assert by_id[anchor].score > by_id[dyn].score
 
     run(scenario())
 
