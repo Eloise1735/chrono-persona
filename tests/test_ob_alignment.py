@@ -2785,3 +2785,97 @@ def test_standing_review_reminder_injected_over_threshold():
         assert "review_standing()" not in text2
 
     run(scenario())
+
+
+# --- Phase 4: breath_bundle slot redesign -------------------------------------
+
+
+def test_feel_surface_ranks_weighty_recent_over_milder_newer():
+    async def scenario():
+        client = await _client("feel_surface_rank")
+        # A milder feel from 1 day ago vs an intense feel from 4 days ago.
+        mild_new = await client.hold(
+            "平淡的近期感受", bucket_type="feel", domain=["relationship"],
+            created=(datetime.utcnow() - timedelta(days=1)).isoformat(),
+            extra_metadata={"arousal": 0.2},
+        )
+        intense_old = await client.hold(
+            "很重的几天前的感受", bucket_type="feel", domain=["relationship"],
+            created=(datetime.utcnow() - timedelta(days=4)).isoformat(),
+            extra_metadata={"arousal": 0.95},
+        )
+        ordered = await client._feel_breath(limit=20, max_character_life=0)
+        ids = [b.id for b in ordered]
+        # recency⊕arousal: the weighty older feeling holds the slot ahead.
+        assert ids.index(intense_old) < ids.index(mild_new)
+
+    run(scenario())
+
+
+def test_echo_slot_surfaces_anchor_when_probability_hits():
+    async def scenario():
+        client = await _client("echo_hit")
+        client.ECHO_PROBABILITY = 1.0  # force the echo branch
+        anchor = await client.hold(
+            "初雪那天的约定", bucket_type="permanent", name="初雪约定",
+            domain=["纪念"],
+            created=(datetime.utcnow() - timedelta(days=90)).isoformat(),
+            extra_metadata={"role": "anchor", "arousal": 0.9},
+        )
+        # Give the bundle some ordinary dynamics to fill the foreground.
+        for i in range(4):
+            await client.hold(f"近期事件 {i}", bucket_type="dynamic", domain=["relationship"])
+
+        bundle = await client.breath_bundle()
+        free_texts = [item["content"] for item in bundle["free"]]
+        # The echo slot carries the anchor, tagged so the model knows it resurfaced.
+        assert any(client.ECHO_SLOT_MARKER in t for t in free_texts)
+        # Surfacing counts as revisiting -> last_revisited is now set.
+        refreshed = await client.get(anchor)
+        assert refreshed.metadata.get("last_revisited")
+
+    run(scenario())
+
+
+def test_echo_slot_silent_when_probability_misses():
+    async def scenario():
+        client = await _client("echo_miss")
+        client.ECHO_PROBABILITY = 0.0  # force the wander-only branch
+        await client.hold(
+            "初雪那天的约定", bucket_type="permanent", name="初雪约定",
+            domain=["纪念"], extra_metadata={"role": "anchor", "arousal": 0.9},
+        )
+        for i in range(5):
+            await client.hold(f"近期事件 {i}", bucket_type="dynamic", domain=["relationship"])
+
+        bundle = await client.breath_bundle()
+        free_texts = [item["content"] for item in bundle["free"]]
+        assert not any(client.ECHO_SLOT_MARKER in t for t in free_texts)
+
+    run(scenario())
+
+
+def test_pick_echo_anchor_favours_unrevisited_high_arousal():
+    async def scenario():
+        client = await _client("echo_weight")
+        old = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        # High arousal but JUST revisited -> weight ~0.
+        await client.hold(
+            "刚翻看过的强记忆", bucket_type="permanent", name="刚翻看",
+            extra_metadata={"role": "anchor", "arousal": 0.9, "last_revisited": datetime.utcnow().isoformat()},
+        )
+        # High arousal, long un-revisited -> high weight (should dominate picks).
+        want = await client.hold(
+            "很久没想起的强记忆", bucket_type="permanent", name="久未翻",
+            created=old, extra_metadata={"role": "anchor", "arousal": 0.9, "last_revisited": old},
+        )
+        picks = set()
+        for _ in range(20):
+            chosen = await client._pick_echo_anchor()
+            assert chosen is not None
+            picks.add(chosen.id)
+        # The long-unrevisited memory is heavily favoured (the just-revisited one
+        # has ~zero weight, so it should essentially never be chosen).
+        assert want in picks
+
+    run(scenario())
