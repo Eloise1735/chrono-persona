@@ -247,4 +247,8 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
    - **块1（✅ 已落地）— evolving 注入保底 + 软预算**：`EVOLVING_INJECT_FLOOR=3` 始终渲染；standing 全量不截断；溢出 = 触发 standing-review 的信号，而非丢 evolving。
    - **块3（✅ 已落地）— anchor 相册**：anchor 是**特权记忆**，三条通道并存而非互斥——①普通关键词 recall **保留**且**加权**（`ANCHOR_RECALL_BOOST=1.3`，相关时更易浮现，而非被排除）；②get_current_state 注入"相册目录"（主题关键词，按 salience=arousal×最近翻看 封顶 `ANCHOR_INDEX_CAP=50`，超出退索引仍可检索）作为直通车；③独立 `recall_anchors(query)` 路径按相关度×情感排序，翻看 bump `last_revisited`。anchor 不 merge（不可还原），偶发重复靠 promote 时去重兜底。「堆积稀释」由相册目录名额封顶（管 top-of-mind）解决，不靠砍召回。
    - **块2（✅ 已落地）— standing-review**：standing 条数 > `STANDING_REVIEW_THRESHOLD=8` → get_current_state 注入提醒 → `review_standing()` **通读全部 standing**（不采样、无天花板）→ 模型读完写合并正文 → `commit_standing_merge(merged_content, retired_ids, user_confirmed=True)` 建新 standing、原条目转 `type=dynamic`（打 `retired_from=standing`、importance=4）自然衰减、仍可 recall。`user_confirmed` 强制用户确认门（最重 gated）。一次一组，多组多次调用。
+   - **块4（✅ 已落地）— anchor 写入收口 + cherish 银档**：解决"周期性结晶机械产出 anchor"。anchor 创建从簇内相对 → **全局绝对**：
+     - **两段式 + 用户确认**：`commit_feel_crystal(anchor_ids=…)` 只**提议**——返回 `pending_anchor_proposals`（候选主题 + 最近邻既有 anchor 全文 + 相似度，供模型+用户对照整个相册）；`confirm_anchor_ids=…`（用户点头后）才写入。多数周期 anchor 产出为 0 是正常。
+     - **相似度算法**：候选对既有 anchor **逐条 max pairwise**（**绝不质心/平均**——会抵消独特性），`ANCHOR_PROPOSAL_TOP_K=3` 条最近邻；主题（domain）只作路由/组织，判断永远基于逐条全文（I3 信号非硬闸）。
+     - **cherish 银档**：落选但有记忆价值的 feel → `cherish_ids` 标 `cherished`：衰减 `×CHERISH_DECAY_FACTOR=0.5`（半衰期约翻倍）+ 刷新 last_active，**延寿但仍会归档**。三档：anchor 永久 / cherished 延长-仍死 / 普通 feel 正常。cherished 自清理，可放心多标。
 4. **Phase 4 — resolve + 读取侧**（见 §9、§9.1 breath_bundle 槽位改造）。

@@ -2229,7 +2229,7 @@ def test_commit_feel_crystal_promotes_keep_and_demotes_redundant():
         result = await client.commit_feel_crystal(
             synthesis="模式综合。",
             cluster_id=cluster_id,
-            anchor_ids=[ids[6]],       # irreplaceable moment -> anchor
+            confirm_anchor_ids=[ids[6]],  # user-confirmed irreplaceable moment -> anchor
             standing_ids=[ids[0]],     # durable consensus -> standing_invariant
             demote_ids=[ids[1], ids[2]],  # redundant -> exit surfacing
             min_cluster_size=3, min_similarity=0.8,
@@ -2254,6 +2254,71 @@ def test_commit_feel_crystal_promotes_keep_and_demotes_redundant():
             assert client.calculate_score(d.metadata) < client.calculate_score(
                 {"type": "feel", "created": d.metadata["created"], "last_active": d.metadata["created"]}
             )
+
+    run(scenario())
+
+
+def test_anchor_admission_is_two_phase_propose_then_confirm():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("anchor_two_phase")
+        # An existing anchor on a different theme, to populate the comparison set.
+        existing = await client.hold(
+            "初雪那天的约定", bucket_type="permanent", name="初雪约定",
+            domain=["纪念"], extra_metadata={"role": "anchor"},
+        )
+        client.embedding_store.vectors[existing] = [0.0, 0.0, 1.0]
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        # Phase 1 — propose only: nothing is promoted, comparison surfaced.
+        propose = await client.commit_feel_crystal(
+            synthesis="模式。", cluster_id=cluster_id,
+            anchor_ids=[ids[6]], min_cluster_size=3, min_similarity=0.8,
+        )
+        assert propose["promoted_to_anchor"] == []
+        proposals = propose["pending_anchor_proposals"]
+        assert len(proposals) == 1 and proposals[0]["id"] == ids[6]
+        assert proposals[0]["existing_anchor_total"] == 1
+        assert proposals[0]["nearest_existing"][0]["id"] == existing
+        assert await client.get(ids[6]) and (await client.get(ids[6])).metadata["type"] == "feel"
+
+        # Phase 2 — confirm (user OK'd): now it is promoted, same crystal.
+        confirm = await client.commit_feel_crystal(
+            synthesis="模式。", crystal_id=propose["crystal_id"], source_ids=ids,
+            confirm_anchor_ids=[ids[6]],
+        )
+        assert confirm["promoted_to_anchor"] == [ids[6]]
+        promoted = await client.get(ids[6])
+        assert promoted.metadata["type"] == "permanent"
+        assert promoted.metadata["role"] == "anchor"
+
+    run(scenario())
+
+
+def test_cherish_tier_lingers_longer_but_still_mortal():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("cherish_tier")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        res = await client.commit_feel_crystal(
+            synthesis="模式。", cluster_id=cluster_id,
+            cherish_ids=[ids[3]], min_cluster_size=3, min_similarity=0.8,
+        )
+        assert res["cherished"] == [ids[3]]
+        cher = await client.get(ids[3])
+        assert cher.metadata["type"] == "feel"          # still a feel (not permanent)
+        assert cher.metadata["cherished"] is True
+
+        # Same age + arousal: cherished decays slower than an ordinary feel...
+        old = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        ar = cher.metadata.get("arousal")
+        cherished_meta = {"type": "feel", "created": old, "last_active": old,
+                          "arousal": ar, "cherished": True}
+        ordinary_meta = {"type": "feel", "created": old, "last_active": old, "arousal": ar}
+        assert client.calculate_score(cherished_meta) > client.calculate_score(ordinary_meta)
+        # ...but is still mortal: far less than a permanent anchor (999).
+        assert client.calculate_score(cherished_meta) < 999.0
 
     run(scenario())
 
