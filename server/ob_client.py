@@ -50,6 +50,11 @@ class OBClient:
     ROLE_ANCHOR = "anchor"                 # 原汁原味关键事件；仅 recall，不自动注入
     PERMANENT_ROLES = {ROLE_EVOLVING, ROLE_STANDING, ROLE_ANCHOR}
     EVOLVING_PRINCIPLE_INJECT_LIMIT = 5    # evolving 注入窗（新近）
+    # anchor 相册（spec §Phase3 块3）：anchor 是不可还原的珍贵事件，几乎不重复，
+    # 不该 merge、也不该注入全文。get_current_state 只注入一份"相册目录"（主题关键词），
+    # 提示模型在相关话题上自检索；细节走独立的 recall_anchors 路径。目录名额自动按
+    # salience(arousal × 最近翻看)封顶，超出的退出目录但仍可检索（深存储）。
+    ANCHOR_INDEX_CAP = 50                  # 进入相册目录的 anchor 名额上限
 
     # --- Consolidation primitive bounds (spec Phase 2, Q1/Q3) -------------
     # Gate 1: cap a single cluster so no review job is unbounded. Oversized
@@ -949,6 +954,110 @@ class OBClient:
             bucket.score = self.calculate_score(bucket.metadata)
         return {"standing": standing, "evolving": evolving}
 
+    def _anchor_salience(self, meta: dict[str, Any], now: datetime) -> float:
+        """Album-index ranking: emotional weight, modulated by how recently the
+        memory was last revisited. Arousal-dominant so vivid old memories stay;
+        a gentle recency bump keeps recently-reopened ones in the index."""
+        arousal = self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3)
+        ref = meta.get("last_revisited") or meta.get("created")
+        days = self._days_since(ref, now)
+        recency = math.exp(-0.01 * max(days, 0.0))  # ~70-day soft horizon
+        return arousal * (0.5 + 0.5 * recency)
+
+    async def anchor_album_index(self, *, cap: int | None = None) -> dict[str, Any]:
+        """A compressed, themed "table of contents" of anchor memories for
+        get_current_state — topic keywords, not full content. Capped by salience
+        (arousal × recency-of-revisit); over-cap anchors drop out of the index
+        but stay retrievable via recall_anchors (deep storage)."""
+        cap = self.ANCHOR_INDEX_CAP if cap is None else max(1, int(cap))
+        anchors = [
+            b for b in await self.list_buckets(include_archive=False)
+            if self.effective_role(b.metadata) == self.ROLE_ANCHOR
+        ]
+        now = datetime.utcnow()
+        anchors.sort(key=lambda b: self._anchor_salience(b.metadata or {}, now), reverse=True)
+        active = anchors[:cap]
+        themes: dict[str, list[OBBucket]] = {}
+        for bucket in active:
+            meta = bucket.metadata or {}
+            domains = [str(d) for d in (meta.get("domain") or []) if str(d).strip()]
+            theme = domains[0] if domains else "未分类"
+            themes.setdefault(theme, []).append(bucket)
+        index = []
+        for theme, items in sorted(themes.items(), key=lambda kv: len(kv[1]), reverse=True):
+            keywords = [
+                str((b.metadata or {}).get("name") or b.id).strip()
+                for b in items[:5]
+            ]
+            index.append({"theme": theme, "count": len(items), "keywords": keywords})
+        return {
+            "themes": index,
+            "active_count": len(active),
+            "total": len(anchors),
+            "capped": len(anchors) > cap,
+            "cap": cap,
+        }
+
+    async def recall_anchors(self, query: str, *, top_k: int = 5) -> list[dict[str, Any]]:
+        """Open the album: search ONLY anchor memories, ranked by relevance ×
+        emotional weight (not dynamic decay — anchors do not decay). Retrieval
+        bumps last_revisited (activation feedback: revisiting keeps a memory in
+        the active album index)."""
+        top_k = max(1, min(20, int(top_k or 5)))
+        anchors = [
+            b for b in await self.list_buckets(include_archive=False)
+            if self.effective_role(b.metadata) == self.ROLE_ANCHOR
+        ]
+        if not anchors:
+            return []
+        query = str(query or "").strip()
+        anchor_ids = {b.id for b in anchors}
+        vector_scores: dict[str, float] = {}
+        if query and self.embedding_store is not None:
+            try:
+                hits = await self.embedding_store.search_similar(query, top_k=max(50, top_k * 6))
+                vector_scores = {
+                    str(bid): float(sim) for bid, sim in hits if str(bid) in anchor_ids
+                }
+            except Exception:
+                logger.exception("anchor recall embedding search failed; lexical fallback.")
+        import difflib
+
+        norm_q = self._normalize_for_dedupe(query)
+        now = datetime.utcnow()
+        scored: list[tuple[float, OBBucket]] = []
+        for bucket in anchors:
+            if bucket.id in vector_scores:
+                relevance = vector_scores[bucket.id]
+            elif norm_q:
+                relevance = difflib.SequenceMatcher(
+                    None, norm_q, self._normalize_for_dedupe(bucket.content)
+                ).ratio()
+            else:
+                relevance = 0.0
+            arousal = self._clamp_float(bucket.metadata.get("arousal"), 0.0, 1.0, 0.3)
+            # emotion-weighted relevance; with no query, fall back to pure salience.
+            score = (relevance * (0.5 + 0.5 * arousal)) if norm_q else self._anchor_salience(bucket.metadata, now)
+            scored.append((score, bucket))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        top = [b for _, b in scored[:top_k]]
+        revisited = now.isoformat()
+        for bucket in top:
+            await self.update(bucket.id, last_revisited=revisited)
+        out = []
+        for score, bucket in scored[:top_k]:
+            meta = bucket.metadata or {}
+            out.append({
+                "id": bucket.id,
+                "name": meta.get("name") or bucket.id,
+                "domain": meta.get("domain", []),
+                "arousal": self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3),
+                "relevance": round(float(score), 4),
+                "created": meta.get("created", ""),
+                "content": self._strip_wikilinks(bucket.content),
+            })
+        return out
+
     async def _query_breath(
         self,
         query: str,
@@ -967,6 +1076,9 @@ class OBClient:
             if self._bucket_type(b.metadata) != "feel"
             and not b.metadata.get("pinned")
             and not b.metadata.get("protected")
+            # anchors have their own album index + recall_anchors path; keep them
+            # out of normal recall so they stop diluting dynamic retrieval.
+            and self.effective_role(b.metadata) != self.ROLE_ANCHOR
         ]
         if domains:
             buckets = [b for b in buckets if self._matches_domains(b, domains)]

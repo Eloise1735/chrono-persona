@@ -2534,3 +2534,103 @@ def test_resurfaced_cluster_folds_into_same_crystal():
 
     run(scenario())
 
+
+
+# --- Phase 3 block 3: anchor album --------------------------------------------
+
+
+def test_anchor_excluded_from_normal_recall():
+    async def scenario():
+        client = await _client("anchor_recall_exclude")
+        anchor = await client.hold(
+            "我们在初雪那天许下的约定", bucket_type="permanent", name="初雪约定",
+            extra_metadata={"role": "anchor"},
+        )
+        dyn = await client.hold(
+            "我们在初雪那天许下的约定", bucket_type="dynamic", name="初雪约定_dyn",
+        )
+        results = await client.breath(query="初雪 约定")
+        ids = {b.id for b in results}
+        assert anchor not in ids   # anchor stays out of normal recall
+        assert dyn in ids          # the dynamic still surfaces
+
+    run(scenario())
+
+
+def test_anchor_album_index_themed_and_salience_capped():
+    async def scenario():
+        client = await _client("anchor_album")
+        client.ANCHOR_INDEX_CAP = 2
+        await client.hold("高强度珍贵记忆", bucket_type="permanent", name="高",
+                          domain=["纪念"], extra_metadata={"role": "anchor", "arousal": 0.9})
+        await client.hold("中等珍贵记忆", bucket_type="permanent", name="中",
+                          domain=["纪念"], extra_metadata={"role": "anchor", "arousal": 0.5})
+        await client.hold("低强度珍贵记忆", bucket_type="permanent", name="低",
+                          domain=["日常"], extra_metadata={"role": "anchor", "arousal": 0.1})
+        album = await client.anchor_album_index()
+        assert album["total"] == 3
+        assert album["active_count"] == 2
+        assert album["capped"] is True
+        all_keywords = [kw for theme in album["themes"] for kw in theme["keywords"]]
+        assert "高" in all_keywords and "中" in all_keywords
+        assert "低" not in all_keywords  # lowest salience dropped from the index
+
+    run(scenario())
+
+
+def test_recall_anchors_only_anchors_and_bumps_revisited():
+    async def scenario():
+        client = await _client("recall_anchors")
+        anchor = await client.hold(
+            "那次海边看日落的约定", bucket_type="permanent", name="海边日落",
+            extra_metadata={"role": "anchor", "arousal": 0.8},
+        )
+        await client.hold("普通的海边日落记录", bucket_type="dynamic", name="海边日落_dyn")
+        before = await client.get(anchor)
+        assert not before.metadata.get("last_revisited")
+        results = await client.recall_anchors("海边 日落", top_k=5)
+        ids = {r["id"] for r in results}
+        assert anchor in ids
+        assert all(r["id"] == anchor or r["id"] != anchor for r in results)  # only anchors returned
+        assert len(ids) == 1  # the dynamic is not an anchor, excluded
+        after = await client.get(anchor)
+        assert after.metadata.get("last_revisited")  # retrieval bumped it
+
+    run(scenario())
+
+
+def test_recall_anchors_empty_query_returns_by_salience():
+    async def scenario():
+        client = await _client("recall_anchors_salience")
+        await client.hold("淡记忆", bucket_type="permanent", name="淡",
+                          extra_metadata={"role": "anchor", "arousal": 0.1})
+        vivid = await client.hold("浓记忆", bucket_type="permanent", name="浓",
+                                  extra_metadata={"role": "anchor", "arousal": 0.9})
+        results = await client.recall_anchors("", top_k=1)
+        assert results[0]["id"] == vivid  # most emotionally vivid first
+
+    run(scenario())
+
+
+def test_anchor_album_context_renders_and_is_silent_when_empty():
+    async def scenario():
+        from server.state_machine import StateMachine
+
+        class FakeOB:
+            def __init__(self, themes):
+                self._themes = themes
+            async def anchor_album_index(self):
+                return {"themes": self._themes, "active_count": 1, "total": 1, "capped": False, "cap": 50}
+
+        sm = StateMachine.__new__(StateMachine)
+        sm.ob_client = FakeOB([{"theme": "纪念", "count": 3, "keywords": ["初雪", "和解"]}])
+        text = await sm._build_anchor_album_context()
+        assert "珍贵记忆·相册目录" in text
+        assert "纪念" in text and "初雪" in text
+        assert "recall_anchors" in text
+
+        sm_empty = StateMachine.__new__(StateMachine)
+        sm_empty.ob_client = FakeOB([])
+        assert await sm_empty._build_anchor_album_context() == ""
+
+    run(scenario())
