@@ -1626,6 +1626,39 @@ def test_special_decay_scores():
     run(scenario())
 
 
+def test_feel_decay_is_arousal_weighted():
+    async def scenario():
+        client = await _client("feel_arousal_decay")
+        old_iso = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        flat = client.calculate_score(
+            {"type": "feel", "created": old_iso, "last_active": old_iso, "arousal": 0.0}
+        )
+        deep = client.calculate_score(
+            {"type": "feel", "created": old_iso, "last_active": old_iso, "arousal": 0.9}
+        )
+        # An intense old feel decays slower, so it scores higher than a flat one
+        # of the same age (a deep mark lingers).
+        assert deep > flat
+
+        # Diagnostic: higher arousal => smaller effective lambda => longer life.
+        flat_diag = client.feel_decay_diagnostic({"type": "feel", "arousal": 0.0})
+        deep_diag = client.feel_decay_diagnostic({"type": "feel", "arousal": 0.9})
+        assert flat_diag["effective_lambda"] == 0.04
+        assert deep_diag["effective_lambda"] < flat_diag["effective_lambda"]
+        assert deep_diag["half_life_days"] > flat_diag["half_life_days"]
+        assert deep_diag["archive_days"] > flat_diag["archive_days"]
+        # k<1 keeps a deep mark mortal (not turned into a de-facto permanent).
+        assert deep_diag["effective_lambda"] > 0
+        # format_buckets surfaces the diagnostic for the dashboard.
+        fid = await client.hold("an intense moment", bucket_type="feel",
+                                extra_metadata={"arousal": 0.9})
+        formatted = client.format_buckets([await client.get(fid)])
+        assert "feel_decay" in formatted[0]
+        assert formatted[0]["feel_decay"]["half_life_days"] > flat_diag["half_life_days"]
+
+    run(scenario())
+
+
 def test_find_merge_candidates_surfaces_near_duplicate_but_does_not_merge():
     async def scenario():
         client = await _client("merge_suggest")
