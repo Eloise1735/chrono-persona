@@ -212,7 +212,23 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
 ## 9. 推迟到 Phase 4+（不在本规格实现范围）
 
 - `resolve` 软化（回归衰减而非硬删）+ dream 护栏。
-- 读取侧：activation^0.3 反馈阻尼、"旧回声"槽、高阈值环境式 recall。
+- 读取侧：activation^0.3 反馈阻尼、**"旧回声"槽**、高阈值环境式 recall。
+  - **回声槽定案（讨论结论）**：breath_bundle 2 个 free 槽分工——槽一保持纯随机（自由联想 + 抗反刍安全阀）；槽二做"回声"，从**已淡出正常浮现的老 bucket**里按 **arousal 加权随机**（非取最高）抽一条，模拟非自主记忆（age×arousal）。加权用**原始 arousal**（非 score，因 feel 浮现时 score 被拍回 50 会抹掉 arousal 差异）。加权随机同时保住随机性与抗反刍：最痛那条不会每次必中。理由：最近的强烈情绪 relational 槽已覆盖，free 槽硬偏高 arousal 会冗余且诱发反刍；真正缺的是"又老又深"的记忆不期然浮现。落地前需先观察 arousal 加权衰减上线后老高-arousal 池的实况。
+
+### 9.1 breath_bundle 槽位改造计划（待办，Phase 4 读取侧）
+
+> 核心判断：**深度要"稀有"不要"占槽"**。给 anchor/回声固定槽会同时廉价化珍贵记忆 + 挤掉日常连续性；做成概率性即化解两难——85% 的 bundle 永远是连续性主体，深度只在偶发命中时占半格。
+
+| 层 | 频率 | 槽 | 负责 | 改动 |
+|---|---|---|---|---|
+| 前台 | 每轮 | personal 3 + relational 8 | 近期事件/感受/我的生活（连续性主体 ~85%） | feel 排序：纯新近 → **新近 ⊕ arousal**（改 `_feel_breath`，让有分量的近期感受多赖几轮；不加槽） |
+| 背景 | 每轮 | free 槽 A | 漫游/自由联想 + 抗反刍安全阀 | 保持现状（随机 top-N 取 1） |
+| 深处 | ~每三轮 | free 槽 B | 古老深记忆不期然浮现（含 anchor/旧feel/旧dynamic） | **概率回声 p≈0.35**：命中→褪色池 age×arousal 加权随机；未命中→退化为漫游 |
+
+- **anchor 不占固定 breath 槽**：其常态露出靠 get_current_state 的"相册目录"关键词（Phase 3 块3）；breath 里的回声只是偶发惊喜。
+- **两类情绪记忆各归其位**：近期重感受 → relational feel 排序（新近⊕arousal，前台稳定）；古老深记忆 → 槽 B 回声（age×arousal，偶发）。
+- **旋钮**：回声概率 p、褪色池年龄阈值、feel recency⊕arousal 权重。
+- **前置依赖**：anchor 相册（Phase 3 块3）+ "褪色池"定义；先观察 arousal 加权衰减上线后老高-arousal 池实况再调参。
 - 横切一致性：归档项 embedding 仍在向量库 → 将来纯语义 recall 要显式排除 archived；`key_record` 的 `update_if_exists` 与"模型 gated"哲学对齐。
 
 ---
