@@ -5332,6 +5332,13 @@ class StateMachine:
     PRINCIPLE_INJECT_CHARS_STANDING = 480
     PRINCIPLE_INJECT_CHARS_EVOLVING = 240
     PRINCIPLE_INJECT_TOTAL_BUDGET = 2400  # ~ combined principle chars before trimming evolving
+    # evolving floor: standing renders in full and can blow the budget once it
+    # accumulates (12+ entries). Without a floor, evolving — the relationship's
+    # *current* mode — gets fully starved (Phase 1 trimmed evolving first). The
+    # budget is therefore SOFT: standing is never truncated AND at least this
+    # many evolving entries are always rendered; an overflow past the budget is
+    # the signal to run standing-review (Phase 3), not a reason to drop evolving.
+    EVOLVING_INJECT_FLOOR = 3
 
     async def _build_pinned_principles_context(self, limit: int = 5) -> str:
         if self.ob_client is None:
@@ -5392,9 +5399,13 @@ class StateMachine:
                 )
         if evolving:
             ev_lines: list[str] = []
-            for b in evolving:
-                if total >= self.PRINCIPLE_INJECT_TOTAL_BUDGET:
-                    break  # standing already consumed the budget; trim evolving first
+            for idx, b in enumerate(evolving):
+                # Guarantee the floor: the first EVOLVING_INJECT_FLOOR entries
+                # always render even if standing already consumed the budget
+                # (soft budget). Beyond the floor, evolving fills only remaining
+                # budget — it stays the more expendable role past the floor.
+                if idx >= self.EVOLVING_INJECT_FLOOR and total >= self.PRINCIPLE_INJECT_TOTAL_BUDGET:
+                    break
                 line = format_line(b, self.PRINCIPLE_INJECT_CHARS_EVOLVING)
                 ev_lines.append(line)
                 total += len(line)

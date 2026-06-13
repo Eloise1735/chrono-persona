@@ -1895,17 +1895,37 @@ def _sm_with_principles(standing, evolving):
     return sm
 
 
-def test_principle_injection_renders_standing_full_and_trims_evolving_over_budget():
+def test_principle_injection_standing_full_evolving_floored_over_budget():
     async def scenario():
-        # 8 standing × ~300 chars > 2400 budget → standing all full, evolving dropped.
+        # 8 standing × ~300 chars > 2400 budget. Standing renders in full; the
+        # evolving FLOOR (3) still renders despite the overflow (soft budget),
+        # but evolving entries beyond the floor are trimmed.
         standing = [_fake_principle(f"s{i}", "标" * 300, f"2026-01-0{i}T00:00:00") for i in range(1, 9)]
-        evolving = [_fake_principle(f"e{i}", "演" * 100, f"2026-02-0{i}T00:00:00") for i in range(1, 4)]
+        evolving = [_fake_principle(f"e{i}", "演" * 100, f"2026-02-0{i}T00:00:00") for i in range(1, 6)]
         sm = _sm_with_principles(standing, evolving)
         text = await sm._build_pinned_principles_context()
         for i in range(1, 9):
             assert f"s{i}" in text                      # every standing rendered
         assert ("标" * 300) in text                     # standing NOT truncated (cap 480 > 300)
-        assert "〔当前相处模式·新近〕" not in text       # evolving trimmed by budget
+        assert "〔当前相处模式·新近〕" in text            # evolving floor still shows
+        for i in range(1, 4):
+            assert f"e{i}" in text                      # first 3 (the floor) rendered
+        assert "e4" not in text and "e5" not in text    # beyond floor trimmed by budget
+
+    run(scenario())
+
+
+def test_principle_injection_evolving_floor_survives_full_starvation():
+    async def scenario():
+        # Standing alone hugely exceeds the budget (would starve evolving to 0
+        # under the old logic). The floor guarantees evolving still appears.
+        standing = [_fake_principle(f"s{i}", "标" * 470, f"2026-01-{i:02d}T00:00:00") for i in range(1, 13)]
+        evolving = [_fake_principle(f"e{i}", "演" * 80, f"2026-02-0{i}T00:00:00") for i in range(1, 4)]
+        sm = _sm_with_principles(standing, evolving)
+        text = await sm._build_pinned_principles_context()
+        assert "〔当前相处模式·新近〕" in text
+        for i in range(1, 4):  # all 3 (== floor) survive despite standing overflow
+            assert f"e{i}" in text
 
     run(scenario())
 
