@@ -1227,6 +1227,60 @@ async def merge_buckets(source_id: str, target_id: str, reason: str = "") -> str
 
 
 @mcp.tool()
+async def review_standing() -> str:
+    """通读全部「长期准则」(standing_invariant)，用于合并/退役评审（standing-review）。
+
+    当 get_current_state 提示「长期准则已超过阈值、建议合并」时调用。standing 每条都是
+    高度精炼、必须守住的边界/共识，所以这里**返回全部条目的完整正文，不采样、不截断**——
+    忠实的合并必须建立在读完每一条之上。读完后，把语义重叠的几条**与用户商议确认后**，用
+    commit_standing_merge(...) 重写为一条新准则。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    result = await _ob_client.review_standing()
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def commit_standing_merge(
+    merged_content: str,
+    retired_ids: list[str],
+    title: str = "",
+    domain: list[str] | None = None,
+    user_confirmed: bool = False,
+) -> str:
+    """把若干条重叠的「长期准则」合并成一条新准则，原条目退役为 dynamic 自然衰减。
+
+    这是**最重的一步、必须与用户确认**：合并的是必须守住的硬规则，有损合并会丢掉边界。
+    所以：
+    - merged_content 必须是你**读完全部 standing 后**亲自写的、把可合并几条忠实糅合的新正文
+      （不能漏掉任何一条的约束力）。retired_ids 是被这条吸收的原条目 id。
+    - **只有在用户明确同意这次合并后**，才设 user_confirmed=True 调用；否则先把你的合并方案
+      讲给用户、等确认。未确认会被拒绝。
+    - 退役的原条目不删除：转为普通 dynamic（带 retired_from=standing 标记）自然衰减、仍可
+      recall。不能合并的条目不要放进 retired_ids，它们保持 standing 不变。
+    一次只合并一组；多组分多次调用。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    if not user_confirmed:
+        return (
+            "未执行：standing 合并必须先与用户确认。请把你的合并方案（新准则正文 + 将退役的"
+            "原条目）讲给用户，得到明确同意后再以 user_confirmed=True 调用。"
+        )
+    try:
+        result = await _ob_client.commit_standing_merge(
+            merged_content=merged_content,
+            retired_ids=retired_ids or [],
+            title=title,
+            domain=domain,
+        )
+    except ValueError as exc:
+        return f"错误：{exc}"
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def trace(
     bucket_id: str,
     name: str = "",

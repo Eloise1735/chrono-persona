@@ -2634,3 +2634,87 @@ def test_anchor_album_context_renders_and_is_silent_when_empty():
         assert await sm_empty._build_anchor_album_context() == ""
 
     run(scenario())
+
+
+# --- Phase 3 block 2: standing-review -----------------------------------------
+
+
+def test_review_standing_reads_all_in_full():
+    async def scenario():
+        client = await _client("review_standing")
+        ids = []
+        for i in range(3):
+            ids.append(await client.hold(
+                f"边界规则 {i}：" + "细" * 300, bucket_type="permanent", name=f"准则{i}",
+                extra_metadata={"role": "standing_invariant"},
+            ))
+        # a non-standing permanent (evolving) must not appear
+        await client.hold("相处模式", bucket_type="permanent", name="ev",
+                          extra_metadata={"role": "evolving_principle"})
+        result = await client.review_standing()
+        assert result["count"] == 3
+        for item in result["items"]:
+            assert ("细" * 300) in item["full_text"]  # full text, not truncated
+        returned = {it["id"] for it in result["items"]}
+        assert returned == set(ids)
+
+    run(scenario())
+
+
+def test_commit_standing_merge_creates_new_and_retires_originals():
+    async def scenario():
+        client = await _client("standing_merge")
+        a = await client.hold("不要在深夜催促回复", bucket_type="permanent", name="边界A",
+                              extra_metadata={"role": "standing_invariant"})
+        b = await client.hold("深夜尽量不打扰休息", bucket_type="permanent", name="边界B",
+                              extra_metadata={"role": "standing_invariant"})
+        keep = await client.hold("重要纪念日要记得", bucket_type="permanent", name="边界C",
+                                 extra_metadata={"role": "standing_invariant"})
+        result = await client.commit_standing_merge(
+            merged_content="深夜以休息为先：不催促回复、不主动打扰。",
+            retired_ids=[a, b], title="深夜边界",
+        )
+        new_id = result["new_standing_id"]
+        assert set(result["retired"]) == {a, b}
+
+        # New entry is a standing_invariant.
+        new_bucket = await client.get(new_id)
+        assert client.effective_role(new_bucket.metadata) == "standing_invariant"
+        assert new_bucket.metadata["merged_from"] == [a, b]
+
+        # Retired originals dropped to dynamic, marked, still recallable (not deleted).
+        for rid in (a, b):
+            rb = await client.get(rid)
+            assert rb is not None
+            assert client._bucket_type(rb.metadata) == "dynamic"
+            assert rb.metadata["retired_from"] == "standing"
+            assert client.effective_role(rb.metadata) != "standing_invariant"
+
+        # Non-merged standing untouched.
+        kb = await client.get(keep)
+        assert client.effective_role(kb.metadata) == "standing_invariant"
+
+        # Injectable principles now show only the merged + kept standing (2, not 3).
+        grouped = await client.list_injectable_principles()
+        standing_ids = {b.id for b in grouped["standing"]}
+        assert standing_ids == {new_id, keep}
+
+    run(scenario())
+
+
+def test_standing_review_reminder_injected_over_threshold():
+    async def scenario():
+        # 9 standing > threshold(8) -> reminder line present.
+        many = [_fake_principle(f"s{i}", "边界", f"2026-01-{i:02d}T00:00:00") for i in range(1, 10)]
+        sm = _sm_with_principles(many, [])
+        text = await sm._build_pinned_principles_context()
+        assert "review_standing()" in text
+        assert "commit_standing_merge" in text
+
+        # 5 standing <= threshold -> no reminder.
+        few = [_fake_principle(f"s{i}", "边界", f"2026-01-0{i}T00:00:00") for i in range(1, 6)]
+        sm2 = _sm_with_principles(few, [])
+        text2 = await sm2._build_pinned_principles_context()
+        assert "review_standing()" not in text2
+
+    run(scenario())

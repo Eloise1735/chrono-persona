@@ -5339,6 +5339,11 @@ class StateMachine:
     # many evolving entries are always rendered; an overflow past the budget is
     # the signal to run standing-review (Phase 3), not a reason to drop evolving.
     EVOLVING_INJECT_FLOOR = 3
+    # standing-review trigger (Phase 3 block 2): once standing grows past this,
+    # inject a reminder nudging the model to read all standing and propose a
+    # merge (gated on user confirmation). Keeps standing lean so "all standing
+    # always injected" stays affordable and stops starving evolving.
+    STANDING_REVIEW_THRESHOLD = 8
 
     async def _build_pinned_principles_context(self, limit: int = 5) -> str:
         if self.ob_client is None:
@@ -5391,6 +5396,15 @@ class StateMachine:
                 line = format_line(b, self.PRINCIPLE_INJECT_CHARS_STANDING)
                 sections.append(line)
                 total += len(line)
+            if len(standing) > self.STANDING_REVIEW_THRESHOLD:
+                # In-injection nudge to run standing-review (gated). Surfaced every
+                # turn until the count drops, so consolidation actually happens.
+                sections.append(
+                    f"※ 长期准则已有 {len(standing)} 条（超过 {self.STANDING_REVIEW_THRESHOLD}），"
+                    "可能有语义重叠、正在挤占当前相处模式的注入。建议择机用 review_standing() "
+                    "通读全部，把可合并的几条与用户确认后用 commit_standing_merge(...) 重写为一条，"
+                    "原条目会退役为 dynamic 自然衰减。"
+                )
             if total > self.PRINCIPLE_INJECT_TOTAL_BUDGET:
                 logger.warning(
                     "standing_invariant injection over budget: %d chars across %d entries "
