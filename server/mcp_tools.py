@@ -1039,6 +1039,7 @@ async def feel_crystals(
     min_cluster_size: int = 3,
     min_similarity: float = 0.7,
     cursor: str = "",
+    include_settled: bool = False,
     scope: str = "relational",
 ) -> str:
     """Find similar feel clusters for crystallization.
@@ -1054,6 +1055,11 @@ async def feel_crystals(
     limit 是簇数，不是 feel 条数。选定某簇后，用 review_feel_cluster(cluster_id, ...)
     分批读全文、逐轮精修综合，再用 commit_feel_crystal(...) 落成一条 evolving_principle。
     review/commit 必须传与本次相同的 scope，才能在同一 scope 池里复原 cluster_id。
+
+    【静默机制】已经结晶覆盖过的簇会"安静"下来，默认不再出现在这里（每条附 settled /
+    unsettled_count）。只有当同主题又攒够 min_cluster_size 条**新的**未结晶 feel 时，该簇
+    才重新浮现；这时 commit 会自动并回**同一条**结晶。想手动复查一个已覆盖的簇，传
+    include_settled=True 把它重新拉出来。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -1063,6 +1069,7 @@ async def feel_crystals(
         min_cluster_size=min_cluster_size,
         min_similarity=min_similarity,
         cursor=cursor,
+        include_settled=include_settled,
         scope=scope,
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
