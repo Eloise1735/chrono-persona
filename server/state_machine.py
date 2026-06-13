@@ -5332,6 +5332,18 @@ class StateMachine:
     PRINCIPLE_INJECT_CHARS_STANDING = 480
     PRINCIPLE_INJECT_CHARS_EVOLVING = 240
     PRINCIPLE_INJECT_TOTAL_BUDGET = 2400  # ~ combined principle chars before trimming evolving
+    # evolving floor: standing renders in full and can blow the budget once it
+    # accumulates (12+ entries). Without a floor, evolving — the relationship's
+    # *current* mode — gets fully starved (Phase 1 trimmed evolving first). The
+    # budget is therefore SOFT: standing is never truncated AND at least this
+    # many evolving entries are always rendered; an overflow past the budget is
+    # the signal to run standing-review (Phase 3), not a reason to drop evolving.
+    EVOLVING_INJECT_FLOOR = 3
+    # standing-review trigger (Phase 3 block 2): once standing grows past this,
+    # inject a reminder nudging the model to read all standing and propose a
+    # merge (gated on user confirmation). Keeps standing lean so "all standing
+    # always injected" stays affordable and stops starving evolving.
+    STANDING_REVIEW_THRESHOLD = 8
 
     async def _build_pinned_principles_context(self, limit: int = 5) -> str:
         if self.ob_client is None:
@@ -5384,6 +5396,15 @@ class StateMachine:
                 line = format_line(b, self.PRINCIPLE_INJECT_CHARS_STANDING)
                 sections.append(line)
                 total += len(line)
+            if len(standing) > self.STANDING_REVIEW_THRESHOLD:
+                # In-injection nudge to run standing-review (gated). Surfaced every
+                # turn until the count drops, so consolidation actually happens.
+                sections.append(
+                    f"※ 长期准则已有 {len(standing)} 条（超过 {self.STANDING_REVIEW_THRESHOLD}），"
+                    "可能有语义重叠、正在挤占当前相处模式的注入。建议择机用 review_standing() "
+                    "通读全部，把可合并的几条与用户确认后用 commit_standing_merge(...) 重写为一条，"
+                    "原条目会退役为 dynamic 自然衰减。"
+                )
             if total > self.PRINCIPLE_INJECT_TOTAL_BUDGET:
                 logger.warning(
                     "standing_invariant injection over budget: %d chars across %d entries "
@@ -5392,9 +5413,13 @@ class StateMachine:
                 )
         if evolving:
             ev_lines: list[str] = []
-            for b in evolving:
-                if total >= self.PRINCIPLE_INJECT_TOTAL_BUDGET:
-                    break  # standing already consumed the budget; trim evolving first
+            for idx, b in enumerate(evolving):
+                # Guarantee the floor: the first EVOLVING_INJECT_FLOOR entries
+                # always render even if standing already consumed the budget
+                # (soft budget). Beyond the floor, evolving fills only remaining
+                # budget — it stays the more expendable role past the floor.
+                if idx >= self.EVOLVING_INJECT_FLOOR and total >= self.PRINCIPLE_INJECT_TOTAL_BUDGET:
+                    break
                 line = format_line(b, self.PRINCIPLE_INJECT_CHARS_EVOLVING)
                 ev_lines.append(line)
                 total += len(line)
@@ -5405,15 +5430,47 @@ class StateMachine:
 
     async def _build_injectable_context(self, snapshot_text: str) -> str:
         # 顺序：稳定原则结晶（standing → evolving）在前，阶段性生活状态的
-        # key_record 在后。key_record 仍按新近注入（与当前生活计划逻辑一致）。
+        # key_record 居中，珍贵记忆相册目录（仅关键词，提示自检索）在后。
         pinned_principles_text = await self._build_pinned_principles_context(limit=5)
         key_records_text = await self._build_recent_key_records_context(limit=5)
-        return (
-            "【稳定原则结晶】\n"
-            f"{pinned_principles_text}\n\n"
-            "【近期关键记录·阶段性生活状态】\n"
-            f"{key_records_text}"
+        album_text = await self._build_anchor_album_context()
+        parts = [
+            "【稳定原则结晶】",
+            pinned_principles_text,
+            "",
+            "【近期关键记录·阶段性生活状态】",
+            key_records_text,
+        ]
+        if album_text:
+            parts.extend(["", album_text])
+        return "\n".join(parts)
+
+    async def _build_anchor_album_context(self) -> str:
+        """A compact "album table of contents" of anchor memories — topic
+        keywords only, never full content. Primes the model to self-recall via
+        recall_anchors when conversation touches these themes. Returns "" when
+        there are no anchors, so it stays silent until precious memories exist."""
+        if self.ob_client is None:
+            return ""
+        try:
+            album = await self.ob_client.anchor_album_index()
+        except Exception:
+            logger.exception("Failed to load anchor album index for context.")
+            return ""
+        themes = album.get("themes") or []
+        if not themes:
+            return ""
+        lines = ["【珍贵记忆·相册目录】"]
+        for entry in themes:
+            theme = str(entry.get("theme") or "").strip() or "未分类"
+            count = int(entry.get("count") or 0)
+            kws = "、".join(str(k) for k in (entry.get("keywords") or []) if str(k).strip())
+            lines.append(f"- {theme}（{count}）：{kws}" if kws else f"- {theme}（{count}）")
+        lines.append(
+            "（以上只是索引。聊到相关主题、或触及你们之间某段珍贵经历时，"
+            "主动用 recall_anchors 翻出细节，像一起翻开相册的那一页。）"
         )
+        return "\n".join(lines)
 
     async def _build_recent_events_text(self, limit: int = 2) -> str:
         events = await self.db.get_recent_events_by_event_time(

@@ -1895,17 +1895,37 @@ def _sm_with_principles(standing, evolving):
     return sm
 
 
-def test_principle_injection_renders_standing_full_and_trims_evolving_over_budget():
+def test_principle_injection_standing_full_evolving_floored_over_budget():
     async def scenario():
-        # 8 standing × ~300 chars > 2400 budget → standing all full, evolving dropped.
+        # 8 standing × ~300 chars > 2400 budget. Standing renders in full; the
+        # evolving FLOOR (3) still renders despite the overflow (soft budget),
+        # but evolving entries beyond the floor are trimmed.
         standing = [_fake_principle(f"s{i}", "标" * 300, f"2026-01-0{i}T00:00:00") for i in range(1, 9)]
-        evolving = [_fake_principle(f"e{i}", "演" * 100, f"2026-02-0{i}T00:00:00") for i in range(1, 4)]
+        evolving = [_fake_principle(f"e{i}", "演" * 100, f"2026-02-0{i}T00:00:00") for i in range(1, 6)]
         sm = _sm_with_principles(standing, evolving)
         text = await sm._build_pinned_principles_context()
         for i in range(1, 9):
             assert f"s{i}" in text                      # every standing rendered
         assert ("标" * 300) in text                     # standing NOT truncated (cap 480 > 300)
-        assert "〔当前相处模式·新近〕" not in text       # evolving trimmed by budget
+        assert "〔当前相处模式·新近〕" in text            # evolving floor still shows
+        for i in range(1, 4):
+            assert f"e{i}" in text                      # first 3 (the floor) rendered
+        assert "e4" not in text and "e5" not in text    # beyond floor trimmed by budget
+
+    run(scenario())
+
+
+def test_principle_injection_evolving_floor_survives_full_starvation():
+    async def scenario():
+        # Standing alone hugely exceeds the budget (would starve evolving to 0
+        # under the old logic). The floor guarantees evolving still appears.
+        standing = [_fake_principle(f"s{i}", "标" * 470, f"2026-01-{i:02d}T00:00:00") for i in range(1, 13)]
+        evolving = [_fake_principle(f"e{i}", "演" * 80, f"2026-02-0{i}T00:00:00") for i in range(1, 4)]
+        sm = _sm_with_principles(standing, evolving)
+        text = await sm._build_pinned_principles_context()
+        assert "〔当前相处模式·新近〕" in text
+        for i in range(1, 4):  # all 3 (== floor) survive despite standing overflow
+            assert f"e{i}" in text
 
     run(scenario())
 
@@ -2209,7 +2229,7 @@ def test_commit_feel_crystal_promotes_keep_and_demotes_redundant():
         result = await client.commit_feel_crystal(
             synthesis="模式综合。",
             cluster_id=cluster_id,
-            anchor_ids=[ids[6]],       # irreplaceable moment -> anchor
+            confirm_anchor_ids=[ids[6]],  # user-confirmed irreplaceable moment -> anchor
             standing_ids=[ids[0]],     # durable consensus -> standing_invariant
             demote_ids=[ids[1], ids[2]],  # redundant -> exit surfacing
             min_cluster_size=3, min_similarity=0.8,
@@ -2234,6 +2254,71 @@ def test_commit_feel_crystal_promotes_keep_and_demotes_redundant():
             assert client.calculate_score(d.metadata) < client.calculate_score(
                 {"type": "feel", "created": d.metadata["created"], "last_active": d.metadata["created"]}
             )
+
+    run(scenario())
+
+
+def test_anchor_admission_is_two_phase_propose_then_confirm():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("anchor_two_phase")
+        # An existing anchor on a different theme, to populate the comparison set.
+        existing = await client.hold(
+            "初雪那天的约定", bucket_type="permanent", name="初雪约定",
+            domain=["纪念"], extra_metadata={"role": "anchor"},
+        )
+        client.embedding_store.vectors[existing] = [0.0, 0.0, 1.0]
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        # Phase 1 — propose only: nothing is promoted, comparison surfaced.
+        propose = await client.commit_feel_crystal(
+            synthesis="模式。", cluster_id=cluster_id,
+            anchor_ids=[ids[6]], min_cluster_size=3, min_similarity=0.8,
+        )
+        assert propose["promoted_to_anchor"] == []
+        proposals = propose["pending_anchor_proposals"]
+        assert len(proposals) == 1 and proposals[0]["id"] == ids[6]
+        assert proposals[0]["existing_anchor_total"] == 1
+        assert proposals[0]["nearest_existing"][0]["id"] == existing
+        assert await client.get(ids[6]) and (await client.get(ids[6])).metadata["type"] == "feel"
+
+        # Phase 2 — confirm (user OK'd): now it is promoted, same crystal.
+        confirm = await client.commit_feel_crystal(
+            synthesis="模式。", crystal_id=propose["crystal_id"], source_ids=ids,
+            confirm_anchor_ids=[ids[6]],
+        )
+        assert confirm["promoted_to_anchor"] == [ids[6]]
+        promoted = await client.get(ids[6])
+        assert promoted.metadata["type"] == "permanent"
+        assert promoted.metadata["role"] == "anchor"
+
+    run(scenario())
+
+
+def test_cherish_tier_lingers_longer_but_still_mortal():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("cherish_tier")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        res = await client.commit_feel_crystal(
+            synthesis="模式。", cluster_id=cluster_id,
+            cherish_ids=[ids[3]], min_cluster_size=3, min_similarity=0.8,
+        )
+        assert res["cherished"] == [ids[3]]
+        cher = await client.get(ids[3])
+        assert cher.metadata["type"] == "feel"          # still a feel (not permanent)
+        assert cher.metadata["cherished"] is True
+
+        # Same age + arousal: cherished decays slower than an ordinary feel...
+        old = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        ar = cher.metadata.get("arousal")
+        cherished_meta = {"type": "feel", "created": old, "last_active": old,
+                          "arousal": ar, "cherished": True}
+        ordinary_meta = {"type": "feel", "created": old, "last_active": old, "arousal": ar}
+        assert client.calculate_score(cherished_meta) > client.calculate_score(ordinary_meta)
+        # ...but is still mortal: far less than a permanent anchor (999).
+        assert client.calculate_score(cherished_meta) < 999.0
 
     run(scenario())
 
@@ -2514,3 +2599,283 @@ def test_resurfaced_cluster_folds_into_same_crystal():
 
     run(scenario())
 
+
+
+# --- Phase 3 block 3: anchor album --------------------------------------------
+
+
+def test_anchor_recallable_via_keyword_and_privileged():
+    async def scenario():
+        client = await _client("anchor_recall_priv")
+        anchor = await client.hold(
+            "我们在初雪那天许下的约定", bucket_type="permanent", name="初雪约定",
+            extra_metadata={"role": "anchor"},
+        )
+        dyn = await client.hold(
+            "我们在初雪那天许下的约定", bucket_type="dynamic", name="初雪约定_dyn",
+        )
+        results = await client.breath(query="初雪 约定")
+        by_id = {b.id: b for b in results}
+        assert anchor in by_id   # anchor IS recallable via normal keyword search
+        assert dyn in by_id      # so is the dynamic
+        # privilege: identical content => anchor outranks the plain dynamic (boost).
+        assert by_id[anchor].score > by_id[dyn].score
+
+    run(scenario())
+
+
+def test_anchor_album_index_themed_and_salience_capped():
+    async def scenario():
+        client = await _client("anchor_album")
+        client.ANCHOR_INDEX_CAP = 2
+        await client.hold("高强度珍贵记忆", bucket_type="permanent", name="高",
+                          domain=["纪念"], extra_metadata={"role": "anchor", "arousal": 0.9})
+        await client.hold("中等珍贵记忆", bucket_type="permanent", name="中",
+                          domain=["纪念"], extra_metadata={"role": "anchor", "arousal": 0.5})
+        await client.hold("低强度珍贵记忆", bucket_type="permanent", name="低",
+                          domain=["日常"], extra_metadata={"role": "anchor", "arousal": 0.1})
+        album = await client.anchor_album_index()
+        assert album["total"] == 3
+        assert album["active_count"] == 2
+        assert album["capped"] is True
+        all_keywords = [kw for theme in album["themes"] for kw in theme["keywords"]]
+        assert "高" in all_keywords and "中" in all_keywords
+        assert "低" not in all_keywords  # lowest salience dropped from the index
+
+    run(scenario())
+
+
+def test_recall_anchors_only_anchors_and_bumps_revisited():
+    async def scenario():
+        client = await _client("recall_anchors")
+        anchor = await client.hold(
+            "那次海边看日落的约定", bucket_type="permanent", name="海边日落",
+            extra_metadata={"role": "anchor", "arousal": 0.8},
+        )
+        await client.hold("普通的海边日落记录", bucket_type="dynamic", name="海边日落_dyn")
+        before = await client.get(anchor)
+        assert not before.metadata.get("last_revisited")
+        results = await client.recall_anchors("海边 日落", top_k=5)
+        ids = {r["id"] for r in results}
+        assert anchor in ids
+        assert all(r["id"] == anchor or r["id"] != anchor for r in results)  # only anchors returned
+        assert len(ids) == 1  # the dynamic is not an anchor, excluded
+        after = await client.get(anchor)
+        assert after.metadata.get("last_revisited")  # retrieval bumped it
+
+    run(scenario())
+
+
+def test_recall_anchors_empty_query_returns_by_salience():
+    async def scenario():
+        client = await _client("recall_anchors_salience")
+        await client.hold("淡记忆", bucket_type="permanent", name="淡",
+                          extra_metadata={"role": "anchor", "arousal": 0.1})
+        vivid = await client.hold("浓记忆", bucket_type="permanent", name="浓",
+                                  extra_metadata={"role": "anchor", "arousal": 0.9})
+        results = await client.recall_anchors("", top_k=1)
+        assert results[0]["id"] == vivid  # most emotionally vivid first
+
+    run(scenario())
+
+
+def test_anchor_album_context_renders_and_is_silent_when_empty():
+    async def scenario():
+        from server.state_machine import StateMachine
+
+        class FakeOB:
+            def __init__(self, themes):
+                self._themes = themes
+            async def anchor_album_index(self):
+                return {"themes": self._themes, "active_count": 1, "total": 1, "capped": False, "cap": 50}
+
+        sm = StateMachine.__new__(StateMachine)
+        sm.ob_client = FakeOB([{"theme": "纪念", "count": 3, "keywords": ["初雪", "和解"]}])
+        text = await sm._build_anchor_album_context()
+        assert "珍贵记忆·相册目录" in text
+        assert "纪念" in text and "初雪" in text
+        assert "recall_anchors" in text
+
+        sm_empty = StateMachine.__new__(StateMachine)
+        sm_empty.ob_client = FakeOB([])
+        assert await sm_empty._build_anchor_album_context() == ""
+
+    run(scenario())
+
+
+# --- Phase 3 block 2: standing-review -----------------------------------------
+
+
+def test_review_standing_reads_all_in_full():
+    async def scenario():
+        client = await _client("review_standing")
+        ids = []
+        for i in range(3):
+            ids.append(await client.hold(
+                f"边界规则 {i}：" + "细" * 300, bucket_type="permanent", name=f"准则{i}",
+                extra_metadata={"role": "standing_invariant"},
+            ))
+        # a non-standing permanent (evolving) must not appear
+        await client.hold("相处模式", bucket_type="permanent", name="ev",
+                          extra_metadata={"role": "evolving_principle"})
+        result = await client.review_standing()
+        assert result["count"] == 3
+        for item in result["items"]:
+            assert ("细" * 300) in item["full_text"]  # full text, not truncated
+        returned = {it["id"] for it in result["items"]}
+        assert returned == set(ids)
+
+    run(scenario())
+
+
+def test_commit_standing_merge_creates_new_and_retires_originals():
+    async def scenario():
+        client = await _client("standing_merge")
+        a = await client.hold("不要在深夜催促回复", bucket_type="permanent", name="边界A",
+                              extra_metadata={"role": "standing_invariant"})
+        b = await client.hold("深夜尽量不打扰休息", bucket_type="permanent", name="边界B",
+                              extra_metadata={"role": "standing_invariant"})
+        keep = await client.hold("重要纪念日要记得", bucket_type="permanent", name="边界C",
+                                 extra_metadata={"role": "standing_invariant"})
+        result = await client.commit_standing_merge(
+            merged_content="深夜以休息为先：不催促回复、不主动打扰。",
+            retired_ids=[a, b], title="深夜边界",
+        )
+        new_id = result["new_standing_id"]
+        assert set(result["retired"]) == {a, b}
+
+        # New entry is a standing_invariant.
+        new_bucket = await client.get(new_id)
+        assert client.effective_role(new_bucket.metadata) == "standing_invariant"
+        assert new_bucket.metadata["merged_from"] == [a, b]
+
+        # Retired originals dropped to dynamic, marked, still recallable (not deleted).
+        for rid in (a, b):
+            rb = await client.get(rid)
+            assert rb is not None
+            assert client._bucket_type(rb.metadata) == "dynamic"
+            assert rb.metadata["retired_from"] == "standing"
+            assert client.effective_role(rb.metadata) != "standing_invariant"
+
+        # Non-merged standing untouched.
+        kb = await client.get(keep)
+        assert client.effective_role(kb.metadata) == "standing_invariant"
+
+        # Injectable principles now show only the merged + kept standing (2, not 3).
+        grouped = await client.list_injectable_principles()
+        standing_ids = {b.id for b in grouped["standing"]}
+        assert standing_ids == {new_id, keep}
+
+    run(scenario())
+
+
+def test_standing_review_reminder_injected_over_threshold():
+    async def scenario():
+        # 9 standing > threshold(8) -> reminder line present.
+        many = [_fake_principle(f"s{i}", "边界", f"2026-01-{i:02d}T00:00:00") for i in range(1, 10)]
+        sm = _sm_with_principles(many, [])
+        text = await sm._build_pinned_principles_context()
+        assert "review_standing()" in text
+        assert "commit_standing_merge" in text
+
+        # 5 standing <= threshold -> no reminder.
+        few = [_fake_principle(f"s{i}", "边界", f"2026-01-0{i}T00:00:00") for i in range(1, 6)]
+        sm2 = _sm_with_principles(few, [])
+        text2 = await sm2._build_pinned_principles_context()
+        assert "review_standing()" not in text2
+
+    run(scenario())
+
+
+# --- Phase 4: breath_bundle slot redesign -------------------------------------
+
+
+def test_feel_surface_ranks_weighty_recent_over_milder_newer():
+    async def scenario():
+        client = await _client("feel_surface_rank")
+        # A milder feel from 1 day ago vs an intense feel from 4 days ago.
+        mild_new = await client.hold(
+            "平淡的近期感受", bucket_type="feel", domain=["relationship"],
+            created=(datetime.utcnow() - timedelta(days=1)).isoformat(),
+            extra_metadata={"arousal": 0.2},
+        )
+        intense_old = await client.hold(
+            "很重的几天前的感受", bucket_type="feel", domain=["relationship"],
+            created=(datetime.utcnow() - timedelta(days=4)).isoformat(),
+            extra_metadata={"arousal": 0.95},
+        )
+        ordered = await client._feel_breath(limit=20, max_character_life=0)
+        ids = [b.id for b in ordered]
+        # recency⊕arousal: the weighty older feeling holds the slot ahead.
+        assert ids.index(intense_old) < ids.index(mild_new)
+
+    run(scenario())
+
+
+def test_echo_slot_surfaces_anchor_when_probability_hits():
+    async def scenario():
+        client = await _client("echo_hit")
+        client.ECHO_PROBABILITY = 1.0  # force the echo branch
+        anchor = await client.hold(
+            "初雪那天的约定", bucket_type="permanent", name="初雪约定",
+            domain=["纪念"],
+            created=(datetime.utcnow() - timedelta(days=90)).isoformat(),
+            extra_metadata={"role": "anchor", "arousal": 0.9},
+        )
+        # Give the bundle some ordinary dynamics to fill the foreground.
+        for i in range(4):
+            await client.hold(f"近期事件 {i}", bucket_type="dynamic", domain=["relationship"])
+
+        bundle = await client.breath_bundle()
+        free_texts = [item["content"] for item in bundle["free"]]
+        # The echo slot carries the anchor, tagged so the model knows it resurfaced.
+        assert any(client.ECHO_SLOT_MARKER in t for t in free_texts)
+        # Surfacing counts as revisiting -> last_revisited is now set.
+        refreshed = await client.get(anchor)
+        assert refreshed.metadata.get("last_revisited")
+
+    run(scenario())
+
+
+def test_echo_slot_silent_when_probability_misses():
+    async def scenario():
+        client = await _client("echo_miss")
+        client.ECHO_PROBABILITY = 0.0  # force the wander-only branch
+        await client.hold(
+            "初雪那天的约定", bucket_type="permanent", name="初雪约定",
+            domain=["纪念"], extra_metadata={"role": "anchor", "arousal": 0.9},
+        )
+        for i in range(5):
+            await client.hold(f"近期事件 {i}", bucket_type="dynamic", domain=["relationship"])
+
+        bundle = await client.breath_bundle()
+        free_texts = [item["content"] for item in bundle["free"]]
+        assert not any(client.ECHO_SLOT_MARKER in t for t in free_texts)
+
+    run(scenario())
+
+
+def test_pick_echo_anchor_favours_unrevisited_high_arousal():
+    async def scenario():
+        client = await _client("echo_weight")
+        old = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        # High arousal but JUST revisited -> weight ~0.
+        await client.hold(
+            "刚翻看过的强记忆", bucket_type="permanent", name="刚翻看",
+            extra_metadata={"role": "anchor", "arousal": 0.9, "last_revisited": datetime.utcnow().isoformat()},
+        )
+        # High arousal, long un-revisited -> high weight (should dominate picks).
+        want = await client.hold(
+            "很久没想起的强记忆", bucket_type="permanent", name="久未翻",
+            created=old, extra_metadata={"role": "anchor", "arousal": 0.9, "last_revisited": old},
+        )
+        picks = set()
+        for _ in range(20):
+            chosen = await client._pick_echo_anchor()
+            assert chosen is not None
+            picks.add(chosen.id)
+        # The long-unrevisited memory is heavily favoured (the just-revisited one
+        # has ~zero weight, so it should essentially never be chosen).
+        assert want in picks
+
+    run(scenario())

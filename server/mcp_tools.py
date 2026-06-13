@@ -38,9 +38,13 @@ Proactive memory policy — call recall tools on your own initiative, do not wai
       call recall_world_book FIRST; do not use key_records for stable profile facts.
   3) When an emotion, situation, or topic the user describes reminds you of something — even vaguely —
      call recall_memories to check whether there is a relevant past event or state snapshot.
+  3c) When the conversation touches one of the themes in the injected「珍贵记忆·相册目录」
+      (the anchor album index), or a precious shared experience between you two, call
+      recall_anchors to open that page of the album — anchors are a separate, privileged
+      recall path from recall_memories.
   4) Do NOT wait for the user to say "do you remember" or "we talked about this before".
      Proactive recall is what makes memory feel alive.
-  5) If conversation produces a narrative memory worth keeping, call hold / hold_feel / grow in OB.
+  5) If conversation produces a narrative memory worth keeping, call hold / hold_feel in OB.
   6) If conversation produces new structured actionable info, call upsert_key_record. Prefer leaving record_type as auto unless you are certain.
   7) OB buckets are experiential memory; key records are operational state; world_book is stable profile/background.
 """
@@ -652,7 +656,7 @@ async def reflect_on_conversation(conversation_summary: str) -> str:
 
     Returns:
         实际落库的快照正文（通常即你传入的内容；命中重复上传则返回已存档内容）。
-        注意：本工具不自动生成事件；若对话中出现值得保留的叙事记忆，请显式调用 OB hold / hold_feel / grow。
+        注意：本工具不自动生成事件；若对话中出现值得保留的叙事记忆，请显式调用 OB hold / hold_feel。
     """
     if _state_machine is None:
         return "错误：状态机未初始化"
@@ -710,6 +714,32 @@ async def recall_memories(query: str, top_k: int = 5) -> str:
     results = await _state_machine.recall_memories(query, top_k=top_k)
     if not results:
         return "未找到相关记忆。"
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def recall_anchors(query: str = "", top_k: int = 5) -> str:
+    """翻开"珍贵记忆相册"：只检索 anchor（不可还原的珍贵关键事件），与普通记忆检索分开。
+
+    【何时调用】
+    get_current_state 里会注入一份「珍贵记忆·相册目录」（只有主题关键词，没有细节）。
+    当对话聊到目录里提示的某个主题、或触及你们之间一段珍贵的共同经历时，**主动**调用
+    这里把那段记忆的完整内容翻出来——就像和对方一起翻开相册的某一页。
+
+    【与 recall_memories 的区别】
+    - recall_memories：日常事件/感受的工作记忆检索。
+    - recall_anchors：专门翻看被珍藏的、永不淡出的关键时刻；按"相关度×情感分量"排序，
+      不受普通衰减影响。翻看本身会让这条记忆更"鲜活"（更可能继续留在相册目录里）。
+
+    Args:
+        query: 主题关键词（空格分隔）；留空则按情感分量返回最珍贵的几条。
+        top_k: 返回条数上限。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    results = await _ob_client.recall_anchors(query, top_k=top_k)
+    if not results:
+        return "相册里还没有相关的珍贵记忆。"
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
@@ -1119,6 +1149,8 @@ async def commit_feel_crystal(
     title: str = "",
     domain: list[str] | None = None,
     anchor_ids: list[str] | None = None,
+    confirm_anchor_ids: list[str] | None = None,
+    cherish_ids: list[str] | None = None,
     standing_ids: list[str] | None = None,
     demote_ids: list[str] | None = None,
     source_ids: list[str] | None = None,
@@ -1132,17 +1164,23 @@ async def commit_feel_crystal(
     role=evolving_principle 结晶的正文。这是**纯加法**：
     - 整簇全部成员（含你没读的批）作为 anchor_refs 指针保留，源 feel 不会被标 crystallized，
       它们继续在自己的衰减轨道上自然淡出——不再「喂 5 条就埋整簇」。
-    - anchor_ids：判定为不可还原的珍贵 moment → 提升为 role=anchor（永不淡出、仅 recall）。
-    - standing_ids：判定为持续成立的边界/共识 → 提升为 standing_invariant（始终注入）。
-    - demote_ids（默认空）：判定冗余的 feel → 退出自动浮现，但仍可 recall，绝不删除。
-      情绪极强(arousal>0.7)的 feel 不会被自动 demote（深痕不是冗余），会回报在
-      demote_vetoed 里；确实要降权请传 force_demote=True 显式覆盖。
+
+    【anchor 写入 = 两段式 + 用户确认】anchor 是永久且珍贵的，多数周期不该产生任何
+    anchor，那是正常的。
+    - anchor_ids：**只提议、不写入**。后台会在 pending_anchor_proposals 里给出每个候选的
+      主题 + 最近邻的既有 anchor（逐条全文 + 相似度），让你对照**整个相册**（而非只看本簇）
+      判断这是真·新珍贵事件还是已被覆盖。请把这份对照如实呈现给用户。
+    - confirm_anchor_ids：**用户点头后**才传，真正写入 role=anchor（带上提议那次返回的
+      crystal_id）。
+    - cherish_ids：有记忆价值但**不够格 anchor** 的 feel → 标 cherished（衰减减半、约 2x 寿命，
+      但仍会归档）。这是会死、自清理的"银档"，可放心多标。被你否掉的 anchor 候选就放这里。
+    - standing_ids：持续成立的边界/共识 → 提升 standing_invariant（始终注入）。
+    - demote_ids（默认空）：冗余 feel → 退出浮现、仍可 recall、绝不删除。arousal>0.7 不会被
+      自动 demote（深痕不是冗余），回报在 demote_vetoed；要降权传 force_demote=True。
 
     多轮精修：把上一次返回的 crystal_id 传回来，就会覆盖更新同一条结晶（后台无状态，
     状态在结晶本体 + cursor）。不传 crystal_id 时按 cluster_id+scope 确定性去重。
     至少要能定位整簇：传 cluster_id（推荐）或显式 source_ids 之一。scope 须与上游一致。
-    review 返回的 items 已按 salience(独特性⊕情绪⊕重要性)降序，前几批即含最该晋升的项；
-    超出 review 天花板的尾部不必读，commit 仍会整簇保留为 anchor_refs。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -1153,6 +1191,8 @@ async def commit_feel_crystal(
             title=title,
             domain=domain,
             anchor_ids=anchor_ids or [],
+            confirm_anchor_ids=confirm_anchor_ids or [],
+            cherish_ids=cherish_ids or [],
             standing_ids=standing_ids or [],
             demote_ids=demote_ids or [],
             source_ids=source_ids or [],
@@ -1197,6 +1237,60 @@ async def merge_buckets(source_id: str, target_id: str, reason: str = "") -> str
     result = await _ob_client.merge_buckets(source_id, target_id)
     if reason and result.get("ok"):
         result["reason"] = reason
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def review_standing() -> str:
+    """通读全部「长期准则」(standing_invariant)，用于合并/退役评审（standing-review）。
+
+    当 get_current_state 提示「长期准则已超过阈值、建议合并」时调用。standing 每条都是
+    高度精炼、必须守住的边界/共识，所以这里**返回全部条目的完整正文，不采样、不截断**——
+    忠实的合并必须建立在读完每一条之上。读完后，把语义重叠的几条**与用户商议确认后**，用
+    commit_standing_merge(...) 重写为一条新准则。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    result = await _ob_client.review_standing()
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def commit_standing_merge(
+    merged_content: str,
+    retired_ids: list[str],
+    title: str = "",
+    domain: list[str] | None = None,
+    user_confirmed: bool = False,
+) -> str:
+    """把若干条重叠的「长期准则」合并成一条新准则，原条目退役为 dynamic 自然衰减。
+
+    这是**最重的一步、必须与用户确认**：合并的是必须守住的硬规则，有损合并会丢掉边界。
+    所以：
+    - merged_content 必须是你**读完全部 standing 后**亲自写的、把可合并几条忠实糅合的新正文
+      （不能漏掉任何一条的约束力）。retired_ids 是被这条吸收的原条目 id。
+    - **只有在用户明确同意这次合并后**，才设 user_confirmed=True 调用；否则先把你的合并方案
+      讲给用户、等确认。未确认会被拒绝。
+    - 退役的原条目不删除：转为普通 dynamic（带 retired_from=standing 标记）自然衰减、仍可
+      recall。不能合并的条目不要放进 retired_ids，它们保持 standing 不变。
+    一次只合并一组；多组分多次调用。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
+    if not user_confirmed:
+        return (
+            "未执行：standing 合并必须先与用户确认。请把你的合并方案（新准则正文 + 将退役的"
+            "原条目）讲给用户，得到明确同意后再以 user_confirmed=True 调用。"
+        )
+    try:
+        result = await _ob_client.commit_standing_merge(
+            merged_content=merged_content,
+            retired_ids=retired_ids or [],
+            title=title,
+            domain=domain,
+        )
+    except ValueError as exc:
+        return f"错误：{exc}"
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
