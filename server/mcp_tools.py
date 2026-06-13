@@ -38,9 +38,13 @@ Proactive memory policy — call recall tools on your own initiative, do not wai
       call recall_world_book FIRST; do not use key_records for stable profile facts.
   3) When an emotion, situation, or topic the user describes reminds you of something — even vaguely —
      call recall_memories to check whether there is a relevant past event or state snapshot.
+  3c) When the conversation touches one of the themes in the injected「珍贵记忆·相册目录」
+      (the anchor album index), or a precious shared experience between you two, call
+      recall_anchors to open that page of the album — anchors are a separate, privileged
+      recall path from recall_memories.
   4) Do NOT wait for the user to say "do you remember" or "we talked about this before".
      Proactive recall is what makes memory feel alive.
-  5) If conversation produces a narrative memory worth keeping, call hold / hold_feel / grow in OB.
+  5) If conversation produces a narrative memory worth keeping, call hold / hold_feel in OB.
   6) If conversation produces new structured actionable info, call upsert_key_record. Prefer leaving record_type as auto unless you are certain.
   7) OB buckets are experiential memory; key records are operational state; world_book is stable profile/background.
 """
@@ -652,7 +656,7 @@ async def reflect_on_conversation(conversation_summary: str) -> str:
 
     Returns:
         实际落库的快照正文（通常即你传入的内容；命中重复上传则返回已存档内容）。
-        注意：本工具不自动生成事件；若对话中出现值得保留的叙事记忆，请显式调用 OB hold / hold_feel / grow。
+        注意：本工具不自动生成事件；若对话中出现值得保留的叙事记忆，请显式调用 OB hold / hold_feel。
     """
     if _state_machine is None:
         return "错误：状态机未初始化"
