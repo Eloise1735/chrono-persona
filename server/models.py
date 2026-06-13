@@ -1,11 +1,72 @@
 from __future__ import annotations
 
+import logging
+import types
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 from server.time_display import iso_string_for_cst_display, shanghai_now
+
+logger = logging.getLogger(__name__)
+
+
+def _literal_options(annotation) -> tuple | None:
+    """Return the allowed values of a Literal[...] annotation (also peering
+    inside Optional[Literal] / `Literal[...] | None`), or None if the field
+    isn't a Literal."""
+    if get_origin(annotation) is Literal:
+        return get_args(annotation)
+    if get_origin(annotation) in (Union, getattr(types, "UnionType", ())):
+        for arg in get_args(annotation):
+            if get_origin(arg) is Literal:
+                return get_args(arg)
+    return None
+
+
+class _DomainModel(BaseModel):
+    """Base for models materialized from DB rows.
+
+    Graceful degradation for enum drift: if a stored row carries a value
+    that isn't in a field's Literal set (e.g. an empty string '' written by
+    a manual SQL edit / external import / partial insert), coerce it to the
+    field's default instead of raising. Before this, a single such row would
+    crash an entire list endpoint — `[NPCEntity(**dict(r)) for r in rows]`
+    raised ValidationError and 500'd GET /api/npcs.
+
+    Only out-of-range values are touched; valid data validates identically.
+    API request models intentionally do NOT inherit this — they should keep
+    rejecting bad client input.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_invalid_literals(cls, data):
+        if not isinstance(data, dict):
+            return data
+        cleaned = None
+        for name, field in cls.model_fields.items():
+            if name not in data:
+                continue
+            opts = _literal_options(field.annotation)
+            if opts is None or data[name] in opts:
+                continue
+            # Out-of-range literal value → degrade gracefully.
+            if cleaned is None:
+                cleaned = dict(data)
+            if field.is_required():
+                cleaned[name] = opts[0]
+            else:
+                del cleaned[name]  # let the field default apply
+            logger.warning(
+                "%s.%s has invalid value %r (allowed: %r); coercing to default.",
+                cls.__name__,
+                name,
+                data[name],
+                opts,
+            )
+        return cleaned if cleaned is not None else data
 
 
 KEY_RECORD_TYPES = (
@@ -40,7 +101,7 @@ def format_utc_instant_z(dt: datetime) -> str:
     return dt.isoformat() + "Z"
 
 
-class StateSnapshot(BaseModel):
+class StateSnapshot(_DomainModel):
     id: int | None = None
     # 叙事/检查点时间（推进逻辑与「最新快照」排序均按此字段）
     created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
@@ -72,7 +133,7 @@ class StateSnapshot(BaseModel):
         return iso_string_for_cst_display(self.inserted_at)
 
 
-class EventAnchor(BaseModel):
+class EventAnchor(_DomainModel):
     id: int | None = None
     date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
     title: str = ""
@@ -88,7 +149,7 @@ class EventAnchor(BaseModel):
     impression_depth: float | None = None
 
 
-class KeyRecord(BaseModel):
+class KeyRecord(_DomainModel):
     id: int | None = None
     type: Literal[
         "medication_protocol",
@@ -125,7 +186,7 @@ class KeyRecord(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
-class WorldBook(BaseModel):
+class WorldBook(_DomainModel):
     id: int | None = None
     name: str = ""
     content: str = ""
@@ -137,7 +198,7 @@ class WorldBook(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
-class DailyPlan(BaseModel):
+class DailyPlan(_DomainModel):
     id: int | None = None
     plan_date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
     generated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
@@ -149,7 +210,7 @@ class DailyPlan(BaseModel):
     created_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class PlanItem(BaseModel):
+class PlanItem(_DomainModel):
     id: int | None = None
     plan_id: int
     hour_start: int = 0
@@ -166,7 +227,7 @@ class PlanItem(BaseModel):
     executed_at: str | None = None
 
 
-class LifeFlowTrace(BaseModel):
+class LifeFlowTrace(_DomainModel):
     id: int | None = None
     trace_date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
     source: Literal["environment", "conversation", "manual"] = "environment"
@@ -186,7 +247,7 @@ class LifeFlowTrace(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class DisturbancePulse(BaseModel):
+class DisturbancePulse(_DomainModel):
     id: int | None = None
     occur_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
     reveal_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
@@ -226,7 +287,7 @@ class DisturbancePulse(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class ConversationTimeClaim(BaseModel):
+class ConversationTimeClaim(_DomainModel):
     id: int | None = None
     status: Literal["active", "closed"] = "active"
     started_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
@@ -239,7 +300,7 @@ class ConversationTimeClaim(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class RelationshipState(BaseModel):
+class RelationshipState(_DomainModel):
     id: int | None = None
     last_meaningful_contact_at: str | None = None
     hours_since_meaningful_contact: float = 0.0
@@ -259,7 +320,7 @@ class RelationshipState(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class RelationshipThought(BaseModel):
+class RelationshipThought(_DomainModel):
     id: int | None = None
     thought_date: str = Field(default_factory=lambda: shanghai_now().date().isoformat())
     source_snapshot_id: int | None = None
@@ -283,7 +344,7 @@ class RelationshipThought(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class SlowLine(BaseModel):
+class SlowLine(_DomainModel):
     id: int | None = None
     thread_key: str = ""
     theme: str = ""
@@ -312,7 +373,7 @@ class SlowLine(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class NPCEntity(BaseModel):
+class NPCEntity(_DomainModel):
     id: int | None = None
     name: str
     role: str = ""
@@ -329,7 +390,7 @@ class NPCEntity(BaseModel):
     updated_at: str = Field(default_factory=lambda: format_utc_instant_z(datetime.utcnow()))
 
 
-class CharacterNotification(BaseModel):
+class CharacterNotification(_DomainModel):
     id: int | None = None
     trigger_type: Literal["plan_item", "replan", "npc_event", "spontaneous"] = "plan_item"
     trigger_item_id: int | None = None

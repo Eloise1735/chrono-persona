@@ -438,6 +438,15 @@
           </div>
         </div>
         <div class="ob-field">
+          <label>Role（仅 permanent 生效；空 = 按 pinned/protected 回退推断）</label>
+          <select class="ob-select" id="bucket-role">
+            <option value="">（auto / legacy 回退）</option>
+            <option value="evolving_principle">evolving_principle · 演化中的相处模式（注入·新近）</option>
+            <option value="standing_invariant">standing_invariant · 边界/偏好/重大共识（始终注入）</option>
+            <option value="anchor">anchor · 原汁原味关键事件（仅 recall，不自动注入）</option>
+          </select>
+        </div>
+        <div class="ob-field">
           <label>Domain（逗号分隔）</label>
           <input class="ob-input" id="bucket-domain" placeholder="relationship, character_life" />
         </div>
@@ -846,6 +855,7 @@
       $('bucket-tags').value = tagsOf(item).join(', ');
       $('bucket-valence').value = meta.valence ?? 0.5;
       $('bucket-arousal').value = meta.arousal ?? 0.3;
+      $('bucket-role').value = ['evolving_principle', 'standing_invariant', 'anchor'].includes(meta.role) ? meta.role : '';
       $('bucket-pinned').checked = !!meta.pinned;
       $('bucket-protected').checked = !!meta.protected;
       $('bucket-resolved').checked = !!meta.resolved;
@@ -885,6 +895,7 @@
       ['edit-id', 'bucket-name', 'bucket-domain', 'bucket-tags', 'bucket-content'].forEach(id => $(id).value = '');
       $('source-bucket').value = '';
       $('bucket-type').value = 'dynamic';
+      $('bucket-role').value = '';
       $('bucket-importance').value = 5;
       $('bucket-valence').value = 0.5;
       $('bucket-arousal').value = 0.3;
@@ -899,6 +910,7 @@
       return {
         name: $('bucket-name').value.trim(),
         type: $('bucket-type').value,
+        role: $('bucket-role').value,
         importance: Number($('bucket-importance').value || 5),
         domain: listFromInput($('bucket-domain').value),
         tags: listFromInput($('bucket-tags').value),

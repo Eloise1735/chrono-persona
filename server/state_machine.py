@@ -16,6 +16,8 @@ from server.environment import (
     environment_text_for_retrieval,
 )
 from server.llm_client import (
+    BudgetExceeded,
+    DuplicatePromptError,
     LLMClient,
     LLMTimeoutError,
     LLMTransportError,
@@ -150,14 +152,26 @@ class StateMachine:
             LLMTimeoutError,
             LLMUpstreamHTTPError,
             LLMTransportError,
+            # A3 dedup is intentional skip behavior, not a real failure —
+            # the cooldown window will lapse on its own. Counting it would
+            # let a dup storm pause the loop unnecessarily.
+            DuplicatePromptError,
         )
+        # A2 BudgetExceeded is the opposite: it must short-circuit straight
+        # to paused. The dedup-and-budget pair is the last-line backstop
+        # for any future silent loop — once daily budget is hit, the
+        # scheduler stops until manual reset, so the proxy balance can't
+        # be drained.
+        _budget_kill_errors = (BudgetExceeded,)
         self.snapshot_scheduler_breaker = SchedulerCircuitBreaker(
             name="snapshot_scheduler",
             non_failure_exception_types=_upstream_transient_errors,
+            pause_immediately_exception_types=_budget_kill_errors,
         )
         self.life_scheduler_breaker = SchedulerCircuitBreaker(
             name="life_scheduler",
             non_failure_exception_types=_upstream_transient_errors,
+            pause_immediately_exception_types=_budget_kill_errors,
         )
 
     def set_plan_engine(self, plan_engine) -> None:
@@ -5312,32 +5326,34 @@ class StateMachine:
                 lines.append(f"- [{record_type}] {title}{suffix}")
         return "\n".join(lines)
 
+    # Injection rendering caps (tunable). standing_invariant gets a larger
+    # per-entry cap and is always rendered in full (faithful); evolving is more
+    # expendable and trimmed first when the combined budget is reached.
+    PRINCIPLE_INJECT_CHARS_STANDING = 480
+    PRINCIPLE_INJECT_CHARS_EVOLVING = 240
+    PRINCIPLE_INJECT_TOTAL_BUDGET = 2400  # ~ combined principle chars before trimming evolving
+
     async def _build_pinned_principles_context(self, limit: int = 5) -> str:
         if self.ob_client is None:
             return "（暂无稳定原则结晶）"
         try:
-            if hasattr(self.ob_client, "recent_pinned"):
-                buckets = await self.ob_client.recent_pinned(limit=max(1, int(limit or 5)))
-            else:
-                all_buckets = await self.ob_client.list_buckets(include_archive=False)
-                buckets = [bucket for bucket in all_buckets if (getattr(bucket, "metadata", {}) or {}).get("pinned")]
-                buckets.sort(key=lambda b: str((getattr(b, "metadata", {}) or {}).get("created") or ""), reverse=True)
-                buckets = buckets[: max(1, int(limit or 5))]
+            grouped = await self.ob_client.list_injectable_principles()
         except Exception:
-            logger.exception("Failed to load pinned OB principles for injectable context.")
+            logger.exception("Failed to load injectable principles for context.")
             return "（稳定原则结晶暂时无法读取）"
-        if not buckets:
+        standing = grouped.get("standing") or []
+        evolving = grouped.get("evolving") or []
+        if not standing and not evolving:
             return "（暂无稳定原则结晶）"
 
-        lines: list[str] = []
-        for bucket in buckets[: max(1, int(limit or 5))]:
+        def format_line(bucket, max_chars: int) -> str:
             meta = getattr(bucket, "metadata", {}) or {}
             bucket_id = str(meta.get("id") or getattr(bucket, "id", "") or "").strip()
             title = (
                 str(meta.get("principle_title") or "").strip()
                 or str(meta.get("name") or "").strip()
                 or bucket_id
-                or "pinned principle"
+                or "principle"
             )
             domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip())
             tags = ", ".join(str(t) for t in meta.get("tags", [])[:4] if str(t).strip())
@@ -5353,21 +5369,50 @@ class StateMachine:
                 injection = "；".join(part for part in [principle, response_rule, f"避免：{avoid}" if avoid else ""] if part)
             if not injection:
                 injection = self._compact_structured_memory_text(str(getattr(bucket, "content", "") or "").strip())
-            injection = self._compact_structured_memory_text(injection)[:260]
-            if injection:
-                lines.append(f"- {title}{label}: {injection}")
-            else:
-                lines.append(f"- {title}{label}")
-        return "\n".join(lines)
+            injection = self._compact_structured_memory_text(injection)[:max_chars]
+            return f"- {title}{label}: {injection}" if injection else f"- {title}{label}"
+
+        # standing_invariant：边界/偏好/共识，必须忠实传达——每条上限更大、且始终
+        # 全量渲染（截断一条边界是危险的）。evolving_principle 更可替代，总预算超出时
+        # 先砍 evolving。若 standing 单独超预算，打一条 warning（信号：该走 Phase 3 的
+        # principle-review 合并/退役，而不是靠注入端硬塞）。
+        sections: list[str] = []
+        total = 0
+        if standing:
+            sections.append("〔长期准则·始终成立〕")
+            for b in standing:
+                line = format_line(b, self.PRINCIPLE_INJECT_CHARS_STANDING)
+                sections.append(line)
+                total += len(line)
+            if total > self.PRINCIPLE_INJECT_TOTAL_BUDGET:
+                logger.warning(
+                    "standing_invariant injection over budget: %d chars across %d entries "
+                    "(budget=%d). Consider consolidating via principle-review (Phase 3).",
+                    total, len(standing), self.PRINCIPLE_INJECT_TOTAL_BUDGET,
+                )
+        if evolving:
+            ev_lines: list[str] = []
+            for b in evolving:
+                if total >= self.PRINCIPLE_INJECT_TOTAL_BUDGET:
+                    break  # standing already consumed the budget; trim evolving first
+                line = format_line(b, self.PRINCIPLE_INJECT_CHARS_EVOLVING)
+                ev_lines.append(line)
+                total += len(line)
+            if ev_lines:
+                sections.append("〔当前相处模式·新近〕")
+                sections.extend(ev_lines)
+        return "\n".join(sections)
 
     async def _build_injectable_context(self, snapshot_text: str) -> str:
-        key_records_text = await self._build_recent_key_records_context(limit=5)
+        # 顺序：稳定原则结晶（standing → evolving）在前，阶段性生活状态的
+        # key_record 在后。key_record 仍按新近注入（与当前生活计划逻辑一致）。
         pinned_principles_text = await self._build_pinned_principles_context(limit=5)
+        key_records_text = await self._build_recent_key_records_context(limit=5)
         return (
-            "【近期关键记录】\n"
-            f"{key_records_text}\n\n"
             "【稳定原则结晶】\n"
-            f"{pinned_principles_text}"
+            f"{pinned_principles_text}\n\n"
+            "【近期关键记录·阶段性生活状态】\n"
+            f"{key_records_text}"
         )
 
     async def _build_recent_events_text(self, limit: int = 2) -> str:

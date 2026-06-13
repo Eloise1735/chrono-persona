@@ -14,6 +14,76 @@ when in doubt.
 
 ## Layered defenses and their tests
 
+### A2 — LLM budget hard cap (last-line backstop)
+
+**Invariant.** Every `LLMClient.chat()` call computes an estimated token
+spend (prompt chars + `max_tokens` ceiling) and consults the
+process-wide `_BudgetTracker` BEFORE any HTTP request. Hourly and daily
+sliding windows; if the next call would exceed either, `BudgetExceeded`
+is raised. **`BudgetExceeded` inherits from `BaseException`**, so
+scattered `except Exception` blocks (in side-effect helpers, in
+`_merge_environment_event_summary`, in legacy retry loops) do NOT
+silently swallow it — it must propagate to the scheduler loop, where
+C1's `pause_immediately_exception_types=(BudgetExceeded,)` clamps the
+loop to paused. Limits are runtime-tunable via DB settings
+`llm_budget_enabled`, `llm_hourly_token_limit`, `llm_daily_token_limit`.
+
+- [`test_llm_budget_dedup.py`](test_llm_budget_dedup.py)
+  - `test_budget_allows_calls_under_hourly_limit`
+  - `test_budget_blocks_when_hourly_limit_would_be_exceeded`
+  - `test_budget_blocks_when_daily_limit_would_be_exceeded`
+  - `test_budget_window_eviction_lets_calls_through_after_an_hour`
+  - `test_budget_can_be_disabled_via_configure`
+  - `test_budget_snapshot_reports_used_remaining_and_rejections`
+  - `test_budget_reset_clears_counters`
+  - `test_budget_exceeded_is_not_caught_by_except_exception`
+    *(the headline A2 invariant — locks the BaseException inheritance)*
+  - `test_breaker_pauses_immediately_on_budget_exceeded`
+    *(C1 integration)*
+
+### A3 — Prompt-hash dedup at LLMClient layer
+
+**Invariant.** Every `LLMClient.chat()` call computes a sha256 of
+(model, messages, temperature) and consults the process-wide
+`_PromptDedupTracker`. If the same hash was sent inside the cooldown
+window (default 60s, configurable via `llm_dedup_window_sec`), it
+raises `DuplicatePromptError` before any HTTP request. The dup
+storm gets absorbed silently — C1 classifies `DuplicatePromptError`
+as `non_failure_exception_types` so the breaker doesn't pause on
+intentional skips, and `plan_engine.PLAN_TRANSIENT_GENERATION_ERRORS`
+includes it so `ensure_today_plan` swallows it naturally for the next
+tick to retry once the window expires. **This is the layer that catches
+calls B2's per-call-site wraps miss**: plan_engine, npc_engine, evolution,
+the merge helper, and any future caller — all protected without
+per-site changes.
+
+- [`test_llm_budget_dedup.py`](test_llm_budget_dedup.py)
+  - `test_hash_is_stable_for_same_inputs`
+  - `test_hash_changes_when_model_changes`
+  - `test_hash_changes_when_messages_change`
+  - `test_hash_changes_when_temperature_changes`
+  - `test_dedup_blocks_identical_hash_inside_window`
+  - `test_dedup_allows_after_window_expires`
+  - `test_dedup_does_not_block_distinct_hashes`
+  - `test_dedup_can_be_disabled_via_configure`
+  - `test_dedup_rejection_counters_tick_up`
+  - `test_dedup_reset_clears_state`
+  - `test_dedup_lru_eviction_caps_memory`
+    *(long-running process never accumulates unbounded state)*
+  - `test_duplicate_prompt_error_IS_caught_by_except_exception`
+    *(symmetric to A2 — dups are RuntimeError so legacy fallback
+    paths absorb them)*
+  - `test_breaker_classifies_duplicate_prompt_as_non_failure`
+    *(C1 integration)*
+
+Both A2 and A3 also surface state on `/api/admin/health` under
+`llm_budget` and `llm_dedup`, and expose `POST
+/api/admin/llm/budget/reset` and `POST /api/admin/llm/dedup/reset` for
+one-click recovery after a top-up or tuning change:
+
+- `test_admin_health_includes_llm_budget_and_dedup_blocks`
+- `test_admin_reset_endpoints_clear_tracker_state`
+
 ### B1 — snapshot ordering by real UTC instant
 
 **Invariant.** `state_snapshots.created_at` rows in either `...Z` or
@@ -138,6 +208,69 @@ smoke alarm for the whole subsystem.
     *(mid-flight tick is observable on the dashboard but does not
     corrupt last_snapshot_at)*
 
+### D1 — non-UTF-8 TEXT resilience (daily-plan corruption incident)
+
+**Invariant.** A TEXT column holding non-UTF-8 bytes must never 500 a
+read. SQLite's default text_factory strict-decodes TEXT and raises
+`OperationalError: Could not decode to UTF-8 column ...`; a single such
+row (written from outside the app — a non-UTF-8/GBK upload, a manual SQL
+edit, or a truncated multibyte paste) would take down an entire endpoint
+(`GET /api/plans/history` → `list_daily_plans` → `fetchall()`).
+`_lenient_text_factory` decodes with replacement so reads survive;
+`Database.repair_non_utf8_text()` rewrites the offending rows to valid
+UTF-8 permanently (detected precisely via `CAST(col AS BLOB)` +
+strict-decode, so it's idempotent). Exposed as `POST
+/api/admin/db/repair-text` and `migrate/repair_non_utf8_text.py`.
+
+The app's own write paths bind Python `str` (always valid UTF-8), so this
+corruption can only originate outside the app — but the read path must be
+defensive regardless.
+
+- [`test_db_non_utf8_text.py`](test_db_non_utf8_text.py)
+  - `test_lenient_factory_passes_valid_utf8_unchanged`
+  - `test_lenient_factory_replaces_invalid_bytes_without_raising`
+  - `test_list_daily_plans_survives_corrupt_row`
+    *(reproduces the exact /api/plans/history 500)*
+  - `test_default_factory_would_have_crashed`
+    *(guards the premise — strict factory DOES raise on the same row)*
+  - `test_repair_rewrites_corrupt_row_to_valid_utf8`
+    *(post-repair, a STRICT-factory connection reads it cleanly)*
+  - `test_repair_is_idempotent_and_clean_db_is_noop`
+  - `test_repair_dry_run_reports_without_writing`
+  - `test_repair_leaves_clean_rows_untouched`
+  - `test_admin_repair_text_endpoint`
+
+### D2 — enum-drift graceful degradation (NPC 500 incident)
+
+**Invariant.** A DB row whose Literal/enum column holds an out-of-range
+value (empty string from a manual edit / external import / partial
+insert) must never 500 a list endpoint. Root cause of the GET /api/npcs
+500: an npc_entities row had `status=''` / `spawn_source=''`; the strict
+Literal fields rejected them and `[NPCEntity(**dict(r)) for r in rows]`
+propagated one row's `ValidationError` to the whole endpoint. Two layers:
+`models._DomainModel` (a `model_validator(mode="before")` base shared by
+all 14 domain models) coerces any out-of-range Literal value to the
+field default; `database._rows_to_models` skips rows that STILL fail
+(e.g. NULL in a required non-Literal column). API request models stay on
+plain `BaseModel` so bad client input is still rejected.
+
+- [`test_model_enum_resilience.py`](test_model_enum_resilience.py)
+  - `test_literal_options_*` (3 — plain / optional / non-literal)
+  - `test_npc_empty_enums_coerce_to_default`
+    *(the exact failing /api/npcs payload)*
+  - `test_npc_unknown_enum_value_coerces_to_default`
+  - `test_valid_enum_values_pass_through_unchanged`
+  - `test_coercion_does_not_touch_non_enum_fields`
+  - `test_coercion_applies_across_domain_models`
+    *(DailyPlan / PlanItem too, not just NPCEntity)*
+  - `test_required_literal_with_no_default_uses_first_option`
+  - `test_api_request_model_still_rejects_bad_enum`
+    *(strict request models are NOT degraded)*
+  - `test_rows_to_models_skips_unparseable_row`
+  - `test_rows_to_models_empty_input`
+  - `test_list_npc_entities_survives_empty_enum_row`
+    *(reproduces the /api/npcs 500 end-to-end)*
+
 ## Deferred phases
 
 These phases of [`docs/fix_plan_snapshot_loop.md`](../docs/fix_plan_snapshot_loop.md)
@@ -145,18 +278,14 @@ were NOT implemented (the team opted to ship the highest-value layers
 first) and have no tests yet. If you implement them later, add the
 corresponding tests here so the registry stays current.
 
-- **A2** — LLM hard budget cap (`BudgetExceeded` exception). Designed to
-  plug into `SchedulerCircuitBreaker.pause_immediately_exception_types`
-  without re-touching `server/main.py`.
-- **A3** — Prompt-hash 60 s dedup at the `LLMClient.chat` level.
-  Designed to plug into `non_failure_exception_types` so duplicate-prompt
-  skips don't trip C1.
 - **B4** — `idempotency_key` on `reflect_on_conversation` for client-side
   retry de-duplication. Skipped because the current production deployment
   generates reflects in the front-end model directly and does not call
   the backend reflect endpoint.
-- **C2** — Hourly/daily budget threshold alerts at 80% / 95%. Depends on
-  A2's tracker.
+- **C2** — Hourly/daily budget threshold alerts at 80% / 95%. A2's
+  tracker is already in place; C2 would add an event-stream alert when
+  `hourly_used / hourly_limit` crosses 0.80 and again at 0.95 so the
+  admin sees the warning BEFORE the tracker actually raises.
 
 ## Running just the safety suite
 
@@ -167,11 +296,15 @@ pytest tests/test_database_snapshot_ordering.py \
        tests/test_snapshot_side_effect_isolation.py \
        tests/test_scheduler_circuit_breaker.py \
        tests/test_admin_health_endpoint.py \
+       tests/test_llm_budget_dedup.py \
+       tests/test_db_non_utf8_text.py \
+       tests/test_model_enum_resilience.py \
        tests/test_snapshot_loop_safety_incident_replay.py -v
 ```
 
-As of the C4 commit this suite is 60 tests; the full repo suite is 111.
+As of the D2 commit this suite is 110 tests; the full repo suite is 196.
 Either should be green before merging anything that touches
 `server/database.py`, `server/state_machine.py`,
-`server/scheduler_breaker.py`, `server/main.py` scheduler loops, or
-`server/api_routes.py` admin endpoints.
+`server/scheduler_breaker.py`, `server/llm_client.py`,
+`server/main.py` scheduler loops, or `server/api_routes.py` admin
+endpoints.

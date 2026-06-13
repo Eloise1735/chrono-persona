@@ -1248,6 +1248,10 @@ async def ob_hold(payload: dict | None = Body(default=None)):
         bucket_type = "dynamic"
     source_bucket = str(payload.get("source_bucket") or "").strip()
     extra_metadata = {"source_bucket": source_bucket} if bucket_type == "feel" and source_bucket else None
+    role = str(payload.get("role") or "").strip()
+    valid_roles = getattr(_ob_client, "PERMANENT_ROLES", {"evolving_principle", "standing_invariant", "anchor"})
+    if role and role in valid_roles:
+        extra_metadata = {**(extra_metadata or {}), "role": role}
     bucket_id = await _ob_client.hold(
         content,
         name=str(payload.get("name") or "").strip() or None,
@@ -1327,6 +1331,13 @@ async def update_ob_bucket(bucket_id: str, payload: dict | None = Body(default=N
     for key in ("pinned", "protected", "resolved", "crystallized", "digested"):
         if key in payload:
             updates[key] = bool(payload.get(key))
+    if "role" in payload:
+        role = str(payload.get("role") or "").strip()
+        valid_roles = getattr(_ob_client, "PERMANENT_ROLES", {"evolving_principle", "standing_invariant", "anchor"})
+        if role and role not in valid_roles:
+            raise HTTPException(400, "Unsupported role")
+        # "" clears the explicit role → effective_role falls back to legacy.
+        updates["role"] = role
     if "importance" in payload:
         updates["importance"] = _ob_payload_int(payload.get("importance"), 5, 1, 10)
     if "valence" in payload:
@@ -3475,6 +3486,19 @@ async def get_admin_health():
         logger.exception("admin/health: get_latest_reflect_created_at failed")
         last_reflect_at = None
 
+    # A2/A3 trackers — the last-line defenses. Surfacing them here lets an
+    # admin notice the next silent loop within minutes: a rising
+    # rejected_count means a dup storm is being absorbed; an hourly_used
+    # bar near the limit warns before the budget tripwire fires.
+    llm_budget = None
+    llm_dedup = None
+    try:
+        from server.llm_client import get_budget_tracker, get_prompt_dedup_tracker
+        llm_budget = get_budget_tracker().snapshot()
+        llm_dedup = get_prompt_dedup_tracker().snapshot()
+    except Exception:
+        logger.exception("admin/health: llm tracker snapshot failed")
+
     return {
         "now": now_iso,
         "schedulers": schedulers,
@@ -3484,7 +3508,148 @@ async def get_admin_health():
         "last_reflect_at": last_reflect_at,
         "age_since_last_snapshot_s": _seconds_between_iso_z(last_snap_at, now_iso),
         "age_since_last_reflect_s": _seconds_between_iso_z(last_reflect_at, now_iso),
+        "llm_budget": llm_budget,
+        "llm_dedup": llm_dedup,
     }
+
+
+@router.post("/admin/db/repair-text")
+async def repair_db_text(payload: dict | None = Body(default=None)):
+    """Clean rows whose TEXT columns hold non-UTF-8 bytes (e.g. a daily-plan
+    uploaded in a non-UTF-8 encoding). Pass {"dry_run": true} to preview.
+    With the lenient text_factory installed, reads already survive corrupt
+    rows; this makes the stored bytes valid UTF-8 permanently."""
+    if _db is None:
+        raise HTTPException(500, "database not initialized")
+    dry_run = bool((payload or {}).get("dry_run", False))
+    report = await _db.repair_non_utf8_text(dry_run=dry_run)
+    return {"ok": True, **report}
+
+
+@router.get("/admin/llm/budget/config")
+async def get_llm_budget_config():
+    """Return the persisted budget thresholds plus the live tracker
+    snapshot. Used by web/admin-health.html to pre-fill the edit form."""
+    from server.llm_client import get_budget_tracker, get_prompt_dedup_tracker
+
+    async def _setting(key: str, default: str) -> str:
+        if _db is None:
+            return default
+        row = await _db.get_setting(key)
+        return str(row["value"]) if row and row.get("value") not in (None, "") else default
+
+    return {
+        "budget": {
+            "enabled": (await _setting("llm_budget_enabled", "1")).strip() == "1",
+            "hourly_token_limit": int(await _setting("llm_hourly_token_limit", "80000")),
+            "daily_token_limit": int(await _setting("llm_daily_token_limit", "450000")),
+        },
+        "dedup": {
+            "enabled": (await _setting("llm_dedup_enabled", "1")).strip() == "1",
+            "window_sec": float(await _setting("llm_dedup_window_sec", "60")),
+        },
+        "budget_live": get_budget_tracker().snapshot(),
+        "dedup_live": get_prompt_dedup_tracker().snapshot(),
+    }
+
+
+@router.post("/admin/llm/budget/config")
+async def set_llm_budget_config(payload: dict | None = Body(default=None)):
+    """Persist new budget thresholds AND reconfigure the live tracker
+    immediately (so the change takes effect without waiting for the 30s
+    settings-refresh cycle). Body fields (all optional):
+      - hourly_token_limit: int >= 1
+      - daily_token_limit:  int >= 1
+      - enabled:            bool
+    """
+    if _db is None:
+        raise HTTPException(500, "database not initialized")
+    from server.llm_client import get_budget_tracker
+
+    payload = payload or {}
+
+    async def _setting(key: str, default: str) -> str:
+        row = await _db.get_setting(key)
+        return str(row["value"]) if row and row.get("value") not in (None, "") else default
+
+    # Start from current persisted values, override with provided fields.
+    hourly = int(await _setting("llm_hourly_token_limit", "80000"))
+    daily = int(await _setting("llm_daily_token_limit", "450000"))
+    enabled = (await _setting("llm_budget_enabled", "1")).strip() == "1"
+
+    if "hourly_token_limit" in payload:
+        try:
+            hourly = int(payload["hourly_token_limit"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "hourly_token_limit must be an integer")
+        if hourly < 1:
+            raise HTTPException(400, "hourly_token_limit must be >= 1")
+    if "daily_token_limit" in payload:
+        try:
+            daily = int(payload["daily_token_limit"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "daily_token_limit must be an integer")
+        if daily < 1:
+            raise HTTPException(400, "daily_token_limit must be >= 1")
+    if "enabled" in payload:
+        enabled = bool(payload["enabled"])
+    if daily < hourly:
+        raise HTTPException(
+            400, f"daily_token_limit ({daily}) must be >= hourly_token_limit ({hourly})"
+        )
+
+    await _db.set_setting(
+        "llm_hourly_token_limit", str(hourly), category="runtime",
+        description="A2 LLM 预算：每小时累计 token 上限",
+    )
+    await _db.set_setting(
+        "llm_daily_token_limit", str(daily), category="runtime",
+        description="A2 LLM 预算：每日累计 token 上限",
+    )
+    await _db.set_setting(
+        "llm_budget_enabled", "1" if enabled else "0", category="runtime",
+        description="A2 LLM 预算开关（1=启用，0=禁用）",
+    )
+    # Apply to the live tracker right away (don't drain the counters — just
+    # update the thresholds; raising the cap should immediately unblock).
+    get_budget_tracker().configure(
+        enabled=enabled, hourly_limit=hourly, daily_limit=daily
+    )
+    return {
+        "ok": True,
+        "budget": {
+            "enabled": enabled,
+            "hourly_token_limit": hourly,
+            "daily_token_limit": daily,
+        },
+        "budget_live": get_budget_tracker().snapshot(),
+    }
+
+
+@router.post("/admin/llm/budget/reset")
+async def reset_llm_budget():
+    """A2 admin reset: wipe the hourly/daily token counters. Use after
+    raising limits or topping up the proxy balance — the counters are
+    process-memory only, so they're also wiped on restart."""
+    from server.llm_client import get_budget_tracker
+    tracker = get_budget_tracker()
+    before = tracker.snapshot()
+    tracker.reset()
+    after = tracker.snapshot()
+    return {"ok": True, "before": before, "after": after}
+
+
+@router.post("/admin/llm/dedup/reset")
+async def reset_llm_dedup():
+    """A3 admin reset: clear the prompt-hash dedup table and rejection
+    counters. Lets a stuck dup-loop retry immediately instead of waiting
+    out the cooldown window."""
+    from server.llm_client import get_prompt_dedup_tracker
+    tracker = get_prompt_dedup_tracker()
+    before = tracker.snapshot()
+    tracker.reset()
+    after = tracker.snapshot()
+    return {"ok": True, "before": before, "after": after}
 
 
 @router.post("/admin/scheduler/{name}/resume")
