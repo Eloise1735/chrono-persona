@@ -2398,3 +2398,86 @@ def test_demote_vetoes_high_arousal_unless_forced():
 
     run(scenario())
 
+
+def test_committed_cluster_goes_quiet_but_recoverable_with_include_settled():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("settled_quiet")
+        page = await client.feel_crystals(limit=5, min_cluster_size=3, min_similarity=0.8)
+        assert page["total_clusters"] == 1
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        res = await client.commit_feel_crystal(
+            synthesis="我们之间反复出现的模式。", cluster_id=cluster_id,
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        # Every source feel (none promoted/demoted) is stamped "settled".
+        assert set(res["settled"]) == set(ids)
+        for fid in ids:
+            src = await client.get(fid)
+            assert src.metadata["type"] == "feel"  # still a feel, recallable
+            assert src.metadata["consolidated_into"] == res["crystal_id"]
+
+        # The cluster now goes quiet in the default menu and the dream hint.
+        quiet = await client.feel_crystals(limit=5, min_cluster_size=3, min_similarity=0.8)
+        assert quiet["total_clusters"] == 0
+        dreamt = await client.dream(scope="relational")
+        assert dreamt["crystal_hint"] == ""
+
+        # But it is recoverable for manual re-review with include_settled=True.
+        shown = await client.feel_crystals(
+            limit=5, min_cluster_size=3, min_similarity=0.8, include_settled=True,
+        )
+        assert shown["total_clusters"] == 1
+        assert shown["clusters"][0]["settled"] is True
+        assert shown["clusters"][0]["unsettled_count"] == 0
+
+    run(scenario())
+
+
+def test_resurfaced_cluster_folds_into_same_crystal():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("resurface_same_crystal")
+        page = await client.feel_crystals(limit=5, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+        first = await client.commit_feel_crystal(
+            synthesis="第一版。", cluster_id=cluster_id,
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        assert (await client.feel_crystals(
+            limit=5, min_cluster_size=3, min_similarity=0.8
+        ))["total_clusters"] == 0  # quiet
+
+        # New feels on the same theme accumulate (un-crystallized -> fresh).
+        new_ids = []
+        for k in range(3):
+            nid = await client.hold(
+                f"又一次被理解 new {k}", bucket_type="feel", domain=["relationship"],
+                created=f"2026-02-0{k + 1}T00:00:00",
+                extra_metadata={"source_bucket": f"dn_{k}"},
+            )
+            new_ids.append(nid)
+            client.embedding_store.vectors[nid] = [0.97 - k * 0.002, 0.05, 0.0]
+
+        # The cluster re-surfaces, carrying only the fresh material as unsettled.
+        page2 = await client.feel_crystals(limit=5, min_cluster_size=3, min_similarity=0.8)
+        assert page2["total_clusters"] == 1
+        assert page2["clusters"][0]["unsettled_count"] == 3
+        cluster_id2 = page2["clusters"][0]["cluster_id"]
+        assert cluster_id2 != cluster_id  # membership grew -> new cluster_id
+
+        # Committing without an explicit crystal_id folds back into the SAME one.
+        second = await client.commit_feel_crystal(
+            synthesis="第二版·纳入新材料。", cluster_id=cluster_id2,
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        assert second["updated"] is True
+        assert second["crystal_id"] == first["crystal_id"]
+        crystals = [
+            b for b in await client.list_buckets()
+            if b.metadata.get("crystal_id") == first["crystal_id"]
+        ]
+        assert len(crystals) == 1  # no duplicate crystal
+        assert crystals[0].metadata["principle_pattern"] == "第二版·纳入新材料。"
+
+    run(scenario())
+
