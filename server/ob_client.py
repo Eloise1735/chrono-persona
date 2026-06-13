@@ -56,6 +56,8 @@ class OBClient:
     # salience(arousal × 最近翻看)封顶，超出的退出目录但仍可检索（深存储）。
     ANCHOR_INDEX_CAP = 50                  # 进入相册目录的 anchor 名额上限
     ANCHOR_RECALL_BOOST = 1.3              # anchor 是特权记忆：关键词召回时小幅加权
+    ANCHOR_PROPOSAL_TOP_K = 3              # 写入前给模型看的"最近邻既有 anchor"条数
+    CHERISH_DECAY_FACTOR = 0.5            # cherished feel：衰减减半（延寿但仍会归档）
 
     # --- Consolidation primitive bounds (spec Phase 2, Q1/Q3) -------------
     # Gate 1: cap a single cluster so no review job is unbounded. Oversized
@@ -115,6 +117,13 @@ class OBClient:
         self.merge_suggest_text_min_ratio = 0.72
         self.merge_suggest_recency_days = 14.0
         self.merge_suggest_top_k = 3
+        # —— 查询召回的相关性门槛（门槛式，见 docs/MEASURING_MEMORY / recall 诊断）——
+        # 召回时用户已心有所指：相关性必须压倒新近/重要，无关条目直接淘汰，
+        # 不让 time/importance 底噪把它们顶上来。字面或向量任一达标即合格。
+        self.recall_topic_min = 0.10        # 字面相关性最低门槛
+        self.recall_vector_min = 0.50       # 向量语义最低门槛
+        self.recall_time_nudge = 5.0        # 新近度只做小幅微调（远小于相关性的 ×100）
+        self.recall_importance_nudge = 3.0  # 重要性只做小幅微调
         self.permanent_dir = self.base_dir / "permanent"
         self.dynamic_dir = self.base_dir / "dynamic"
         self.archive_dir = self.base_dir / "archive"
@@ -999,6 +1008,58 @@ class OBClient:
             "cap": cap,
         }
 
+    async def _anchor_admission_proposal(
+        self, feel: OBBucket, *, top_k: int | None = None
+    ) -> dict[str, Any]:
+        """Compare a candidate anchor against the EXISTING anchor set one-by-one
+        (max pairwise similarity — never a centroid, which would cancel out the
+        very distinctiveness we care about). Routes the candidate to a theme and
+        surfaces its nearest existing anchors (full excerpts) so the model + user
+        can judge whether it is a genuinely new precious memory or already
+        represented. Informational signal (I3), not an automatic gate."""
+        top_k = self.ANCHOR_PROPOSAL_TOP_K if top_k is None else max(1, int(top_k))
+        meta = feel.metadata or {}
+        domains = [str(d) for d in (meta.get("domain") or []) if str(d).strip()]
+        theme = domains[0] if domains else "未分类"
+        anchors = [
+            b for b in await self.list_buckets(include_archive=False)
+            if self.effective_role(b.metadata) == self.ROLE_ANCHOR
+        ]
+        cand_emb = self.embedding_store.get(feel.id) if self.embedding_store is not None else None
+        import difflib
+        norm_cand = self._normalize_for_dedupe(feel.content)
+        scored: list[tuple[float, OBBucket]] = []
+        for anchor in anchors:
+            a_emb = self.embedding_store.get(anchor.id) if self.embedding_store is not None else None
+            if cand_emb and a_emb:
+                sim = self._cosine_similarity(cand_emb, a_emb)
+            elif norm_cand:
+                sim = difflib.SequenceMatcher(
+                    None, norm_cand, self._normalize_for_dedupe(anchor.content)
+                ).ratio()
+            else:
+                sim = 0.0
+            scored.append((float(sim), anchor))
+        scored.sort(key=lambda p: p[0], reverse=True)
+        nearest = []
+        for sim, anchor in scored[:top_k]:
+            am = anchor.metadata or {}
+            a_domains = [str(d) for d in (am.get("domain") or []) if str(d).strip()]
+            nearest.append({
+                "id": anchor.id,
+                "name": str(am.get("name") or anchor.id),
+                "theme": a_domains[0] if a_domains else "未分类",
+                "similarity": round(float(sim), 4),
+                "excerpt": self._strip_wikilinks(anchor.content)[:160],
+            })
+        return {
+            "id": feel.id,
+            "candidate_excerpt": self._strip_wikilinks(feel.content)[:160],
+            "theme": theme,
+            "existing_anchor_total": len(anchors),
+            "nearest_existing": nearest,
+        }
+
     async def recall_anchors(self, query: str, *, top_k: int = 5) -> list[dict[str, Any]]:
         """Open the album: search ONLY anchor memories, ranked by relevance ×
         emotional weight (not dynamic decay — anchors do not decay). Retrieval
@@ -1179,16 +1240,20 @@ class OBClient:
         scored: list[OBBucket] = []
         now = datetime.utcnow()
         for bucket in buckets:
+            topic = self._topic_score(query, bucket)
+            vsim = float(vector_scores.get(bucket.id, 0.0))
+            # 门槛式：字面或向量任一达到最低相关性才有资格；否则直接淘汰，
+            # 不让 time/importance 底噪把无关条目顶上来（这是召回污染的根因）。
+            if topic < float(self.recall_topic_min) and vsim < float(self.recall_vector_min):
+                continue
             score = self._search_score(bucket, query, valence, arousal, now)
-            if bucket.id in vector_scores and vector_scores[bucket.id] > 0.5:
-                score = max(score, vector_scores[bucket.id] * 100.0)
+            if vsim >= float(self.recall_vector_min):
+                score = max(score, vsim * 100.0)
             # anchors are privileged precious memories: when relevant they should
             # surface MORE readily, not less — keyword recall is a kept channel,
             # the album index is just an extra direct lane (the two coexist).
             if self.effective_role(bucket.metadata) == self.ROLE_ANCHOR:
                 score *= self.ANCHOR_RECALL_BOOST
-            if score < 18:
-                continue
             bucket.score = round(score, 2)
             scored.append(bucket)
 
@@ -1459,6 +1524,8 @@ class OBClient:
         title: str = "",
         domain: list[str] | None = None,
         anchor_ids: list[str] | None = None,
+        confirm_anchor_ids: list[str] | None = None,
+        cherish_ids: list[str] | None = None,
         standing_ids: list[str] | None = None,
         demote_ids: list[str] | None = None,
         source_ids: list[str] | None = None,
@@ -1476,14 +1543,24 @@ class OBClient:
         cluster (incl. unread batches) as retained pointers (I2). Source feels
         are NOT marked crystallized — they age out on their own track.
 
-        keep → promote: `anchor_ids` (irreplaceable moments → role=anchor,
-        recall-only) and `standing_ids` (durable consensus → standing_invariant,
-        always injected). `demote_ids` (default empty) exit auto-surfacing but
-        stay recallable — never deleted (I2).
+        Anchor admission is TWO-PHASE + user-gated (anchors are permanent &
+        precious; most cycles should anchor nothing):
+        - `anchor_ids` only PROPOSES. For each candidate the backend returns, in
+          `pending_anchor_proposals`, its theme + nearest EXISTING anchors
+          (one-by-one max similarity, full excerpts) so the model + user judge
+          it against the whole album, not just this cluster. Nothing is promoted.
+        - `confirm_anchor_ids` actually promotes (role=anchor) — pass these only
+          after the user OKs the proposal (carry `crystal_id` from the proposal
+          call).
 
-        Q3 deep-mark guard: a feel with arousal > DEMOTE_AROUSAL_VETO is NOT
-        auto-demoted (emotional weight is not "redundancy"); it is reported in
-        `demote_vetoed`. Pass force_demote=True to override deliberately.
+        Other keep destinations:
+        - `standing_ids`: durable consensus → standing_invariant (always injected).
+        - `cherish_ids`: memory-worthy but NOT anchor-worthy feels → `cherished`
+          flag (decay ~halved, clock refreshed) — they linger ~2x but still
+          archive. The mortal "silver tier"; self-cleaning, so flag liberally.
+        - `demote_ids` (default empty): redundant → exit auto-surfacing, still
+          recallable, never deleted (I2). arousal > DEMOTE_AROUSAL_VETO is NOT
+          auto-demoted (reported in `demote_vetoed`); pass force_demote=True.
 
         Pass back `crystal_id` from a prior commit to keep refining the same
         crystal across batches (state lives in the crystal, backend stateless).
@@ -1557,9 +1634,16 @@ class OBClient:
                 extra_metadata=extra,
             )
 
+        # Phase 1 — propose: surface theme + nearest existing anchors. No write.
+        pending_anchor_proposals: list[dict[str, Any]] = []
+        for bid in (anchor_ids or []):
+            bucket = await self.get(self._safe_id(bid))
+            if bucket and self._bucket_type(bucket.metadata) == "feel":
+                pending_anchor_proposals.append(await self._anchor_admission_proposal(bucket))
+        # Phase 2 — confirm (user-OK'd): actually promote to anchor.
         promoted_anchor: list[str] = []
         promoted_standing: list[str] = []
-        for bid in (anchor_ids or []):
+        for bid in (confirm_anchor_ids or []):
             bucket = await self.get(self._safe_id(bid))
             if bucket and self._bucket_type(bucket.metadata) == "feel":
                 await self.update(
@@ -1570,6 +1654,7 @@ class OBClient:
                     demoted=False,
                     promoted_from="feel",
                     promoted_into=crystal_bucket_id,
+                    last_revisited=now,
                 )
                 promoted_anchor.append(bucket.id)
         for bid in (standing_ids or []):
@@ -1611,6 +1696,27 @@ class OBClient:
             )
             demoted_ids.append(bucket.id)
 
+        # Cherished tier — memory-worthy but not anchor-worthy: slow the decay
+        # (~2x lifespan) and refresh the clock so it lingers from this commit,
+        # while staying a mortal, self-cleaning feel (never permanent).
+        cherished_ids: list[str] = []
+        skip_cherish = promoted_set | set(demoted_ids)
+        for bid in (cherish_ids or []):
+            sid = self._safe_id(bid)
+            if sid in skip_cherish:
+                continue
+            bucket = await self.get(sid)
+            if not bucket or self._bucket_type(bucket.metadata) != "feel":
+                continue
+            await self.update(
+                bucket.id,
+                cherished=True,
+                consolidated_into=crystal_id,
+                consolidated_at=now,
+                last_active=now,
+            )
+            cherished_ids.append(bucket.id)
+
         # Fourth state — "reviewed, kept as-is": stamp every remaining source feel
         # with a back-ref to this crystal. It stays a normal feel (recallable, can
         # re-cluster), but the cluster goes quiet in the dream hint / menu until
@@ -1620,7 +1726,7 @@ class OBClient:
         # Vetoed items still count as "considered" (they get the settled stamp
         # below) so a deep mark does not keep the cluster nagging forever; the
         # veto is reported in the return for the model to act on next round.
-        handled = promoted_set | set(demoted_ids)
+        handled = promoted_set | set(demoted_ids) | set(cherished_ids)
         settled_ids: list[str] = []
         for bucket in members:
             if bucket.id in handled:
@@ -1642,8 +1748,10 @@ class OBClient:
             "synthesis_len": len(synthesis),
             "anchor_refs_count": len(anchor_refs),
             "source_count": len(members),
+            "pending_anchor_proposals": pending_anchor_proposals,
             "promoted_to_anchor": promoted_anchor,
             "promoted_to_standing": promoted_standing,
+            "cherished": cherished_ids,
             "demoted": demoted_ids,
             "demote_vetoed": demote_vetoed,
             "settled": settled_ids,
@@ -2042,6 +2150,8 @@ class OBClient:
         stretches this feel's half-life and archive horizon."""
         arousal = self._clamp_float(metadata.get("arousal"), 0.0, 1.0, 0.3)
         eff = float(self.feel_decay_lambda) * (1.0 - float(self.feel_decay_arousal_k) * arousal)
+        if metadata.get("cherished"):
+            eff *= float(self.CHERISH_DECAY_FACTOR)
         mult = 1.0
         if metadata.get("crystallized"):
             mult *= 0.1
@@ -2078,6 +2188,11 @@ class OBClient:
             days_since = self._days_since(metadata.get("last_active") or metadata.get("created"), datetime.utcnow())
             arousal = self._clamp_float(metadata.get("arousal"), 0.0, 1.0, 0.3)
             effective_lambda = float(self.feel_decay_lambda) * (1.0 - float(self.feel_decay_arousal_k) * arousal)
+            # Cherished tier: model-flagged memory-worthy-but-not-anchor feels
+            # decay slower (~2x half-life) — they linger but, unlike anchors,
+            # still archive eventually. Self-cleaning, so safe to flag liberally.
+            if metadata.get("cherished"):
+                effective_lambda *= float(self.CHERISH_DECAY_FACTOR)
             feel_score = 50.0 * math.exp(-effective_lambda * days_since)
             if metadata.get("crystallized"):
                 feel_score *= 0.1
@@ -2147,13 +2262,15 @@ class OBClient:
                 "importance": round(importance, 4),
                 "search_score": round(search_score, 2),
                 "decay_score": decay_score,
-                "passed_threshold": search_score >= 18 if query else decay_score > 0,
+                # 门槛式：字面相关性达标即合格（探针无向量；真实召回还可由 vsim≥min 救回）。
+                "passed_threshold": (topic >= float(self.recall_topic_min)) if query else decay_score > 0,
             })
         rows.sort(key=lambda item: float(item["search_score"] if query else item["decay_score"]), reverse=True)
         return {
             "query": query,
-            "weights": {"topic": 4.0, "emotion": 2.0, "time": 1.5, "importance": 1.0},
-            "threshold": 18 if query else 0,
+            "scoring": "relevance-primary: score = relevance*100 + time*%g + importance*%g（情绪仅在显式传入时计入 relevance）" % (
+                self.recall_time_nudge, self.recall_importance_nudge),
+            "gate": {"topic_min": self.recall_topic_min, "vector_min": self.recall_vector_min},
             "items": rows,
         }
 
@@ -2668,11 +2785,19 @@ class OBClient:
     ) -> float:
         meta = bucket.metadata
         topic = self._topic_score(query, bucket)
-        emotion = self._emotion_score(valence, arousal, meta)
         time_score = self._time_score(meta, now)
         importance = max(1, min(10, int(meta.get("importance", 5) or 5))) / 10.0
-        total = topic * 4.0 + emotion * 2.0 + time_score * 1.5 + importance
-        score = total / 8.5 * 100
+        # 相关性主导：召回时用户已心有所指，相关性必须压倒新近/重要。
+        # 情绪只在调用方显式传 valence/arousal 时参与（否则权重归零，
+        # 不再像旧版那样给所有桶白送 0.5 的情绪底分稀释相关性）。
+        relevance = topic
+        if valence is not None and arousal is not None:
+            emotion = self._emotion_score(valence, arousal, meta)
+            relevance = topic * 0.8 + emotion * 0.2
+        # relevance ∈ [0,1] 放大到百分制作主轴；time/importance 仅做小幅微调。
+        score = relevance * 100.0
+        score += time_score * float(self.recall_time_nudge)
+        score += importance * float(self.recall_importance_nudge)
         if meta.get("resolved"):
             score *= 0.3
         return score
@@ -2711,7 +2836,10 @@ class OBClient:
 
     @staticmethod
     def _time_score(meta: dict[str, Any], now: datetime) -> float:
-        days = OBClient._days_since(meta.get("last_active") or meta.get("created"), now)
+        # Fix 3：查询召回的新近度用 created（事件发生时间），不用 last_active。
+        # last_active 会被每次召回 touch 刷新，旧版用它 → "被召回过的越容易再被召回"
+        # 的滚雪球反馈。改用 created 后，"多久前发生"与"我多久前想起它"解耦。
+        days = OBClient._days_since(meta.get("created") or meta.get("last_active"), now)
         return math.exp(-0.02 * min(days, 365))
 
     @staticmethod
