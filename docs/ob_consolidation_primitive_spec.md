@@ -251,4 +251,9 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
      - **两段式 + 用户确认**：`commit_feel_crystal(anchor_ids=…)` 只**提议**——返回 `pending_anchor_proposals`（候选主题 + 最近邻既有 anchor 全文 + 相似度，供模型+用户对照整个相册）；`confirm_anchor_ids=…`（用户点头后）才写入。多数周期 anchor 产出为 0 是正常。
      - **相似度算法**：候选对既有 anchor **逐条 max pairwise**（**绝不质心/平均**——会抵消独特性），`ANCHOR_PROPOSAL_TOP_K=3` 条最近邻；主题（domain）只作路由/组织，判断永远基于逐条全文（I3 信号非硬闸）。
      - **cherish 银档**：落选但有记忆价值的 feel → `cherish_ids` 标 `cherished`：衰减 `×CHERISH_DECAY_FACTOR=0.5`（半衰期约翻倍）+ 刷新 last_active，**延寿但仍会归档**。三档：anchor 永久 / cherished 延长-仍死 / 普通 feel 正常。cherished 自清理，可放心多标。
-4. **Phase 4 — resolve + 读取侧**（见 §9、§9.1 breath_bundle 槽位改造）。
+4. **Phase 4 — 读取侧 breath_bundle 槽位改造**（✅ 已落地，见 §9.1）：
+   - **relational feel 排序：新近⊕arousal**（`_feel_breath`）：`rank = 0.7·exp(−天数/7) + 0.3·arousal`，连续性仍主导，但有分量的近期感受多赖几轮。不加槽、score 仍 50。
+   - **free 槽 A = 纯漫游**（top-5 score shuffle 取 1，抗反刍安全阀）。
+   - **free 槽 B = 概率回声**（`ECHO_PROBABILITY=0.35`）：命中 → `_pick_echo_anchor` 从 **anchor 池**按 `arousal×(1−exp(−距上次翻看/30))` 加权随机抽 1、bump `last_revisited`、贴 `【不期然想起】` 标记；未命中 → 退化漫游。
+   - personal 3 / relational 8 仍是连续性主体（~85%）；anchor 只经回声槽进 breath，不参与漫游 score 排序。
+   - 其余 §9 读取侧（resolve 软化、activation 反馈阻尼、高阈值环境式 recall）仍待办。

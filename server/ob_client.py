@@ -59,6 +59,16 @@ class OBClient:
     ANCHOR_PROPOSAL_TOP_K = 3              # 写入前给模型看的"最近邻既有 anchor"条数
     CHERISH_DECAY_FACTOR = 0.5            # cherished feel：衰减减半（延寿但仍会归档）
 
+    # --- breath_bundle 槽位（spec §9.1，Phase 4 读取侧）-------------------
+    # relational feel 排序：新近⊕arousal，让有分量的近期感受多赖几轮（连续性仍主导）。
+    FEEL_SURFACE_RECENCY_HORIZON_DAYS = 7.0
+    FEEL_SURFACE_W_RECENCY = 0.7
+    FEEL_SURFACE_W_AROUSAL = 0.3
+    # free 槽 B = 概率回声：偶发让一条珍贵旧记忆（仅 anchor）不期然浮现。
+    ECHO_PROBABILITY = 0.35                # 约每 3 轮一次
+    ECHO_REVISIT_HORIZON_DAYS = 30.0       # 越久没翻看，越容易被回声选中
+    ECHO_SLOT_MARKER = "【不期然想起】"
+
     # --- Consolidation primitive bounds (spec Phase 2, Q1/Q3) -------------
     # Gate 1: cap a single cluster so no review job is unbounded. Oversized
     # connected components are re-partitioned at a tighter similarity until
@@ -546,7 +556,11 @@ class OBClient:
             and self._feel_is_eligible(bucket.metadata)
             and self._bucket_in_date_window(bucket, window)
         ]
-        feels.sort(key=lambda b: str(b.metadata.get("created") or ""), reverse=True)
+        now = datetime.utcnow()
+        # Order by recency ⊕ arousal (spec §9.1): recency still dominates so the
+        # bundle stays continuous, but a weighty recent feeling can hold a slot
+        # over a milder newer one — "the heavy ones stick a few extra turns".
+        feels.sort(key=lambda b: self._feel_surface_rank(b.metadata or {}, now), reverse=True)
         char_limit = max(0, min(int(max_character_life or 0), int(limit or 0)))
         char_items: list[OBBucket] = []
         other_items: list[OBBucket] = []
@@ -557,11 +571,22 @@ class OBClient:
                 continue
             other_items.append(bucket)
         selected = char_items + other_items[: max(0, int(limit or 0) - len(char_items))]
-        # Note: do NOT re-sort by created here; char_items must stay in front. They are
-        # already created-desc within each group because `feels` was sorted above.
+        # Note: do NOT re-sort here; char_items must stay in front. They are already
+        # recency⊕arousal-ranked within each group because `feels` was sorted above.
         for bucket in selected:
             bucket.score = 50.0
         return selected[:limit]
+
+    def _feel_surface_rank(self, meta: dict[str, Any], now: datetime) -> float:
+        """relational feel 浮现排序键：新近 ⊕ arousal（spec §9.1）。新近仍主导，
+        但有分量的近期感受能压过更新但更淡的，多停留几轮。"""
+        days = self._days_since(meta.get("created"), now)
+        recency = math.exp(-max(days, 0.0) / float(self.FEEL_SURFACE_RECENCY_HORIZON_DAYS))
+        arousal = self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3)
+        return (
+            float(self.FEEL_SURFACE_W_RECENCY) * recency
+            + float(self.FEEL_SURFACE_W_AROUSAL) * arousal
+        )
 
     async def _surface_breath(
         self,
@@ -779,7 +804,9 @@ class OBClient:
 
         relational = relational_dyn + relational_feel
 
-        # Free: 2 条自由浮现；防御 pinned/protected/permanent；top 5 score 后 shuffle 取 2。
+        # Free: 2 槽分工（spec §9.1）——槽 A 纯漫游（自由联想 + 抗反刍）；槽 B 概率回声
+        # （~每 3 轮一次，让一条珍贵旧 anchor 不期然浮现）。防御 pinned/protected/permanent
+        # 进入漫游池（它们 999 分会霸榜）；anchor 只通过回声槽进入，不参与漫游 score 排序。
         free_pool: list[OBBucket] = []
         seen_pool_ids: set[str] = set()
         for bucket in dyn_candidates:
@@ -800,14 +827,33 @@ class OBClient:
             free_pool.append(bucket)
             seen_pool_ids.add(bucket.id)
         free_pool.sort(key=lambda b: float(getattr(b, "score", 0.0) or 0.0), reverse=True)
-        top_pool = free_pool[:5]
-        random.shuffle(top_pool)
+        wander_pool = free_pool[:5]
+        random.shuffle(wander_pool)
         free: list[OBBucket] = []
-        for bucket in top_pool:
-            if len(free) >= 2:
-                break
-            free.append(bucket)
-            used_ids.add(bucket.id)
+
+        def take_wander() -> None:
+            for bucket in wander_pool:
+                if bucket.id in used_ids:
+                    continue
+                free.append(bucket)
+                used_ids.add(bucket.id)
+                return
+
+        # Slot A — pure wander: free association + anti-rumination safety valve.
+        take_wander()
+        # Slot B — probabilistic echo: ~ECHO_PROBABILITY of the time a precious
+        # old anchor resurfaces unbidden (involuntary memory); else another wander.
+        if random.random() < float(self.ECHO_PROBABILITY):
+            echo = await self._pick_echo_anchor(exclude_ids=used_ids)
+            if echo is not None:
+                used_ids.add(echo.id)
+                # surfacing counts as revisiting (activation feedback).
+                await self.update(echo.id, last_revisited=datetime.utcnow().isoformat())
+                free.append(self._with_fixed_slot_marker(echo, "echo_memory", self.ECHO_SLOT_MARKER))
+            else:
+                take_wander()
+        else:
+            take_wander()
 
         return {
             "personal":   self.format_buckets(personal),
@@ -824,6 +870,30 @@ class OBClient:
         if meta.get("pinned") or meta.get("protected"):
             return True
         return self._bucket_type(meta) == "permanent"
+
+    async def _pick_echo_anchor(self, *, exclude_ids: set[str] | None = None) -> OBBucket | None:
+        """Weighted-random pick from the anchor pool for the echo slot (spec §9.1):
+        weight = arousal × (1 − exp(−距上次翻看天数 / H))，偏向情绪深、且久未翻看的
+        珍贵旧记忆——模拟非自主记忆"很久没翻到的那页突然翻开"。无 anchor 时返回 None。"""
+        exclude_ids = exclude_ids or set()
+        now = datetime.utcnow()
+        anchors = [
+            b for b in await self.list_buckets(include_archive=False)
+            if self.effective_role(b.metadata) == self.ROLE_ANCHOR and b.id not in exclude_ids
+        ]
+        if not anchors:
+            return None
+        weights: list[float] = []
+        for bucket in anchors:
+            meta = bucket.metadata or {}
+            arousal = self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3)
+            ref = meta.get("last_revisited") or meta.get("created")
+            days = self._days_since(ref, now)
+            unrevisited = 1.0 - math.exp(-max(days, 0.0) / float(self.ECHO_REVISIT_HORIZON_DAYS))
+            weights.append(max(0.0, arousal * unrevisited))
+        if sum(weights) <= 0.0:
+            return random.choice(anchors)
+        return random.choices(anchors, weights=weights, k=1)[0]
 
     async def _character_life_pins(
         self,
