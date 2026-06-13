@@ -1077,6 +1077,247 @@ class OBClient:
             },
         }
 
+    async def review_feel_cluster(
+        self,
+        *,
+        cluster_id: str,
+        cursor: str = "",
+        batch_size: int = 6,
+        min_cluster_size: int = 3,
+        min_similarity: float = 0.7,
+        scope: str = "relational",
+    ) -> dict[str, Any]:
+        """Iterative review packet for one feel cluster (consolidation primitive).
+
+        Returns up to `batch_size` FULL-TEXT items (no truncation), ordered by
+        uniqueness desc (distance to cluster centroid — age-independent, I4), so
+        the model reads the most distinctive outliers first and builds the
+        synthesis batch by batch. Backend is stateless: state lives in the
+        crystal + cursor. Read a couple batches then stop; unread items remain
+        anchors (retained, recallable) — see commit_feel_crystal.
+        """
+        batch = max(1, min(20, int(batch_size or 6)))
+        normalized_scope = self._normalize_scope(scope)
+        degraded = self.embedding_store is None
+        cluster = await self._get_feel_cluster_by_id(
+            cluster_id,
+            min_cluster_size=min_cluster_size,
+            min_similarity=min_similarity,
+            scope=normalized_scope,
+        )
+        if not cluster:
+            return {
+                "cluster_id": cluster_id,
+                "items": [],
+                "size": 0,
+                "cursor": "",
+                "next_cursor": "",
+                "has_more": False,
+                "total": 0,
+                "all_ids": [],
+                "degraded": degraded,
+                "scope": normalized_scope,
+                "error": "cluster not found (membership may have shifted; re-list with feel_crystals)",
+            }
+        buckets: list[OBBucket] = list(cluster.get("buckets") or [])
+        uniqueness: dict[str, float] = dict(cluster.get("uniqueness") or {})
+        if degraded or not uniqueness:
+            degraded = True
+            ordered = sorted(
+                buckets,
+                key=lambda b: len(self._strip_wikilinks(b.content)),
+                reverse=True,
+            )
+        else:
+            ordered = sorted(
+                buckets,
+                key=lambda b: float(uniqueness.get(b.id, 0.0)),
+                reverse=True,
+            )
+        offset = self._cursor_offset(cursor)
+        page = ordered[offset : offset + batch]
+        items = []
+        for bucket in page:
+            meta = bucket.metadata or {}
+            items.append({
+                "id": bucket.id,
+                "full_text": self._strip_wikilinks(bucket.content).strip(),
+                "arousal": self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3),
+                "importance": max(1, min(10, int(meta.get("importance", 5) or 5))),
+                "uniqueness": float(uniqueness.get(bucket.id, 0.0)),
+                "source_dynamic": str(meta.get("source_bucket") or ""),
+                "created": str(meta.get("created") or ""),
+            })
+        next_offset = offset + len(page)
+        has_more = next_offset < len(ordered)
+        return {
+            "cluster_id": cluster.get("id"),
+            "items": items,
+            "size": len(items),
+            "cursor": str(offset) if offset else "",
+            "next_cursor": str(next_offset) if has_more else "",
+            "has_more": has_more,
+            "total": len(ordered),
+            "all_ids": [bucket.id for bucket in ordered],
+            "degraded": degraded,
+            "scope": normalized_scope,
+        }
+
+    async def _find_crystal_bucket(self, crystal_id: str) -> OBBucket | None:
+        if not crystal_id:
+            return None
+        for bucket in await self.list_buckets(include_archive=False):
+            if str((bucket.metadata or {}).get("crystal_id") or "") == crystal_id:
+                return bucket
+        return None
+
+    async def commit_feel_crystal(
+        self,
+        *,
+        synthesis: str,
+        cluster_id: str = "",
+        title: str = "",
+        domain: list[str] | None = None,
+        anchor_ids: list[str] | None = None,
+        standing_ids: list[str] | None = None,
+        demote_ids: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        crystal_id: str = "",
+        importance: int = 9,
+        min_cluster_size: int = 3,
+        min_similarity: float = 0.7,
+        scope: str = "relational",
+    ) -> dict[str, Any]:
+        """Idempotent upsert of one evolving_principle crystal from a feel cluster.
+
+        Pure-additive integration (I1): creates/updates a permanent
+        role=evolving_principle bucket whose `anchor_refs` cover the WHOLE
+        cluster (incl. unread batches) as retained pointers (I2). Source feels
+        are NOT marked crystallized — they age out on their own track.
+
+        keep → promote: `anchor_ids` (irreplaceable moments → role=anchor,
+        recall-only) and `standing_ids` (durable consensus → standing_invariant,
+        always injected). `demote_ids` (default empty) exit auto-surfacing but
+        stay recallable — never deleted (I2).
+
+        Pass back `crystal_id` from a prior commit to keep refining the same
+        crystal across batches (state lives in the crystal, backend stateless).
+        """
+        synthesis = str(synthesis or "").strip()
+        if not synthesis:
+            raise ValueError("synthesis 不能为空")
+        normalized_scope = self._normalize_scope(scope)
+        cluster = None
+        if cluster_id:
+            cluster = await self._get_feel_cluster_by_id(
+                cluster_id,
+                min_cluster_size=min_cluster_size,
+                min_similarity=min_similarity,
+                scope=normalized_scope,
+            )
+        raw_member_ids = list(source_ids or (cluster["ids"] if cluster else []))
+        member_ids = list(dict.fromkeys(
+            self._safe_id(x) for x in raw_member_ids if str(x or "").strip()
+        ))
+        members = [b for b in [await self.get(bid) for bid in member_ids] if b]
+        anchor_refs = []
+        for bucket in members:
+            meta = bucket.metadata or {}
+            snippet = self._strip_wikilinks(bucket.content).strip().replace("\n", " ")
+            anchor_refs.append({
+                "id": bucket.id,
+                "source_dynamic": str(meta.get("source_bucket") or ""),
+                "snippet": snippet[:80],
+            })
+        now = datetime.utcnow().isoformat()
+        if not crystal_id:
+            basis = cluster.get("id") if cluster else (member_ids[0] if member_ids else uuid.uuid4().hex[:12])
+            crystal_id = "fc_" + hashlib.sha1(
+                f"{basis}|{normalized_scope}".encode("utf-8")
+            ).hexdigest()[:12]
+        existing = await self._find_crystal_bucket(crystal_id)
+        extra = {
+            "source_kind": "feel_crystal",
+            "role": self.ROLE_EVOLVING,
+            "crystal_id": crystal_id,
+            "principle_pattern": synthesis,
+            "anchor_refs": anchor_refs,
+            "source_ids": [bucket.id for bucket in members],
+            "crystallized_at": now,
+        }
+        name = str(title or "").strip() or "相处模式结晶"
+        if existing:
+            await self.update(existing.id, content=synthesis, name=name, **extra)
+            crystal_bucket_id = existing.id
+        else:
+            crystal_bucket_id = await self.hold(
+                synthesis,
+                tags=["feel_crystal", "principle"],
+                importance=max(1, min(10, int(importance or 9))),
+                domain=domain or ["core"],
+                bucket_type="permanent",
+                name=name,
+                extra_metadata=extra,
+            )
+
+        promoted_anchor: list[str] = []
+        promoted_standing: list[str] = []
+        for bid in (anchor_ids or []):
+            bucket = await self.get(self._safe_id(bid))
+            if bucket and self._bucket_type(bucket.metadata) == "feel":
+                await self.update(
+                    bucket.id,
+                    type="permanent",
+                    role=self.ROLE_ANCHOR,
+                    crystallized=False,
+                    demoted=False,
+                    promoted_from="feel",
+                    promoted_into=crystal_bucket_id,
+                )
+                promoted_anchor.append(bucket.id)
+        for bid in (standing_ids or []):
+            bucket = await self.get(self._safe_id(bid))
+            if bucket and self._bucket_type(bucket.metadata) == "feel":
+                await self.update(
+                    bucket.id,
+                    type="permanent",
+                    role=self.ROLE_STANDING,
+                    crystallized=False,
+                    demoted=False,
+                    promoted_from="feel",
+                    promoted_into=crystal_bucket_id,
+                )
+                promoted_standing.append(bucket.id)
+
+        promoted_set = set(promoted_anchor) | set(promoted_standing)
+        demoted_ids: list[str] = []
+        for bid in (demote_ids or []):
+            sid = self._safe_id(bid)
+            if sid in promoted_set:
+                continue
+            bucket = await self.get(sid)
+            if bucket and self._bucket_type(bucket.metadata) == "feel":
+                await self.update(
+                    bucket.id,
+                    demoted=True,
+                    consolidated_into=crystal_bucket_id,
+                    demoted_at=now,
+                )
+                demoted_ids.append(bucket.id)
+
+        return {
+            "crystal_id": crystal_id,
+            "crystal_bucket_id": crystal_bucket_id,
+            "updated": bool(existing),
+            "synthesis_len": len(synthesis),
+            "anchor_refs_count": len(anchor_refs),
+            "source_count": len(members),
+            "promoted_to_anchor": promoted_anchor,
+            "promoted_to_standing": promoted_standing,
+            "demoted": demoted_ids,
+            "scope": normalized_scope,
+        }
+
     async def crystallize_feel(
         self,
         *,
@@ -1481,6 +1722,10 @@ class OBClient:
             feel_score = 50.0 * math.exp(-float(self.feel_decay_lambda) * days_since)
             if metadata.get("crystallized"):
                 feel_score *= 0.1
+            # Demoted feels (a crystal judged them redundant) sink out of
+            # surfacing/clustering but stay recallable — never deleted (I2).
+            if metadata.get("demoted"):
+                feel_score *= 0.1
             return round(feel_score, 4)
         if bucket_type == "archived":
             return 0.0
@@ -1589,7 +1834,8 @@ class OBClient:
             "- 哪些可以放下？\n"
             "想完之后：值得放下的，用 resolve_bucket(bucket_id, reason=\"...\")；"
             "有沉淀的，用 hold_feel(content=\"...\", source_bucket=\"bucket_id\", valence=你的感受)；"
-            "如果末尾出现结晶提示，调用 feel_crystals(...) / crystallize_feel(...)。"
+            "如果末尾出现结晶提示，按 feel_crystals(...) → review_feel_cluster(...) → "
+            "commit_feel_crystal(...) 逐批结晶。"
             "resolve_bucket 是放下已经被沉淀、理解或转写的 dynamic 源事件，不是删除或归档。\n\n"
         )
         parts: list[str] = []
@@ -1639,38 +1885,38 @@ class OBClient:
             return ""
 
     async def _dream_crystal_hint(self, buckets: list[OBBucket], *, scope: str = "relational") -> str:
+        """Light tail hint (spec §5.1): count mature feel clusters ready to crystallize.
+
+        Only a prompt — never auto-runs. Points to the consolidation primitive
+        (feel_crystals → review_feel_cluster → commit_feel_crystal). Returns ""
+        when nothing is mature, so it stays quiet most nights.
+        """
         if self.embedding_store is None:
             return ""
-        feels = [
-            bucket for bucket in buckets
-            if self._bucket_type(bucket.metadata) == "feel"
-            and not bucket.metadata.get("pinned")
-        ]
-        feels = self._filter_by_scope(feels, scope)
-        if len(feels) < 3:
-            return ""
         try:
-            embeddings = {bucket.id: self.embedding_store.get(bucket.id) for bucket in feels}
-            embeddings = {bid: emb for bid, emb in embeddings.items() if emb}
-            for bucket in feels:
-                emb = embeddings.get(bucket.id)
-                if not emb:
-                    continue
-                similar = [
-                    other_id for other_id, other_emb in embeddings.items()
-                    if other_id != bucket.id and self._cosine_similarity(emb, other_emb) > 0.7
-                ]
-                if len(similar) >= 2:
-                    preview = self._strip_wikilinks(bucket.content)[:90]
-                    return (
-                        f"结晶提示：我已经写过 {len(similar) + 1} 条相似的 feel"
-                        f"（围绕“{preview}...”）。如果它已经从感受变成稳定认知，"
-                        "请先调用 feel_crystals(...) 查看相似 feel，再用 crystallize_feel(...) "
-                        "结晶为 OB principle、key_record、both 或浓缩为普通 feel。"
-                    )
+            clusters = await self._feel_clusters(
+                min_cluster_size=3,
+                min_similarity=0.7,
+                scope=scope,
+            )
         except Exception:
             logger.exception("OB dream crystal hint failed")
-        return ""
+            return ""
+        if not clusters:
+            return ""
+        count = len(clusters)
+        largest = max(clusters, key=lambda c: len(c.get("ids") or []))
+        preview = ""
+        sample = largest.get("buckets") or []
+        if sample:
+            preview = self._strip_wikilinks(sample[0].content)[:60]
+        around = f"（最大一簇约 {len(largest.get('ids') or [])} 条，围绕“{preview}...”）" if preview else ""
+        return (
+            f"结晶提示：有 {count} 簇 feel 已经成熟、可结晶{around}。"
+            "如果它们已从一时的感受沉淀成稳定的相处认知，按 feel_crystals(...) 选簇 → "
+            "review_feel_cluster(cluster_id) 逐批读全文 → commit_feel_crystal(...) 综合为一条"
+            " evolving_principle。这是提醒，不是必须——读两三批就停也行，未读的会作为锚点保留。"
+        )
 
     async def _feel_clusters(
         self,
@@ -1686,6 +1932,7 @@ class OBClient:
             bucket for bucket in await self.list_buckets(include_archive=False)
             if self._bucket_type(bucket.metadata) == "feel"
             and (include_crystallized or not bucket.metadata.get("crystallized"))
+            and not bucket.metadata.get("demoted")
         ]
         feels = self._filter_by_scope(feels, scope)
         embeddings = {bucket.id: self.embedding_store.get(bucket.id) for bucket in feels}
@@ -1727,12 +1974,28 @@ class OBClient:
                 if a in component and b in component
             ]
             avg = sum(sims) / len(sims) if sims else 0.0
+            # uniqueness = distance to cluster centroid (age-independent signal, I4).
+            # centroid = mean of member embeddings; uniqueness = 1 - cos(member, centroid).
+            member_ids = list(component)
+            dim = len(embeddings[member_ids[0]]) if member_ids else 0
+            centroid = [0.0] * dim
+            for bid in member_ids:
+                vec = embeddings[bid]
+                for i in range(dim):
+                    centroid[i] += float(vec[i])
+            if member_ids:
+                centroid = [c / len(member_ids) for c in centroid]
+            uniqueness = {
+                bid: round(1.0 - self._cosine_similarity(embeddings[bid], centroid), 4)
+                for bid in member_ids
+            }
             clusters.append({
                 "id": self._cluster_id(ordered),
                 "ids": ordered,
                 "avg_similarity": round(avg, 4),
                 "latest_created": str(by_id[ordered[0]].metadata.get("created") or "") if ordered else "",
                 "buckets": [by_id[bid] for bid in ordered],
+                "uniqueness": uniqueness,
             })
         clusters.sort(key=lambda item: (len(item["ids"]), item["latest_created"]), reverse=True)
         return clusters

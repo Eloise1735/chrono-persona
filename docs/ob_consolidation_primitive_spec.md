@@ -1,6 +1,6 @@
 # OB 记忆：统一整合原语 + 稳定层模型（规格 v2）
 
-> Status: **Phase 0 — 设计定稿（蓝图）**。本文件是后续 Phase 1–3 的实现依据。
+> Status: **Phase 1 + 2 已落地**。本文件是 Phase 1–4 的实现依据；§10 标注各阶段进度。
 > 不含可执行代码；定义字段语义、不变量、交互协议与每层参数。
 >
 > 已完成前置（PR #3，已合并）：
@@ -215,7 +215,10 @@ commit(job_id, cursor, synthesis, keep_ids=[], demote_ids=[])
 
 ## 10. 实现阶段（落地顺序）
 
-1. **Phase 1 — permanent 重定义**：引入 `role` 字段 + 回退推断 + 按 role 的注入/浮现分流 + web 面板 role 控件。修复"非 pinned 高分浮现""基础原则被挤出"等线上问题。
-2. **Phase 2 — 原语 on `feel → principle`**：迭代游标工具 + 锚点存储 + keep 晋升（anchor/standing）+ dream 轻提示。先验证原语。
+1. **Phase 1 — permanent 重定义**（✅ 已落地）：引入 `role` 字段 + 回退推断 + 按 role 的注入/浮现分流 + web 面板 role 控件。修复"非 pinned 高分浮现""基础原则被挤出"等线上问题。
+2. **Phase 2 — 原语 on `feel → principle`**（✅ 已落地）：迭代游标工具 + 锚点存储 + keep 晋升（anchor/standing）+ dream 轻提示。先验证原语。
+   - 工具：`review_feel_cluster(cluster_id, cursor)` 分批 6 条全文（uniqueness 降序）；`commit_feel_crystal(synthesis, anchor_ids, standing_ids, demote_ids, crystal_id)` 幂等 upsert。
+   - 源 feel **不再标 crystallized**：纯加法结晶 + anchor_refs 覆盖整簇，源靠 feel aging 自然淡出；`demote_ids` 退出浮现（score×0.1）仍可 recall；keep → moment 升 `anchor` / 共识升 `standing_invariant`。
+   - 旧 MCP `crystallize_feel` 工具已删除（web `/ob/crystallize-feel` 手动端点保留）；dream 末尾 `_dream_crystal_hint` 改为「有 N 簇成熟可结晶」并指向新流程。
 3. **Phase 3 — 同一原语 on `principle-review`**：合并/退役，全程 gated。必须 Phase 2 跑通后。
 4. **Phase 4 — resolve + 读取侧**（见 §9）。

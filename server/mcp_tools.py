@@ -24,7 +24,7 @@ OB startup protocol:
   Do not use dream() as the startup tool by default.
   Use dream() at conversation end or maintenance time. Dream only reads dynamic
   candidates; after dream, explicitly choose hold_feel(source_bucket=...),
-  resolve_bucket(...), or feel_crystals()/crystallize_feel(...).
+  resolve_bucket(...), or feel_crystals() → review_feel_cluster() → commit_feel_crystal().
   resolve_bucket means: the dynamic source event has been understood, sedimented,
   or rewritten, so it can stop occupying active dynamic emergence slots. It is not
   deletion or archive.
@@ -405,40 +405,6 @@ async def _schedule_items_response(plan) -> tuple[dict | None, list[dict]]:
     return payload, []
 
 
-async def _create_feel_crystal_key_record(
-    *,
-    mode: str,
-    content: str,
-    key_record_type: str = "",
-    key_record_title: str = "Feel crystal",
-    feel_ids: list[str] | None = None,
-    cluster_id: str = "",
-    include_all: bool = False,
-) -> dict:
-    if _state_machine is None:
-        raise RuntimeError("State machine is not initialized")
-    body = str(content or "").strip()
-    if not body:
-        raise ValueError("key_record_content is required for key_record crystallization")
-    normalized_type = str(key_record_type or "").strip()
-    return await _state_machine.upsert_key_record(
-        record_type=normalized_type if normalized_type and normalized_type.lower() != "auto" else None,
-        title=str(key_record_title or "Feel crystal").strip() or "Feel crystal",
-        content_text=body,
-        tags=["feel_crystal", "ob"],
-        content_json={
-            "source": "ob_feel_crystal",
-            "mode": mode,
-            "cluster_id": str(cluster_id or ""),
-            "feel_ids": feel_ids or [],
-            "include_all": bool(include_all),
-        },
-        source="ob_feel_crystal",
-        life_scope="character_life",
-        update_if_exists=True,
-    )
-
-
 @mcp.tool()
 async def get_current_state(current_time: str, last_interaction_time: str | None = None) -> str:
     """对话开始时调用。直接读取数据库里的最新状态快照与结构化上下文，不在请求期间生成新快照。
@@ -455,7 +421,7 @@ async def get_current_state(current_time: str, last_interaction_time: str | None
     Returns:
         可直接注入会话上下文的文本块，顺序为：近期 key_records -> pinned 稳定原则结晶。
         注意：在整个对话过程中，遇到任何与过往经历、事件、约定、人物相关的话题，
-        应主动调用 key_records 与 OB 工具（breath/dream/feel/hold/grow）——不要等对方开口询问。
+        应主动调用 key_records 与 OB 工具（breath/dream/hold_feel/hold/merge_buckets）——不要等对方开口询问。
     """
     if _state_machine is None:
         return "错误：状态机未初始化"
@@ -1056,8 +1022,9 @@ async def dream(limit: int = 10, scope: str = "relational") -> str:
     - hold_feel(content=..., source_bucket=...): sediment a dynamic event into feel.
     - resolve_bucket(bucket_id, reason=...): after the dynamic source event has been
       understood, sedimented, or rewritten, let it stop occupying active dynamic slots.
-    - feel_crystals()/crystallize_feel(...): handle repeated/similar feel clusters
-      (同样默认 scope="relational"，与 dream 对称)。
+    - feel_crystals() → review_feel_cluster() → commit_feel_crystal(): 把反复出现的相似
+      feel 簇逐批读全文、综合成一条 evolving_principle（同样默认 scope="relational"，与
+      dream 对称）。dream 末尾会提示「有 N 簇成熟可结晶」。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -1083,10 +1050,10 @@ async def feel_crystals(
       用于专门整理角色侧自身的感受沉淀。
     - scope="all"：旧行为，全部 feel 一起聚类。
 
-    limit is the number of clusters, not the number of feel items. If a cluster is
-    larger than max_items_per_cluster, use next_cursor / cluster_id + include_all
-    with crystallize_feel(...) so the full cluster is handled without losing hidden items.
-    crystallize_feel 必须传相同的 scope，才能在同一 scope 池里复原 cluster_id。
+    这是「选菜单」：列出已成熟、可结晶的 feel 簇（cluster_id / 大小 / 相似度 / 预览）。
+    limit 是簇数，不是 feel 条数。选定某簇后，用 review_feel_cluster(cluster_id, ...)
+    分批读全文、逐轮精修综合，再用 commit_feel_crystal(...) 落成一条 evolving_principle。
+    review/commit 必须传与本次相同的 scope，才能在同一 scope 池里复原 cluster_id。
     """
     if _ob_client is None:
         return _ob_unavailable()
@@ -1102,91 +1069,83 @@ async def feel_crystals(
 
 
 @mcp.tool()
-async def crystallize_feel(
-    mode: str,
-    principle_content: str = "",
-    principle_title: str = "",
-    principle_card_json: str = "",
-    principle_injection: str = "",
-    key_record_content: str = "",
-    feel_content: str = "",
-    key_record_type: str = "auto",
-    key_record_title: str = "Feel crystal",
-    domain: list[str] | None = None,
-    feel_ids: list[str] | None = None,
-    cluster_id: str = "",
-    include_all: bool = False,
-    cursor_snapshot: str = "",
+async def review_feel_cluster(
+    cluster_id: str,
+    cursor: str = "",
+    batch_size: int = 6,
+    min_cluster_size: int = 3,
+    min_similarity: float = 0.7,
     scope: str = "relational",
 ) -> str:
-    """Crystallize repeated feel into one of four destinations.
+    """逐批阅读一个 feel 簇的全文，用于结晶前的综合（整合原语·review 步）。
 
-    mode="principle" creates an OB permanent bucket with pinned=True and protected=False.
-    mode="thread" writes a key_record and marks source feels crystallized.
-    mode="both" writes both an OB principle and a key_record.
-    mode="feel" condenses many feel entries into one ordinary feel.
-    This is distinct from hold_feel: hold_feel records immediate sediment, while
-    crystallize_feel turns repeated sediments into stable growth.
+    每批返回最多 batch_size 条**完整正文**（不截断），按 uniqueness 降序——先看最
+    独特的离群项，模式骨架早定。每条附 arousal / importance / uniqueness / source_dynamic
+    等年龄无关信号，供你判断哪些是不可还原的 moment、哪些是冗余。
 
-    【scope 三态，默认 relational，仅影响 cluster_id+include_all 路径】
-    - scope="relational" (默认)：在关系侧 feel 池里复原 cluster_id。
-    - scope="character"：在角色侧 feel 池里复原 cluster_id。
-    - scope="all"：在全量 feel 池里复原。
-    必须与上游 feel_crystals(...) 调用的 scope 保持一致，否则 cluster_id 找不到。
-    显式传 feel_ids 不受 scope 影响（信任调用者的 ID 列表）。
+    用法：feel_crystals() 选簇 → review_feel_cluster(cluster_id) 读第一批 → 若 has_more，
+    用 next_cursor 续读 → 在你自己的上下文里逐轮精修综合 → commit_feel_crystal(...) 落地。
+    预算友好：读两三批就停也行，未读条目仍作为锚点保留、可 recall，绝不丢失。
+    scope 必须与 feel_crystals 一致，才能复原同一 cluster_id。
     """
     if _ob_client is None:
         return _ob_unavailable()
-    normalized_mode = str(mode or "").strip().lower()
+    result = await _ob_client.review_feel_cluster(
+        cluster_id=cluster_id,
+        cursor=cursor,
+        batch_size=batch_size,
+        min_cluster_size=min_cluster_size,
+        min_similarity=min_similarity,
+        scope=scope,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def commit_feel_crystal(
+    synthesis: str,
+    cluster_id: str = "",
+    title: str = "",
+    domain: list[str] | None = None,
+    anchor_ids: list[str] | None = None,
+    standing_ids: list[str] | None = None,
+    demote_ids: list[str] | None = None,
+    source_ids: list[str] | None = None,
+    crystal_id: str = "",
+    scope: str = "relational",
+) -> str:
+    """把一个 feel 簇综合成一条 evolving_principle（整合原语·commit 步），幂等可多轮精修。
+
+    synthesis 是你逐批阅读后写的那段关系模式综合，会成为这条 permanent /
+    role=evolving_principle 结晶的正文。这是**纯加法**：
+    - 整簇全部成员（含你没读的批）作为 anchor_refs 指针保留，源 feel 不会被标 crystallized，
+      它们继续在自己的衰减轨道上自然淡出——不再「喂 5 条就埋整簇」。
+    - anchor_ids：判定为不可还原的珍贵 moment → 提升为 role=anchor（永不淡出、仅 recall）。
+    - standing_ids：判定为持续成立的边界/共识 → 提升为 standing_invariant（始终注入）。
+    - demote_ids（默认空）：判定冗余的 feel → 退出自动浮现，但仍可 recall，绝不删除。
+
+    多轮精修：把上一次返回的 crystal_id 传回来，就会覆盖更新同一条结晶（后台无状态，
+    状态在结晶本体 + cursor）。不传 crystal_id 时按 cluster_id+scope 确定性去重。
+    至少要能定位整簇：传 cluster_id（推荐）或显式 source_ids 之一。scope 须与上游一致。
+    """
+    if _ob_client is None:
+        return _ob_unavailable()
     try:
-        principle_card = None
-        if str(principle_card_json or "").strip():
-            parsed_card = json.loads(principle_card_json)
-            if not isinstance(parsed_card, dict):
-                return "错误：principle_card_json 必须是 JSON object"
-            principle_card = parsed_card
-        key_record_result = None
-        extra_targets: list[str] = []
-        if normalized_mode in {"thread", "both"}:
-            key_record_result = await _create_feel_crystal_key_record(
-                mode=normalized_mode,
-                content=key_record_content or principle_injection or principle_content or feel_content,
-                key_record_type=key_record_type,
-                key_record_title=key_record_title,
-                feel_ids=feel_ids or [],
-                cluster_id=cluster_id,
-                include_all=include_all,
-            )
-            record = (key_record_result or {}).get("record") or {}
-            if record.get("id") is not None:
-                extra_targets.append(f"key_record:{record.get('id')}")
-        ob_result = await _ob_client.crystallize_feel(
-            mode=normalized_mode,
-            principle_content=principle_content,
-            principle_title=principle_title,
-            principle_card=principle_card,
-            principle_injection=principle_injection,
-            feel_content=feel_content,
-            domain=domain or ["core"],
-            feel_ids=feel_ids or [],
+        result = await _ob_client.commit_feel_crystal(
+            synthesis=synthesis,
             cluster_id=cluster_id,
-            include_all=include_all,
-            extra_targets=extra_targets,
+            title=title,
+            domain=domain,
+            anchor_ids=anchor_ids or [],
+            standing_ids=standing_ids or [],
+            demote_ids=demote_ids or [],
+            source_ids=source_ids or [],
+            crystal_id=crystal_id,
             scope=scope,
         )
-    except json.JSONDecodeError as exc:
-        return f"错误：principle_card_json 不是有效 JSON：{exc}"
     except ValueError as exc:
         return f"错误：{exc}"
-    return json.dumps(
-        {
-            "ob": ob_result,
-            "key_record": key_record_result,
-            "cursor_snapshot": cursor_snapshot,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
