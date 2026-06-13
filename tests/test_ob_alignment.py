@@ -1442,7 +1442,7 @@ def test_dream_excludes_resolved_digested_feel_and_archived():
         assert ids == [keep_id]
         assert "hold_feel" in result["text"]
         assert "resolve_bucket" in result["text"]
-        assert "crystallize_feel" in result["text"]
+        assert "commit_feel_crystal" in result["text"]
         assert resolved_id not in ids
         assert digested_id not in ids
         assert feel_id not in ids
@@ -2073,3 +2073,207 @@ def test_crystallize_feel_cluster_lookup_respects_scope():
             assert not char_feel.metadata.get("crystallized")
 
     run(scenario())
+
+
+# --- Phase 2: feel -> principle consolidation primitive ---------------------
+
+
+async def _seven_feel_cluster(name: str):
+    """Build a client with one 7-member relational feel cluster + embeddings."""
+    client = await _client(name)
+    ids = []
+    for idx in range(7):
+        ids.append(await client.hold(
+            f"我又一次感到被理解 variant {idx}",
+            bucket_type="feel",
+            domain=["relationship"],
+            created=f"2026-01-0{idx + 1}T00:00:00",
+            extra_metadata={"source_bucket": f"d_{idx}", "arousal": 0.3 + idx * 0.05},
+        ))
+    # Six near-identical vectors + one mild outlier (highest uniqueness).
+    vectors = {
+        ids[0]: [1.0, 0.00, 0.0],
+        ids[1]: [0.99, 0.01, 0.0],
+        ids[2]: [0.985, 0.02, 0.0],
+        ids[3]: [0.98, 0.03, 0.0],
+        ids[4]: [0.975, 0.04, 0.0],
+        ids[5]: [0.97, 0.05, 0.0],
+        ids[6]: [0.90, 0.20, 0.0],  # outlier -> max uniqueness
+    }
+    client.set_embedding_store(FakeEmbeddingStore(vectors))
+    return client, ids
+
+
+def test_review_feel_cluster_batches_full_text_by_uniqueness():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("review_batch")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        first = await client.review_feel_cluster(
+            cluster_id=cluster_id, batch_size=6, min_cluster_size=3, min_similarity=0.8,
+        )
+        # Whole cluster visible as total; only 6 full-text items in the batch.
+        assert first["total"] == 7
+        assert first["size"] == 6
+        assert first["has_more"] is True
+        assert first["degraded"] is False
+        # Full text is not truncated and the outlier (max uniqueness) comes first.
+        assert first["items"][0]["id"] == ids[6]
+        assert first["items"][0]["full_text"].startswith("我又一次感到被理解")
+        assert first["items"][0]["source_dynamic"] == "d_6"
+        assert first["items"][0]["uniqueness"] >= first["items"][1]["uniqueness"]
+
+        second = await client.review_feel_cluster(
+            cluster_id=cluster_id, cursor=first["next_cursor"],
+            batch_size=6, min_cluster_size=3, min_similarity=0.8,
+        )
+        assert second["size"] == 1
+        assert second["has_more"] is False
+
+    run(scenario())
+
+
+def test_commit_feel_crystal_keeps_whole_cluster_as_anchor_refs():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("commit_anchor_refs")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        result = await client.commit_feel_crystal(
+            synthesis="我们之间反复出现的模式：被理解后我会卸下防备。",
+            cluster_id=cluster_id,
+            title="相处模式·被理解",
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        assert result["updated"] is False
+        assert result["source_count"] == 7
+        # anchor_refs cover the WHOLE cluster, including unread items (I2).
+        assert result["anchor_refs_count"] == 7
+
+        crystal = await client.get(result["crystal_bucket_id"])
+        assert crystal.metadata["type"] == "permanent"
+        assert crystal.metadata["role"] == "evolving_principle"
+        assert len(crystal.metadata["anchor_refs"]) == 7
+        assert set(crystal.metadata["source_ids"]) == set(ids)
+        assert crystal.metadata["principle_pattern"].startswith("我们之间反复出现")
+
+        # Source feels are NOT crystallized — they age on their own track.
+        for fid in ids:
+            src = await client.get(fid)
+            assert src.metadata["type"] == "feel"
+            assert not src.metadata.get("crystallized")
+
+    run(scenario())
+
+
+def test_commit_feel_crystal_promotes_keep_and_demotes_redundant():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("commit_keep_demote")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        result = await client.commit_feel_crystal(
+            synthesis="模式综合。",
+            cluster_id=cluster_id,
+            anchor_ids=[ids[6]],       # irreplaceable moment -> anchor
+            standing_ids=[ids[0]],     # durable consensus -> standing_invariant
+            demote_ids=[ids[1], ids[2]],  # redundant -> exit surfacing
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        assert result["promoted_to_anchor"] == [ids[6]]
+        assert result["promoted_to_standing"] == [ids[0]]
+        assert set(result["demoted"]) == {ids[1], ids[2]}
+
+        anchor = await client.get(ids[6])
+        assert anchor.metadata["type"] == "permanent"
+        assert anchor.metadata["role"] == "anchor"
+        standing = await client.get(ids[0])
+        assert standing.metadata["type"] == "permanent"
+        assert standing.metadata["role"] == "standing_invariant"
+
+        # Demoted feels stay as feel, flagged demoted, still recallable (not deleted).
+        for fid in (ids[1], ids[2]):
+            d = await client.get(fid)
+            assert d.metadata["type"] == "feel"
+            assert d.metadata["demoted"] is True
+            # Demoted feels sink in score but are not zero (recall still works).
+            assert client.calculate_score(d.metadata) < client.calculate_score(
+                {"type": "feel", "created": d.metadata["created"], "last_active": d.metadata["created"]}
+            )
+
+    run(scenario())
+
+
+def test_commit_feel_crystal_is_idempotent_via_crystal_id():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("commit_idempotent")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+
+        first = await client.commit_feel_crystal(
+            synthesis="第一版综合。", cluster_id=cluster_id,
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        second = await client.commit_feel_crystal(
+            synthesis="第二版·精修后的综合。",
+            crystal_id=first["crystal_id"], source_ids=ids,
+        )
+        assert second["updated"] is True
+        assert second["crystal_bucket_id"] == first["crystal_bucket_id"]
+
+        # Only one crystal bucket exists; content reflects the latest synthesis.
+        permanents = [
+            b for b in await client.list_buckets()
+            if b.metadata.get("crystal_id") == first["crystal_id"]
+        ]
+        assert len(permanents) == 1
+        assert permanents[0].metadata["principle_pattern"] == "第二版·精修后的综合。"
+
+    run(scenario())
+
+
+def test_review_feel_cluster_degraded_without_embeddings():
+    async def scenario():
+        client = await _client("review_degraded")
+        for idx in range(4):
+            await client.hold(
+                f"feel {idx}", bucket_type="feel", domain=["relationship"],
+                created=f"2026-01-0{idx + 1}T00:00:00",
+            )
+        # No embedding store set -> clustering returns nothing, review degrades.
+        out = await client.review_feel_cluster(cluster_id="nonexistent")
+        assert out["items"] == []
+        assert out["degraded"] is True
+        assert "error" in out
+
+    run(scenario())
+
+
+def test_dream_crystal_hint_counts_mature_clusters():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("dream_hint")
+        result = await client.dream(scope="relational")
+        assert "结晶提示" in result["crystal_hint"]
+        assert "1 簇" in result["crystal_hint"]
+        assert "commit_feel_crystal" in result["crystal_hint"]
+
+    run(scenario())
+
+
+def test_demoted_feel_excluded_from_clusters():
+    async def scenario():
+        client, ids = await _seven_feel_cluster("demoted_excluded")
+        page = await client.feel_crystals(limit=1, min_cluster_size=3, min_similarity=0.8)
+        cluster_id = page["clusters"][0]["cluster_id"]
+        await client.commit_feel_crystal(
+            synthesis="综合。", cluster_id=cluster_id,
+            demote_ids=[ids[1], ids[2], ids[3], ids[4], ids[5]],
+            min_cluster_size=3, min_similarity=0.8,
+        )
+        # After demoting 5 of 7, only 2 active feels remain -> below min_cluster_size.
+        page2 = await client.feel_crystals(limit=5, min_cluster_size=3, min_similarity=0.8)
+        assert page2["total_clusters"] == 0
+
+    run(scenario())
+
