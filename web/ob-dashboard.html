@@ -693,6 +693,7 @@
           </div>
           <div class="ob-meta">${pills}</div>
           <div class="ob-meta">imp ${esc(meta.importance ?? '')} · v ${esc(meta.valence ?? '')} · a ${esc(meta.arousal ?? '')} · score ${esc(item.score ?? '')}</div>
+          ${item.feel_decay ? `<div class="ob-meta">衰减 λ ${esc(item.feel_decay.effective_lambda)} · 半衰期 ${esc(item.feel_decay.half_life_days)}d · 归档约 ${esc(item.feel_decay.archive_days)}d</div>` : ''}
           <div class="ob-meta">${esc(meta.last_active || meta.created || '')}</div>
           <div class="ob-content">${esc(item.content || '')}</div>
         </article>

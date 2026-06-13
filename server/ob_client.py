@@ -80,11 +80,26 @@ class OBClient:
         # feel aging: feel used to be a flat 50 plateau that never decayed nor
         # archived (a pure write-only leak). It now decays gently from 50 so
         # that genuinely old, un-recalled feel eventually drops below the decay
-        # archive threshold. Half-life ≈ 17 days; an uncrystallized feel reaches
-        # the 0.3 archive line around ~128 days, a crystallized one (×0.1) around
-        # ~70 days — both well past the 7-day crystallized protection window, so
-        # surfacing is unaffected (breath sets feel score to 50 at selection).
+        # archive threshold.
+        #
+        # Unlike dynamic (whose decay also drives surfacing priority and so
+        # carries importance/activation/resolved shaping), feel decay governs
+        # ONLY archival lifecycle — surfacing sets feel score to 50 at selection.
+        # So feel keeps a deliberately minimal curve and borrows exactly one
+        # mechanism from dynamic that fits: emotional weighting. Feelings fade by
+        # intensity (a deep moment lingers; a mild one washes out), independent
+        # of whether their source event was resolved — a different forgetting law
+        # than events, which fade by closure.
+        #
+        # effective_λ = base_λ · (1 − k·arousal), k=0.6. Half-life and archive
+        # point (0.3 line, from the 50 plateau):
+        #   arousal 0.0 → λ 0.040, t½ ≈ 17d, archive ≈ 128d
+        #   arousal 0.3 → λ 0.033, t½ ≈ 21d, archive ≈ 155d
+        #   arousal 0.9 → λ 0.018, t½ ≈ 38d, archive ≈ 277d (~9 months)
+        # k<1 guarantees λ>0, so a deep mark lingers far longer but is never
+        # immortal (that is what permanent is for).
         self.feel_decay_lambda = 0.04
+        self.feel_decay_arousal_k = 0.6
         # Merge SUGGESTIONS on hold(): the backend never merges on its own — it
         # only surfaces recent similar same-type buckets as candidates and lets
         # the frontend model decide (and call merge_buckets explicitly). The
@@ -1055,6 +1070,7 @@ class OBClient:
         min_similarity: float = 0.7,
         cursor: str = "",
         include_crystallized: bool = False,
+        include_settled: bool = False,
         scope: str = "relational",
     ) -> dict[str, Any]:
         limit = max(1, min(20, int(limit or 3)))
@@ -1069,6 +1085,14 @@ class OBClient:
             include_crystallized=include_crystallized,
             scope=normalized_scope,
         )
+        # By default only surface clusters with enough fresh (un-crystallized)
+        # material; already-covered ("settled") clusters stay quiet. Pass
+        # include_settled=True to re-pull a covered cluster for re-review.
+        if not include_settled:
+            clusters = [
+                c for c in clusters
+                if int(c.get("unsettled_count", len(c.get("ids") or []))) >= min_size
+            ]
         page = clusters[offset : offset + limit]
         formatted = [
             self._format_feel_cluster(cluster, max_items_per_cluster=max_items)
@@ -1085,6 +1109,7 @@ class OBClient:
             "min_cluster_size": min_size,
             "min_similarity": threshold,
             "include_crystallized": bool(include_crystallized),
+            "include_settled": bool(include_settled),
             "scope": normalized_scope,
             "cursor": str(offset) if offset else "",
             "cursor_snapshot": str(offset) if offset else "",
@@ -1293,10 +1318,22 @@ class OBClient:
             })
         now = datetime.utcnow().isoformat()
         if not crystal_id:
-            basis = cluster.get("id") if cluster else (member_ids[0] if member_ids else uuid.uuid4().hex[:12])
-            crystal_id = "fc_" + hashlib.sha1(
-                f"{basis}|{normalized_scope}".encode("utf-8")
-            ).hexdigest()[:12]
+            # Re-surface case: if this cluster's members already carry a back-ref
+            # to a crystal (a prior commit folded them in), reuse it so growing
+            # the cluster updates the SAME evolving_principle instead of spawning
+            # a duplicate. Otherwise derive a deterministic id from the cluster.
+            prior_counts: dict[str, int] = {}
+            for bucket in members:
+                ref = str((bucket.metadata or {}).get("consolidated_into") or "").strip()
+                if ref:
+                    prior_counts[ref] = prior_counts.get(ref, 0) + 1
+            if prior_counts:
+                crystal_id = max(prior_counts.items(), key=lambda kv: kv[1])[0]
+            else:
+                basis = cluster.get("id") if cluster else (member_ids[0] if member_ids else uuid.uuid4().hex[:12])
+                crystal_id = "fc_" + hashlib.sha1(
+                    f"{basis}|{normalized_scope}".encode("utf-8")
+                ).hexdigest()[:12]
         existing = await self._find_crystal_bucket(crystal_id)
         extra = {
             "source_kind": "feel_crystal",
@@ -1370,10 +1407,35 @@ class OBClient:
             await self.update(
                 bucket.id,
                 demoted=True,
-                consolidated_into=crystal_bucket_id,
+                consolidated_into=crystal_id,
+                consolidated_at=now,
                 demoted_at=now,
             )
             demoted_ids.append(bucket.id)
+
+        # Fourth state — "reviewed, kept as-is": stamp every remaining source feel
+        # with a back-ref to this crystal. It stays a normal feel (recallable, can
+        # re-cluster), but the cluster goes quiet in the dream hint / menu until
+        # enough genuinely NEW (un-stamped) feels accumulate on the same theme —
+        # then it re-surfaces and folds back into the SAME crystal (via the id
+        # reuse above). This stops the nightly re-nag without burying anything.
+        # Vetoed items still count as "considered" (they get the settled stamp
+        # below) so a deep mark does not keep the cluster nagging forever; the
+        # veto is reported in the return for the model to act on next round.
+        handled = promoted_set | set(demoted_ids)
+        settled_ids: list[str] = []
+        for bucket in members:
+            if bucket.id in handled:
+                continue
+            current = await self.get(bucket.id)
+            if not current or self._bucket_type(current.metadata) != "feel":
+                continue
+            await self.update(
+                bucket.id,
+                consolidated_into=crystal_id,
+                consolidated_at=now,
+            )
+            settled_ids.append(bucket.id)
 
         return {
             "crystal_id": crystal_id,
@@ -1386,6 +1448,7 @@ class OBClient:
             "promoted_to_standing": promoted_standing,
             "demoted": demoted_ids,
             "demote_vetoed": demote_vetoed,
+            "settled": settled_ids,
             "scope": normalized_scope,
         }
 
@@ -1763,16 +1826,38 @@ class OBClient:
         out: list[dict[str, Any]] = []
         for bucket in buckets:
             meta = dict(bucket.metadata)
-            out.append(
-                {
-                    "id": bucket.id,
-                    "score": bucket.score,
-                    "content": bucket.content,
-                    "metadata": meta,
-                    "path": bucket.path,
-                }
-            )
+            row: dict[str, Any] = {
+                "id": bucket.id,
+                "score": bucket.score,
+                "content": bucket.content,
+                "metadata": meta,
+                "path": bucket.path,
+            }
+            if self._bucket_type(meta) == "feel":
+                # Dashboard diagnostic: how arousal stretches this feel's lifespan.
+                row["feel_decay"] = self.feel_decay_diagnostic(meta)
+            out.append(row)
         return out
+
+    def feel_decay_diagnostic(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Per-feel aging readout for the dashboard: how arousal-weighted decay
+        stretches this feel's half-life and archive horizon."""
+        arousal = self._clamp_float(metadata.get("arousal"), 0.0, 1.0, 0.3)
+        eff = float(self.feel_decay_lambda) * (1.0 - float(self.feel_decay_arousal_k) * arousal)
+        mult = 1.0
+        if metadata.get("crystallized"):
+            mult *= 0.1
+        if metadata.get("demoted"):
+            mult *= 0.1
+        base = 50.0 * mult
+        half_life = (math.log(2.0) / eff) if eff > 0 else None
+        archive_days = (math.log(base / 0.3) / eff) if (eff > 0 and base > 0.3) else None
+        return {
+            "arousal": round(arousal, 3),
+            "effective_lambda": round(eff, 5),
+            "half_life_days": round(half_life, 1) if half_life is not None else None,
+            "archive_days": round(archive_days, 1) if archive_days is not None else None,
+        }
 
     def calculate_score(self, metadata: dict[str, Any]) -> float:
         if not isinstance(metadata, dict):
@@ -1789,8 +1874,13 @@ class OBClient:
             # background decay/archive lifecycle — it does NOT change which feel
             # surfaces. Crystallized feel sinks faster (its essence has been
             # captured into a principle/key_record).
+            #
+            # Emotional weighting (the one mechanism borrowed from dynamic):
+            # intense feelings decay slower. effective_λ = base_λ·(1−k·arousal).
             days_since = self._days_since(metadata.get("last_active") or metadata.get("created"), datetime.utcnow())
-            feel_score = 50.0 * math.exp(-float(self.feel_decay_lambda) * days_since)
+            arousal = self._clamp_float(metadata.get("arousal"), 0.0, 1.0, 0.3)
+            effective_lambda = float(self.feel_decay_lambda) * (1.0 - float(self.feel_decay_arousal_k) * arousal)
+            feel_score = 50.0 * math.exp(-effective_lambda * days_since)
             if metadata.get("crystallized"):
                 feel_score *= 0.1
             # Demoted feels (a crystal judged them redundant) sink out of
@@ -1964,19 +2054,24 @@ class OBClient:
         """
         if self.embedding_store is None:
             return ""
+        min_size = 3
         try:
             clusters = await self._feel_clusters(
-                min_cluster_size=3,
+                min_cluster_size=min_size,
                 min_similarity=0.7,
                 scope=scope,
             )
         except Exception:
             logger.exception("OB dream crystal hint failed")
             return ""
-        if not clusters:
+        # Only nag about clusters with enough fresh, un-crystallized material —
+        # already-covered clusters stay quiet until new feels pile up (the
+        # "settled" fourth state). This stops the same cluster re-nagging nightly.
+        ready = [c for c in clusters if int(c.get("unsettled_count", len(c.get("ids") or []))) >= min_size]
+        if not ready:
             return ""
-        count = len(clusters)
-        largest = max(clusters, key=lambda c: len(c.get("ids") or []))
+        count = len(ready)
+        largest = max(ready, key=lambda c: len(c.get("ids") or []))
         preview = ""
         sample = largest.get("buckets") or []
         if sample:
@@ -2130,6 +2225,13 @@ class OBClient:
             bid: round(1.0 - self._cosine_similarity(embeddings[bid], centroid), 4)
             for bid in member_ids
         }
+        # "unsettled" = members not yet folded into any crystal. A cluster is
+        # only "ready" (surfaced in hint/menu) when it has enough fresh material;
+        # an already-covered cluster stays quiet until new feels accumulate.
+        unsettled = [
+            bid for bid in member_ids
+            if not str((by_id[bid].metadata or {}).get("consolidated_into") or "").strip()
+        ]
         return {
             "id": self._cluster_id(ordered),
             "ids": ordered,
@@ -2137,6 +2239,7 @@ class OBClient:
             "latest_created": str(by_id[ordered[0]].metadata.get("created") or "") if ordered else "",
             "buckets": [by_id[bid] for bid in ordered],
             "uniqueness": uniqueness,
+            "unsettled_count": len(unsettled),
         }
 
     async def _get_feel_cluster_by_id(
@@ -2179,6 +2282,8 @@ class OBClient:
             "hidden_count": max(0, len(buckets) - len(shown)),
             "has_more": len(buckets) > len(shown),
             "avg_similarity": cluster.get("avg_similarity", 0.0),
+            "unsettled_count": int(cluster.get("unsettled_count", len(buckets))),
+            "settled": int(cluster.get("unsettled_count", len(buckets))) == 0,
             "excerpts": excerpts,
             "items": excerpts,
             "suggested_core": preview,
