@@ -233,9 +233,37 @@ def _compact_schedule_plan(plan: dict | None) -> dict | None:
     }
 
 
+_SCHEDULE_ITEM_KEEP = ("id", "hour_start", "hour_end", "activity", "status")
+
+
 def _compact_schedule_items(items: list[dict]) -> list[dict]:
-    """Prune null/empty fields from schedule items (model_dump emits many)."""
-    return [{k: v for k, v in (it or {}).items() if v not in (None, "", [], {})} for it in (items or [])]
+    """Compact a day's schedule for the init read: the character needs time +
+    activity + status, plus a one-line objective and step progress. The heavy
+    action_payload scaffolding (progress_outline / dominant_mode / constraint_*
+    / flexibility / failure_cost / closure_condition / source_* …) is planning
+    machinery — it lives in the DB and breath_personal, not in every init.
+    """
+    out: list[dict] = []
+    for it in items or []:
+        it = it or {}
+        ap = it.get("action_payload")
+        ap = ap if isinstance(ap, dict) else {}
+        row: dict = {k: it.get(k) for k in _SCHEDULE_ITEM_KEEP}
+        objective = ap.get("intended_objective") or ap.get("objective")
+        if objective:
+            row["objective"] = objective
+        cur, exp, ps = ap.get("current_step"), ap.get("expected_steps"), ap.get("progress_status")
+        progress = []
+        if cur is not None and exp is not None:
+            progress.append(f"{cur}/{exp}")
+        if ps:
+            progress.append(str(ps))
+        if progress:
+            row["progress"] = " ".join(progress)
+        if ap.get("thread_id"):
+            row["thread_id"] = ap.get("thread_id")
+        out.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
+    return out
 
 
 def _log_inject_size(block: str, text: str) -> None:
