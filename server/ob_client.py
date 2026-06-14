@@ -134,6 +134,13 @@ class OBClient:
         self.recall_vector_min = 0.50       # 向量语义最低门槛
         self.recall_time_nudge = 5.0        # 新近度只做小幅微调（远小于相关性的 ×100）
         self.recall_importance_nudge = 3.0  # 重要性只做小幅微调
+        # 混合检索一致性加成：向量与关键词**双通道都命中**时，按关键词相关性额外加分。
+        # 取代旧的 max(关键词, 向量) 纯择高——max 让"只命中向量"的近义干扰能压过
+        # "既语义相关又字面对得上"的真目标。加成奖励双通道一致性：真目标通常两边都中，
+        # 干扰项往往只中一边，于是真目标被抬到干扰项之上（思想同 RRF 倒数排名融合）。
+        self.recall_agreement_bonus = 100.0
+        # Q2 正文覆盖率保底：关键词只在正文命中时（被字段加权稀释到接近 0）的补偿权重。
+        self.recall_content_coverage_bonus = 0.3
         # feel 可被内容召回（Fix 1）：feel 默认隔离在浮现/查询之外，但"回想某个特定旧感受"
         # 是真实意图。于是 query 召回给 feel 保留至多 N 个槽位（自动、无需模型显式开关），
         # 且 feel 召回为只读（不 touch、不改 last_active、不进衰减时钟）——零干扰其生命周期。
@@ -1195,6 +1202,8 @@ class OBClient:
             score = self._search_score(bucket, query, None, None, now)
             if vsim >= float(self.recall_vector_min):
                 score = max(score, vsim * 100.0)
+                if topic >= float(self.recall_topic_min):
+                    score += topic * float(self.recall_agreement_bonus)
             score *= self.ANCHOR_RECALL_BOOST  # anchor 是珍贵记忆：相关时小幅加权
             scored.append((score, relevance01, bucket))
         scored.sort(key=lambda t: t[0], reverse=True)
@@ -1393,7 +1402,10 @@ class OBClient:
                 continue
             score = self._search_score(bucket, query, valence, arousal, now)
             if vsim >= float(self.recall_vector_min):
+                # 混合融合：向量为主，双通道都命中再加关键词一致性加成（取代纯 max）。
                 score = max(score, vsim * 100.0)
+                if topic >= float(self.recall_topic_min):
+                    score += topic * float(self.recall_agreement_bonus)
             # anchors are privileged precious memories: when relevant they should
             # surface MORE readily, not less — keyword recall is a kept channel,
             # the album index is just an extra direct lane (the two coexist).
@@ -3005,7 +3017,17 @@ class OBClient:
             token_hits = sum(1 for token in tokens if token in t)
             token_score = token_hits / max(1, len(tokens))
             score += max(direct, ratio, token_score) * weight
-        return score / total_weight if total_weight else 0.0
+        weighted = score / total_weight if total_weight else 0.0
+        # Q2 全字段 token 覆盖率：标题/标签命中走上面的加权（更精准、分更高）；但若关键词
+        # 只落在正文（weight=1，被 /8.5 稀释到接近 0），这里给一个**不被字段权重稀释**的
+        # 覆盖率保底分——"这些词到底在不在这条记忆里"。两者相加，正文命中不再被埋。
+        if tokens:
+            uniq = set(tokens)
+            haystack = " ".join(text.lower() for text, _ in chunks)
+            covered = sum(1 for tk in uniq if tk in haystack) / len(uniq)
+        else:
+            covered = 0.0
+        return min(1.0, weighted + covered * float(self.recall_content_coverage_bonus))
 
     @staticmethod
     def _emotion_score(valence: float | None, arousal: float | None, meta: dict[str, Any]) -> float:
