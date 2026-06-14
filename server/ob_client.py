@@ -1249,6 +1249,7 @@ class OBClient:
         title: str = "",
         domain: list[str] | None = None,
         principle_injection: str = "",
+        preserve_as_anchor_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create ONE new merged standing_invariant absorbing several originals,
         then retire those originals to type=dynamic (auto-decay, still recallable).
@@ -1285,10 +1286,40 @@ class OBClient:
                 "principle_injection": str(principle_injection or "").strip(),
             },
         )
+        preserve_ids = list(dict.fromkeys(
+            self._safe_id(x) for x in (preserve_as_anchor_ids or []) if str(x or "").strip()
+        ))
+        # Sources carrying irreplaceable detail are PRESERVED as anchors
+        # (recall-only, never decays). Critical now that standing keeps only a
+        # concise rule: the rich derivation / core event must survive somewhere,
+        # not be lost to a decaying dynamic.
+        preserved: list[str] = []
+        for aid in preserve_ids:
+            bucket = await self.get(aid)
+            if bucket and aid != new_id and self._bucket_type(bucket.metadata) == "permanent":
+                await self.update(
+                    aid,
+                    role=self.ROLE_ANCHOR,
+                    pinned=False,
+                    protected=False,
+                    converted_from="standing_merge",
+                    converted_into=new_id,
+                    converted_at=now,
+                )
+                preserved.append(aid)
+        # Pure duplicates (no unique detail) retire to dynamic and fade. Honor the
+        # explicitly-named ids for ANY permanent source — not just role==standing.
+        # The old role==standing guard silently skipped legacy-pinned sources
+        # (effective_role fell back to evolving), which is why earlier merges
+        # created the new bucket but never actually retired the originals.
         retired: list[str] = []
+        skipped: list[str] = []
+        preserve_set = set(preserved)
         for rid in retired_ids:
+            if rid in preserve_set:
+                continue
             bucket = await self.get(rid)
-            if bucket and self.effective_role(bucket.metadata) == self.ROLE_STANDING:
+            if bucket and rid != new_id and self._bucket_type(bucket.metadata) == "permanent":
                 await self.update(
                     rid,
                     type="dynamic",
@@ -1301,10 +1332,14 @@ class OBClient:
                     retired_at=now,
                 )
                 retired.append(rid)
+            else:
+                skipped.append(rid)
         return {
             "new_standing_id": new_id,
             "retired": retired,
             "retired_count": len(retired),
+            "preserved_as_anchor": preserved,
+            "skipped": skipped,
         }
 
     async def _query_breath(

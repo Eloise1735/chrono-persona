@@ -1342,39 +1342,42 @@ async def review_standing() -> str:
 async def commit_standing_merge(
     merged_content: str,
     retired_ids: list[str],
-    principle_injection: str,
+    preserve_as_anchor_ids: list[str] | None = None,
+    principle_injection: str = "",
     title: str = "",
     domain: list[str] | None = None,
     user_confirmed: bool = False,
 ) -> str:
-    """把若干条重叠的「长期准则」合并成一条新准则，原条目退役为 dynamic 自然衰减。
+    """把若干条重叠的「长期准则」合并成一条新准则，原条目退役。
 
     这是**最重的一步、必须与用户确认**：合并的是必须守住的硬规则，有损合并会丢掉边界。
-    所以：
-    - merged_content 必须是你**读完全部 standing 后**亲自写的、把可合并几条忠实糅合的新正文
-      （不能漏掉任何一条的约束力）。retired_ids 是被这条吸收的原条目 id。
-    - **principle_injection（必填）**：这条准则的**一句话忠实精华**，每轮都会被注入上下文
-      （get_current_state 优先注入它、而非全文）。它就是角色每次真正看到的那句——**必须承载
-      规则的完整约束力，漏掉一条子句 = 角色可能违反那条边界**。尽量浓缩原文核心、不丢约束。
-    - **只有在用户明确同意这次合并后**，才设 user_confirmed=True 调用；否则先把你的合并方案
-      （新正文 + 这句注入摘要 + 将退役的原条目）讲给用户、等确认。未确认会被拒绝。
-    - 退役的原条目不删除：转为普通 dynamic（带 retired_from=standing 标记）自然衰减、仍可
-      recall。不能合并的条目不要放进 retired_ids，它们保持 standing 不变。
-    一次只合并一组；多组分多次调用。新建/改写任何 standing 时都应配一句 principle_injection。
+    - merged_content：你**读完全部 standing 后**亲自写的新正文。standing 走"**单一精简正文**"
+      路线——一条 invariant 本质就短，请**一次写到位、控制在 ~300 字内**（准则本身即注入内容，
+      不能漏任何一条的约束力）。`principle_injection` 为**可选逃生舱**：仅当某条多子句规则确实
+      超长时才补一句忠实精华；正常情况正文够短就不必写。
+    - **退役源分两类（关键）**：
+      · `retired_ids`：纯重复、无独有细节的源 → 转 dynamic 自然衰减（仍可 recall）。
+      · `preserve_as_anchor_ids`：含**不可还原的核心事件/推导**的源 → 转 **anchor 永久保留**
+        （仅检索、不衰减）。因为新 standing 只留精简准则，这些细节**必须转 anchor，否则会随
+        dynamic 衰减丢失**。拿不准就放这里、别放 retired_ids。
+    - **只有用户明确同意后**才设 user_confirmed=True；否则先把方案（新正文 + 哪些退役/哪些转
+      anchor）讲给用户。未确认会被拒绝。
+    - 返回里看 retired_count / preserved_as_anchor / skipped——**skipped 非空说明有源没退役成功**
+      （比如 id 错或非 permanent），别以为有 new_standing_id 就万事大吉。
+    一次合并一组；多组多次调用。
     """
     if _ob_client is None:
         return _ob_unavailable()
-    if not str(principle_injection or "").strip():
-        return "未执行：standing 必须带一句 principle_injection（注入用的忠实精华，承载完整约束力）。"
     if not user_confirmed:
         return (
-            "未执行：standing 合并必须先与用户确认。请把你的合并方案（新准则正文 + 注入摘要 + "
-            "将退役的原条目）讲给用户，得到明确同意后再以 user_confirmed=True 调用。"
+            "未执行：standing 合并必须先与用户确认。请把你的合并方案（新准则精简正文 + 哪些源"
+            "退役为 dynamic / 哪些转 anchor 保留）讲给用户，得到明确同意后再以 user_confirmed=True 调用。"
         )
     try:
         result = await _ob_client.commit_standing_merge(
             merged_content=merged_content,
             retired_ids=retired_ids or [],
+            preserve_as_anchor_ids=preserve_as_anchor_ids or [],
             title=title,
             domain=domain,
             principle_injection=principle_injection,
