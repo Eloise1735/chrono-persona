@@ -1248,6 +1248,7 @@ class OBClient:
         retired_ids: list[str],
         title: str = "",
         domain: list[str] | None = None,
+        principle_injection: str = "",
     ) -> dict[str, Any]:
         """Create ONE new merged standing_invariant absorbing several originals,
         then retire those originals to type=dynamic (auto-decay, still recallable).
@@ -1256,6 +1257,11 @@ class OBClient:
         standing (review_standing). Retired originals are NOT deleted — they drop
         to dynamic with a `retired_from=standing` marker and fade naturally (I2).
         Non-merged standing entries are simply left out of retired_ids and stay.
+
+        `principle_injection` is the one-line faithful essence injected every turn
+        (get_current_state prefers it over full content). For a standing it MUST
+        carry the rule's full binding force — it is what the character actually
+        sees, so a dropped clause = a boundary that can be violated.
         """
         merged_content = str(merged_content or "").strip()
         if not merged_content:
@@ -1275,6 +1281,8 @@ class OBClient:
                 "role": self.ROLE_STANDING,
                 "source_kind": "standing_merge",
                 "merged_from": retired_ids,
+                "principle_title": str(title or "").strip(),
+                "principle_injection": str(principle_injection or "").strip(),
             },
         )
         retired: list[str] = []
