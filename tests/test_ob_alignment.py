@@ -1848,7 +1848,7 @@ def test_list_injectable_principles_groups_by_role():
         grouped = await client.list_injectable_principles()
         assert [b.id for b in grouped["standing"]] == [s]  # all standing injected
         ev_ids = [b.id for b in grouped["evolving"]]
-        assert len(ev_ids) == 5  # newest 5 of 7
+        assert len(ev_ids) == 3  # newest 3 of 7 (EVOLVING_PRINCIPLE_INJECT_LIMIT)
         assert evolving_ids[6] in ev_ids and evolving_ids[0] not in ev_ids
         # anchor never enters injection
         assert anchor not in {b.id for b in grouped["standing"] + grouped["evolving"]}
