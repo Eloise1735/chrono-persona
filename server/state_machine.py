@@ -5367,11 +5367,10 @@ class StateMachine:
                 or bucket_id
                 or "principle"
             )
-            domains = ", ".join(str(d) for d in meta.get("domain", []) if str(d).strip())
-            tags = ", ".join(str(t) for t in meta.get("tags", [])[:4] if str(t).strip())
-            created = str(meta.get("created") or "").strip()[:16]
-            label_parts = [part for part in [f"id={bucket_id}" if bucket_id else "", created, domains, f"tags={tags}" if tags else ""] if part]
-            label = f"（{' | '.join(label_parts)}）" if label_parts else ""
+            # Keep only the id as a reference handle. date / domain / tags are
+            # bookkeeping the character doesn't need to understand a principle,
+            # and they repeat on every entry — a lossless token cut.
+            label = f"（id={bucket_id}）" if bucket_id else ""
             injection = str(meta.get("principle_injection") or "").strip()
             if not injection:
                 card = meta.get("principle_card") if isinstance(meta.get("principle_card"), dict) else {}

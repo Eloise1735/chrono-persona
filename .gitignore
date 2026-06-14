@@ -3,6 +3,9 @@ config.yaml
 data/
 *.db
 
+# 私人召回评测真值集（含个人记忆内容，切勿提交；提交 .example 版即可）
+scripts/recall_gold.json
+
 # Python
 .venv/
 venv/

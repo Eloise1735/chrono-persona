@@ -1,210 +1,67 @@
-# 凯尔希意向状态机 (Kal'tsit State Machine)
+# chrono-persona / OmbreBrain
 
-为 rikkahub 或其他前端提供凯尔希角色的持久化记忆与时间感知系统。
+**面向长期陪伴 Agent 的记忆与状态系统。**
+基于 MCP 协议，给没有跨对话记忆的 AI Agent 装上一套会沉淀、会遗忘、会回想的长期记忆——让每次新对话不是从零重建，而是接续上一次。
 
-## 快速开始
+> 已稳定运行 3 个月，承载 900+ 条活跃记忆与 370+ 个状态快照；通过一组 MCP 工具接入任意支持 MCP 的对话端。
 
-### 1. 安装依赖
+---
 
-```bash
-pip install -r requirements.txt
-```
+## 它解决什么
 
-### 2. 配置
+对话式 AI 关掉窗口、记忆就清零。对"长期陪伴 / 协作"型 Agent，这带来三个真实痛点：**状态断裂**（每次都要重新交代背景）、**记忆不可控**（要么全记淹没重点、要么全忘）、**上下文丢失**（要紧的事和随口一提被同等对待）。
 
-编辑 `config.yaml`，填入你的 LLM API 信息：
+chrono-persona 是补在 LLM 与应用之间的**记忆中间件**：不替代官方的"身份记忆"，专管*时间里发生的事*——你们聊过什么、经历了什么、哪些还悬着没解决。
 
-```yaml
-llm:
-  api_base: "https://your-api-provider.com/v1"
-  api_key: "your-api-key"
-  model: "your-model-name"
-```
+> 由来：以开源项目 **Ombre Brain** 的 `breath`（自动衰减 + 自然浮现）机制为起点，重写了存储结构、稳定层与角色自主生活联动——把记忆从"机械分层打分"改造成"自然代谢"。
 
-### 3. 启动服务
+---
 
-```bash
-python -m server.main
-```
+## 核心设计：两条独立的线
 
-> **升级现有部署（B1 快照排序修复）**：从旧版本升级时，`state_snapshots.created_at` 历史行可能混用 `...Z` 与 `+08:00` 两种字面量，会让排序错乱（参见 `docs/fix_plan_snapshot_loop.md` 出血点 3）。**首次启动前**请执行一次幂等回填脚本，把所有历史行规范化为 UTC `Z` 格式：
->
-> ```bash
-> # 先 dry-run 看影响范围
-> python migrate/normalize_snapshot_created_at.py --db ./data/kelsey.db --dry-run
-> # 确认无误后正式回填
-> python migrate/normalize_snapshot_created_at.py --db ./data/kelsey.db
-> ```
->
-> 脚本复用 `Database.repair_snapshot_timezones()`，可多次重跑，已规范化的行会被跳过。
+- **用户端 · 分层记忆** —— 系统*记住*了什么。
+- **角色端 · 自主生活** —— 角色在两次对话之间*经历*了什么（后台轮询推进快照与日程，带熔断保护）。
 
-服务启动后：
-- Web 管理面板: http://localhost:8000
-- 历史记录: http://localhost:8000/history
-- 关键记录: http://localhost:8000/key-records
-- 日程表: http://localhost:8000/schedule
-- NPC 管理: http://localhost:8000/npcs
-- MCP SSE 端点: http://localhost:8000/mcp/sse
-- REST API: http://localhost:8000/api/
-- 向量管理: http://localhost:8000/vectors
+### 分层记忆（三层 + 稳定层按 `role` 细分）
 
-### 云服务器访问（公网部署）
+| 层 | 记什么 | 边界 |
+|---|---|---|
+| 事件层 Event | 对话中发生的具体事件、状态快照 | 随时间衰减 |
+| 感受层 Feel | 模型自己的感受、留下的疑问 | 独立衰减、独立检索 |
+| 稳定档案层 Stable | 长期边界 / 共识 / 相处模式 / 珍贵锚点 | **豁免遗忘**，与时间无关 |
 
-当服务运行在云服务器上时，请把 `localhost` 替换成你的公网 IP（或域名）：
+稳定层内部再分三级：`standing`（每轮必注入的边界共识）→ `evolving`（按新近上浮的关系原则）→ `anchor`（仅可检索的珍贵事件）。感受经提炼向上滚动，旧原则被新结晶顶出后回落为 anchor——**近景会呼吸，中景靠提炼上浮，远端沉成永不遗忘的锚点。**
 
-- Web 管理面板：`http://47.115.35.155:8000`
-- MCP SSE：`http://47.115.35.155:8000/mcp/sse`
-- MCP Streamable HTTP（兼容入口）：`http://47.115.35.155:8000/mcp-http`
+---
 
-已提供一键入口脚本：
+## 关键机制
 
-- 双击 `deploy/open_web.bat`：自动打开 `deploy/web_url.txt` 中配置的地址
-- 你可以直接编辑 `deploy/web_url.txt` 的第一行来替换为新的公网地址
-- 也可命令行调用：
-  - `deploy/open_web.bat http://47.115.35.155:8000`
-  - `deploy/open_web.bat 47.115.35.155 8000`
+- **衰减评分** —— 基于遗忘曲线的指数衰减 + 回想强化（情绪越强、越常被想起，衰减越慢）。
+- **混合召回** —— 向量语义 + 关键词双通道，一致性加成融合（思想同 RRF），相关性主导 + 门槛式过滤。
+  *经 20 条真实 gold set 的生产口径 A/B 验证：recall@5 20% → 85%（McNemar p=0.0002，227 测试零回归）。*
+- **晋升 / 结晶** —— 反复出现的感受聚类、提炼为稳定原则；源数据永不销毁，只降权、始终可检索。
+- **自主调度** —— 对话前后自动跑向量同步 / 人格演化 / 冷记忆整理；后台快照与日程推进带熔断器。
 
-## MCP 工具
+---
 
-| 工具 | 触发时机 | 说明 |
-|------|---------|------|
-| `get_current_state` | 对话开始 | 根据时间间隔生成状态快照序列，返回最新状态独白 |
-| `reflect_on_conversation` | 对话结束 | 基于对话摘要生成新快照和事件锚点 |
-| `recall_memories` | 对话中 | 搜索过往记忆（事件锚点+历史快照） |
-| `periodic_review`（REST） | 手动触发 | 基于自定义时间段生成阶段性生活与关系发展回顾 |
-| `upsert_key_record` | 对话中 | 写入/更新关键记录（关键日期/物品/协作/医疗建议） |
-| `recall_key_records` | 对话中 | 检索结构化关键记录 |
+## 技术栈
 
-### 对话模板建议（可复制到上游系统提示词）
+- **后端**：FastAPI（异步调度 + 熔断保护）
+- **存储**：SQLite + Markdown 记忆桶（可挂载 Obsidian）
+- **接入**：MCP 工具集（Streamable HTTP / SSE）
+- **检索**：向量语义 + 关键词双通道混合融合
+- **远程**：Cloudflare Tunnel ·  **管理台**：记忆 / 快照 / 向量 / 日程可视化治理
 
-当出现以下场景时，请优先使用关键记录工具：
+> 部署详见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
 
-- 用户询问或提及既有的**用药方案/剂量/频次/注意事项**
-- 用户提及**共同计划、生活安排、医疗嘱咐、待办清单**
-- 用户提及**纪念日、关键物品（礼物/信物）**且需要具体细节
+---
 
-推荐调用顺序：
+## Roadmap
 
-1. 先 `recall_key_records` 获取可执行细节（优先 `active`）
-2. 若本轮对话产生了新的可复用结构化信息（表格/清单/方案），调用 `upsert_key_record` 持久化
-3. 需要叙事背景时再补充 `recall_memories`（事件锚点）
+把记忆做成一套**代谢机制**——能晋升、能整理、能毕业：
 
-建议写入规范：
+- ✅ 晋升：感受可结晶为稳定原则并提升到豁免遗忘层
+- 🚧 顶层 compaction：稳定层自身的合并去重，避免无限堆积
+- 🚧 evolving 毕业：旧相处模式被新结晶顶出注入窗后，自动转为仅可检索的 anchor
 
-- `record_type` 明确使用：`important_date` / `important_item` / `key_collaboration` / `medical_advice`
-- `title` 用稳定短标题（便于后续更新命中）
-- `content_text` 保留完整可执行内容（可包含表格/步骤）
-- 有时效信息时填写 `start_date` / `end_date`
-
-## REST API
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/snapshots` | 快照列表 |
-| GET | `/api/snapshots/latest` | 最新快照 |
-| POST | `/api/snapshots` | 手动创建快照 |
-| GET | `/api/events` | 事件列表 |
-| POST | `/api/events` | 手动添加事件 |
-| PUT | `/api/events/{id}` | 编辑事件（描述/关键词） |
-| DELETE | `/api/events/{id}` | 删除事件 |
-| GET | `/api/key-records` | 关键记录列表（支持类型筛选） |
-| POST | `/api/key-records` | 添加关键记录 |
-| PUT | `/api/key-records/{id}` | 编辑关键记录 |
-| DELETE | `/api/key-records/{id}` | 删除关键记录 |
-| POST | `/api/key-records/search` | 搜索关键记录 |
-| GET | `/api/search?q=关键词` | 关键词搜索 |
-| GET | `/api/vectors/stats` | 向量库统计 |
-| GET | `/api/vectors/entries` | 向量条目列表 |
-| GET | `/api/vectors/settings` | 向量参数读取 |
-| PUT | `/api/vectors/settings` | 向量参数更新 |
-| POST | `/api/vectors/sync` | 向量同步/重建 |
-| POST | `/api/vectors/compact` | 冷记忆压缩（旧向量摘要合并） |
-| DELETE | `/api/vectors/entries/{entry_id}` | 删除向量条目 |
-| GET | `/api/runtime/llm` | 运行时 LLM 配置读取 |
-| PUT | `/api/runtime/llm` | 运行时 LLM 配置更新 |
-| GET | `/api/automation/latest` | 最近一次自动化执行报告 |
-| GET | `/api/automation/runs` | 自动化执行历史列表 |
-| GET | `/api/automation/token-summary` | 自动化 Token 汇总（今日/本周/累计） |
-| POST | `/api/state/current` | 测试 get_current_state |
-| POST | `/api/state/reflect` | 测试 reflect_on_conversation |
-| POST | `/api/memories/search` | 测试 recall_memories |
-| POST | `/api/review/periodic` | 生成阶段性回顾（可自定义起止日期） |
-| POST | `/api/import/bulk` | 一键批量导入（settings/snapshots/events/key_records） |
-| GET | `/api/plans/today` | 今日计划与计划项 |
-| GET | `/api/plans/history` | 历史计划列表 |
-| GET | `/api/plans/{id}` | 某个计划详情 |
-| PUT | `/api/plans/items/{id}` | 编辑计划项 |
-| POST | `/api/plans/generate` | 手动生成计划 |
-| POST | `/api/plans/replan` | 手动触发重规划 |
-| GET | `/api/npcs` | NPC 列表 |
-| GET | `/api/npcs/{id}` | NPC 详情 |
-| POST | `/api/npcs` | 创建 NPC |
-| PUT | `/api/npcs/{id}` | 更新 NPC |
-| GET | `/api/notifications` | 通知列表（支持 status） |
-| GET | `/api/notifications/history` | 通知历史 |
-| POST | `/api/notifications/{id}/read` | 标记通知已读 |
-
-## 配置项说明
-
-```yaml
-server:
-  host: "0.0.0.0"        # 监听地址
-  port: 8000              # 端口
-
-llm:
-  api_base: ""            # OpenAI 兼容 API 地址
-  api_key: ""             # API Key
-  model: ""               # 模型名称
-
-database:
-  path: "./data/kelsey.db"  # SQLite 数据库路径
-
-environment:
-  min_time_unit_hours: 24   # 最小时间单位（小时）
-  generator: "template"     # 环境生成器类型
-
-memory_store:
-  type: "vector"            # 记忆检索类型（vector 或 keyword）
-  max_snapshots: 7          # 最大保留快照数
-```
-
-向量记忆策略：
-- 已归档事件会进入向量化队列
-- 超过 `vector_snapshot_days_threshold`（默认14天）的快照会进入向量化队列
-- 若配置了 Embedding API，则优先使用远端 embedding；否则自动回退到本地 deterministic embedding
-- 检索评分融合：语义相似度 + 时间衰减 + 事件重要性/印象深度
-- 冷记忆压缩：对超过 `vector_cold_days_threshold` 的旧向量按分组摘要合并，降低噪声与堆积
-
-自动化编排（默认开启）：
-- 在 `get_current_state` / `reflect_on_conversation` 后自动执行：向量同步 → 阈值触发的人格演化 → 冷记忆压缩（按最小间隔）
-- 保留全部手动入口：`/vectors` 的同步、压缩、重建仍可随时手动触发
-- 自动执行后会在状态机返回文本尾部附加“自动记忆整理报告”
-- 仪表盘内置“自动化记忆整理（子面板）”，可查看最近一次执行结果与最近20条历史记录
-- 自动化报告包含本次完整流程的 LLM Token 统计（输入/输出/总计/请求次数）
-- 仪表盘新增可折叠“Token 汇总”卡片，展示今日/本周/累计 Token 与请求数
-- Token 汇总卡片支持按模型单价进行成本估算，并展示模型成本拆分（按 USD / 1M tokens 计）
-
-## 自主生活系统
-
-项目现已支持计划驱动的自主生活循环：
-
-- `PlanEngine`：生成每日计划、执行计划项、在对话或重大事件后重规划
-- `NPCEngine`：维护 NPC 实体并推演互动影响
-- `character_notifications`：角色主动给用户发送的消息队列
-- `web_search`：计划项中的联网搜索能力，当前优先兼容 Tavily
-
-网络搜索配置走运行时设置，不在 `config.yaml` 中：
-
-- `plan_web_search_enabled`
-- `plan_web_search_api_base`
-- `plan_web_search_api_key`
-
-如果使用 Tavily，推荐填：
-
-- `plan_web_search_enabled = true`
-- `plan_web_search_api_base = https://api.tavily.com/search`
-- `plan_web_search_api_key = <你的 Tavily Key>`
-
-## 测试指南
-
-完整测试步骤见 `TEST_GUIDE_AUTONOMOUS_LIFE.md`。
+> 设计蓝图见 [`docs/ob_consolidation_primitive_spec.md`](docs/ob_consolidation_primitive_spec.md)。

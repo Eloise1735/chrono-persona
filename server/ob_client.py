@@ -49,7 +49,7 @@ class OBClient:
     ROLE_STANDING = "standing_invariant"   # 边界/稳定偏好/重大共识；始终注入
     ROLE_ANCHOR = "anchor"                 # 原汁原味关键事件；仅 recall，不自动注入
     PERMANENT_ROLES = {ROLE_EVOLVING, ROLE_STANDING, ROLE_ANCHOR}
-    EVOLVING_PRINCIPLE_INJECT_LIMIT = 5    # evolving 注入窗（新近）
+    EVOLVING_PRINCIPLE_INJECT_LIMIT = 3    # evolving 注入窗（新近）
     # anchor 相册（spec §Phase3 块3）：anchor 是不可还原的珍贵事件，几乎不重复，
     # 不该 merge、也不该注入全文。get_current_state 只注入一份"相册目录"（主题关键词），
     # 提示模型在相关话题上自检索；细节走独立的 recall_anchors 路径。目录名额自动按
@@ -134,6 +134,17 @@ class OBClient:
         self.recall_vector_min = 0.50       # 向量语义最低门槛
         self.recall_time_nudge = 5.0        # 新近度只做小幅微调（远小于相关性的 ×100）
         self.recall_importance_nudge = 3.0  # 重要性只做小幅微调
+        # 混合检索一致性加成：向量与关键词**双通道都命中**时，按关键词相关性额外加分。
+        # 取代旧的 max(关键词, 向量) 纯择高——max 让"只命中向量"的近义干扰能压过
+        # "既语义相关又字面对得上"的真目标。加成奖励双通道一致性：真目标通常两边都中，
+        # 干扰项往往只中一边，于是真目标被抬到干扰项之上（思想同 RRF 倒数排名融合）。
+        self.recall_agreement_bonus = 100.0
+        # Q2 正文覆盖率保底：关键词只在正文命中时（被字段加权稀释到接近 0）的补偿权重。
+        self.recall_content_coverage_bonus = 0.3
+        # feel 可被内容召回（Fix 1）：feel 默认隔离在浮现/查询之外，但"回想某个特定旧感受"
+        # 是真实意图。于是 query 召回给 feel 保留至多 N 个槽位（自动、无需模型显式开关），
+        # 且 feel 召回为只读（不 touch、不改 last_active、不进衰减时钟）——零干扰其生命周期。
+        self.recall_feel_slots = 2
         self.permanent_dir = self.base_dir / "permanent"
         self.dynamic_dir = self.base_dir / "dynamic"
         self.archive_dir = self.base_dir / "archive"
@@ -408,13 +419,16 @@ class OBClient:
         # → 自然应该包含 character_life；否则默认排除。
         include_char_life = bool(include_character_life) or "character_life" in domains
 
-        if domains == {"feel"}:
-            return await self._feel_breath(
+        # domain="feel" 无查询 = 翻感受（按新近）；有查询 = 在 feel 内做内容召回。
+        if domains == {"feel"} and not query:
+            result = await self._feel_breath(
                 limit=limit,
                 date_window=date_window,
                 # 不显式包含 char_life 时，feel 池也禁止 char_life feel 渗透
                 max_character_life=1 if include_char_life else 0,
             )
+            await self._mark_surfaced(result)
+            return result
 
         if importance_min and not query:
             buckets = [
@@ -427,7 +441,9 @@ class OBClient:
             buckets.sort(key=lambda b: int(b.metadata.get("importance", 0) or 0), reverse=True)
             for bucket in buckets:
                 bucket.score = self.calculate_score(bucket.metadata)
-            return buckets[:limit]
+            result = buckets[:limit]
+            await self._mark_surfaced(result)
+            return result
 
         if query:
             selected = await self._query_breath(
@@ -439,18 +455,24 @@ class OBClient:
                 include_archive=include_archive,
                 date_window=date_window,
                 include_character_life=include_char_life,
+                feel_only=(domains == {"feel"}),
             )
             for bucket in selected:
-                await self.touch(bucket.id)
+                # feel 召回只读：不 touch（不加 activation、不刷 last_active），
+                # 零干扰 feel 的衰减/结晶生命周期。仅 dynamic/permanent 命中才强化。
+                if self._bucket_type(bucket.metadata) != "feel":
+                    await self.touch(bucket.id)
             return selected
 
-        return await self._surface_breath(
+        result = await self._surface_breath(
             limit=limit,
             domains=domains,
             include_core=include_core,
             date_window=date_window,
             include_character_life=include_char_life,
         )
+        await self._mark_surfaced(result)
+        return result
 
     def _normalize_date_window(
         self, date_from: str | None, date_to: str | None
@@ -731,6 +753,7 @@ class OBClient:
         if pin_feel is not None and pin_feel.id not in used_ids:
             personal.append(self._with_fixed_slot_marker(pin_feel, "current_feeling", "【当下感受】"))
             used_ids.add(pin_feel.id)
+        await self._mark_surfaced(personal)
         return {"personal": self.format_buckets(personal)}
 
     async def breath_bundle(self, *, top_k: int = 8, feel_top_k: int = 3) -> dict[str, Any]:
@@ -855,6 +878,7 @@ class OBClient:
         else:
             take_wander()
 
+        await self._mark_surfaced(personal + relational + free)
         return {
             "personal":   self.format_buckets(personal),
             "relational": self.format_buckets(relational),
@@ -1153,38 +1177,49 @@ class OBClient:
                 }
             except Exception:
                 logger.exception("anchor recall embedding search failed; lexical fallback.")
-        import difflib
-
         norm_q = self._normalize_for_dedupe(query)
         now = datetime.utcnow()
-        scored: list[tuple[float, OBBucket]] = []
+        # (rank_score, relevance01, bucket)：rank_score 与 _query_breath 同口径
+        # （相关性主导 + anchor 加权）；relevance01 ∈ [0,1] 是纯相关性，仅供展示。
+        scored: list[tuple[float, float, OBBucket]] = []
         for bucket in anchors:
-            if bucket.id in vector_scores:
-                relevance = vector_scores[bucket.id]
-            elif norm_q:
-                relevance = difflib.SequenceMatcher(
-                    None, norm_q, self._normalize_for_dedupe(bucket.content)
-                ).ratio()
-            else:
-                relevance = 0.0
-            arousal = self._clamp_float(bucket.metadata.get("arousal"), 0.0, 1.0, 0.3)
-            # emotion-weighted relevance; with no query, fall back to pure salience.
-            score = (relevance * (0.5 + 0.5 * arousal)) if norm_q else self._anchor_salience(bucket.metadata, now)
-            scored.append((score, bucket))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        top = [b for _, b in scored[:top_k]]
+            if not norm_q:
+                # 无查询 = 翻相册，按纯显著性（情绪/重要性）排。
+                s = self._anchor_salience(bucket.metadata, now)
+                scored.append((s, s, bucket))
+                continue
+            # 关键词通道：复用 breath 同款 _topic_score（token 命中率，name/tags/domain/正文
+            # 加权），而非旧版对整篇正文做 difflib 整串相似度（短查询 vs 长正文恒≈0）。
+            topic = self._topic_score(query, bucket)
+            vsim = float(vector_scores.get(bucket.id, 0.0))
+            relevance01 = max(topic, vsim)
+            # 门槛式（与 _query_breath 一致）：字面或向量任一达标才算相关，否则淘汰——
+            # 绝不让高 arousal 的无关 anchor 靠情绪挤上来（这是召回打分被反转的根因）。
+            if topic < float(self.recall_topic_min) and vsim < float(self.recall_vector_min):
+                continue
+            # 相关性主导打分（_search_score：topic 为主，time/importance 微调）；向量达标取 max。
+            # 不再用 difflib、也不再把 arousal 当乘数翻转排序。
+            score = self._search_score(bucket, query, None, None, now)
+            if vsim >= float(self.recall_vector_min):
+                score = max(score, vsim * 100.0)
+                if topic >= float(self.recall_topic_min):
+                    score += topic * float(self.recall_agreement_bonus)
+            score *= self.ANCHOR_RECALL_BOOST  # anchor 是珍贵记忆：相关时小幅加权
+            scored.append((score, relevance01, bucket))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        top = scored[:top_k]
         revisited = now.isoformat()
-        for bucket in top:
+        for _, _, bucket in top:
             await self.update(bucket.id, last_revisited=revisited)
         out = []
-        for score, bucket in scored[:top_k]:
+        for _, relevance01, bucket in top:
             meta = bucket.metadata or {}
             out.append({
                 "id": bucket.id,
                 "name": meta.get("name") or bucket.id,
                 "domain": meta.get("domain", []),
                 "arousal": self._clamp_float(meta.get("arousal"), 0.0, 1.0, 0.3),
-                "relevance": round(float(score), 4),
+                "relevance": round(float(relevance01), 4),
                 "created": meta.get("created", ""),
                 "content": self._strip_wikilinks(bucket.content),
             })
@@ -1222,6 +1257,8 @@ class OBClient:
         retired_ids: list[str],
         title: str = "",
         domain: list[str] | None = None,
+        principle_injection: str = "",
+        preserve_as_anchor_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create ONE new merged standing_invariant absorbing several originals,
         then retire those originals to type=dynamic (auto-decay, still recallable).
@@ -1230,6 +1267,11 @@ class OBClient:
         standing (review_standing). Retired originals are NOT deleted — they drop
         to dynamic with a `retired_from=standing` marker and fade naturally (I2).
         Non-merged standing entries are simply left out of retired_ids and stay.
+
+        `principle_injection` is the one-line faithful essence injected every turn
+        (get_current_state prefers it over full content). For a standing it MUST
+        carry the rule's full binding force — it is what the character actually
+        sees, so a dropped clause = a boundary that can be violated.
         """
         merged_content = str(merged_content or "").strip()
         if not merged_content:
@@ -1249,12 +1291,44 @@ class OBClient:
                 "role": self.ROLE_STANDING,
                 "source_kind": "standing_merge",
                 "merged_from": retired_ids,
+                "principle_title": str(title or "").strip(),
+                "principle_injection": str(principle_injection or "").strip(),
             },
         )
+        preserve_ids = list(dict.fromkeys(
+            self._safe_id(x) for x in (preserve_as_anchor_ids or []) if str(x or "").strip()
+        ))
+        # Sources carrying irreplaceable detail are PRESERVED as anchors
+        # (recall-only, never decays). Critical now that standing keeps only a
+        # concise rule: the rich derivation / core event must survive somewhere,
+        # not be lost to a decaying dynamic.
+        preserved: list[str] = []
+        for aid in preserve_ids:
+            bucket = await self.get(aid)
+            if bucket and aid != new_id and self._bucket_type(bucket.metadata) == "permanent":
+                await self.update(
+                    aid,
+                    role=self.ROLE_ANCHOR,
+                    pinned=False,
+                    protected=False,
+                    converted_from="standing_merge",
+                    converted_into=new_id,
+                    converted_at=now,
+                )
+                preserved.append(aid)
+        # Pure duplicates (no unique detail) retire to dynamic and fade. Honor the
+        # explicitly-named ids for ANY permanent source — not just role==standing.
+        # The old role==standing guard silently skipped legacy-pinned sources
+        # (effective_role fell back to evolving), which is why earlier merges
+        # created the new bucket but never actually retired the originals.
         retired: list[str] = []
+        skipped: list[str] = []
+        preserve_set = set(preserved)
         for rid in retired_ids:
+            if rid in preserve_set:
+                continue
             bucket = await self.get(rid)
-            if bucket and self.effective_role(bucket.metadata) == self.ROLE_STANDING:
+            if bucket and rid != new_id and self._bucket_type(bucket.metadata) == "permanent":
                 await self.update(
                     rid,
                     type="dynamic",
@@ -1267,10 +1341,14 @@ class OBClient:
                     retired_at=now,
                 )
                 retired.append(rid)
+            else:
+                skipped.append(rid)
         return {
             "new_standing_id": new_id,
             "retired": retired,
             "retired_count": len(retired),
+            "preserved_as_anchor": preserved,
+            "skipped": skipped,
         }
 
     async def _query_breath(
@@ -1284,16 +1362,22 @@ class OBClient:
         include_archive: bool,
         date_window: tuple[datetime | None, datetime | None] | None = None,
         include_character_life: bool = True,
+        feel_only: bool = False,
     ) -> list[OBBucket]:
         window = date_window or (None, None)
-        buckets = [
-            b for b in await self.list_buckets(include_archive=include_archive)
-            if self._bucket_type(b.metadata) != "feel"
-            and not b.metadata.get("pinned")
-            and not b.metadata.get("protected")
-        ]
-        if domains:
-            buckets = [b for b in buckets if self._matches_domains(b, domains)]
+        all_buckets = await self.list_buckets(include_archive=include_archive)
+        if feel_only:
+            # 显式 feel 内容召回：只搜 feel（domain 过滤不适用——feel 的 domain 多为 []）。
+            buckets = [b for b in all_buckets if self._bucket_type(b.metadata) == "feel"]
+        else:
+            # 混合召回：含 feel（不再整类排除——Fix 1），feel 在选取阶段限额。
+            buckets = [
+                b for b in all_buckets
+                if not b.metadata.get("pinned")
+                and not b.metadata.get("protected")
+            ]
+            if domains:
+                buckets = [b for b in buckets if self._matches_domains(b, domains)]
         if window != (None, None):
             buckets = [b for b in buckets if self._bucket_in_date_window(b, window)]
         if not include_character_life:
@@ -1318,7 +1402,10 @@ class OBClient:
                 continue
             score = self._search_score(bucket, query, valence, arousal, now)
             if vsim >= float(self.recall_vector_min):
+                # 混合融合：向量为主，双通道都命中再加关键词一致性加成（取代纯 max）。
                 score = max(score, vsim * 100.0)
+                if topic >= float(self.recall_topic_min):
+                    score += topic * float(self.recall_agreement_bonus)
             # anchors are privileged precious memories: when relevant they should
             # surface MORE readily, not less — keyword recall is a kept channel,
             # the album index is just an extra direct lane (the two coexist).
@@ -1328,7 +1415,20 @@ class OBClient:
             scored.append(bucket)
 
         scored.sort(key=lambda b: b.score, reverse=True)
-        return scored[:limit]
+        if feel_only:
+            return scored[:limit]
+        # 混合召回：feel 可被内容召回，但至多占 recall_feel_slots 个槽，避免淹没 dynamic。
+        selected: list[OBBucket] = []
+        feel_used = 0
+        for b in scored:
+            if len(selected) >= limit:
+                break
+            if self._bucket_type(b.metadata) == "feel":
+                if feel_used >= int(self.recall_feel_slots):
+                    continue
+                feel_used += 1
+            selected.append(b)
+        return selected
 
     async def grow(
         self,
@@ -2105,6 +2205,30 @@ class OBClient:
         if content_changed:
             self._schedule_embedding_upsert(bucket_id, content)
         return True
+
+    async def _mark_surfaced(self, buckets: list[OBBucket]) -> None:
+        """方案 C：统计「自然浮现」这条通路的'被读到'，与「查询命中」(activation_count
+        / touch) 严格分开——两者是不同的记忆机制。
+
+        纯统计：surface_count / last_surfaced **不参与** calculate_score、**不刷**
+        last_active，因此不会制造"被浮现 → 分更高 → 更容易再浮现"的滚雪球（零反应性，
+        即方案 C 的"隔离 + 弱反应"）。只用于检索健康度体检的覆盖率口径修正。
+        """
+        now = datetime.utcnow().isoformat()
+        seen: set[str] = set()
+        for bucket in buckets or []:
+            bid = getattr(bucket, "id", None)
+            if not bid or bid in seen:
+                continue
+            seen.add(bid)
+            try:
+                current = await self.get(bid)
+                if current is None:
+                    continue
+                count = float((current.metadata or {}).get("surface_count", 0) or 0)
+                await self.update(bid, surface_count=round(count + 1, 1), last_surfaced=now)
+            except Exception:
+                logger.debug("mark_surfaced failed for %s", bid, exc_info=True)
 
     async def archive(self, bucket_id: str) -> bool:
         return await self.update(bucket_id, type="archived", pinned=False)
@@ -2893,7 +3017,17 @@ class OBClient:
             token_hits = sum(1 for token in tokens if token in t)
             token_score = token_hits / max(1, len(tokens))
             score += max(direct, ratio, token_score) * weight
-        return score / total_weight if total_weight else 0.0
+        weighted = score / total_weight if total_weight else 0.0
+        # Q2 全字段 token 覆盖率：标题/标签命中走上面的加权（更精准、分更高）；但若关键词
+        # 只落在正文（weight=1，被 /8.5 稀释到接近 0），这里给一个**不被字段权重稀释**的
+        # 覆盖率保底分——"这些词到底在不在这条记忆里"。两者相加，正文命中不再被埋。
+        if tokens:
+            uniq = set(tokens)
+            haystack = " ".join(text.lower() for text, _ in chunks)
+            covered = sum(1 for tk in uniq if tk in haystack) / len(uniq)
+        else:
+            covered = 0.0
+        return min(1.0, weighted + covered * float(self.recall_content_coverage_bonus))
 
     @staticmethod
     def _emotion_score(valence: float | None, arousal: float | None, meta: dict[str, Any]) -> float:

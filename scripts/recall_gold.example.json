@@ -1,0 +1,13 @@
+{
+  "_README": [
+    "召回评测 gold set 示例。复制为 scripts/recall_gold.json 并填入你自己的真值后使用。",
+    "每条 = 一个查询 + 期待被召回的记忆（真值）。expect 填 bucket id 或 name/正文子串；",
+    "多个 expect = 任一进 top-k 即算命中。建议 15~30 条，查询用模型真实会发的关键词形式。",
+    "跑：python scripts/recall_eval.py"
+  ],
+  "cases": [
+    {"query": "部署 配置 docker 端口", "expect": ["把这里换成目标记忆的 id 或标题子串"], "note": "示例：部署相关记忆"},
+    {"query": "向量 检索 门槛 融合", "expect": ["..."], "note": "示例：检索机制相关记忆"},
+    {"query": "熔断器 调度 失败 退避", "expect": ["..."], "note": "示例：后台调度相关记忆"}
+  ]
+}

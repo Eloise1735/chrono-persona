@@ -3,9 +3,7 @@
 Tools:
   - get_current_state: Called at conversation start
   - reflect_on_conversation: Called at conversation end
-  - recall_memories: Called proactively during conversation for memory retrieval
   - upsert_key_record: Store structured key records during conversation, defaulting to automatic classification into the new 10-type taxonomy
-  - recall_key_records: Called proactively during conversation for structured record retrieval
   - upsert_world_book: Store stable profile/world-book facts that rarely change
   - recall_world_book: Called proactively for stable profile/background lookup
   - schedule_bundle: Read or directly edit the backend daily schedule from the conversation frontend
@@ -31,17 +29,17 @@ OB startup protocol:
 
 Proactive memory policy — call recall tools on your own initiative, do not wait for the user to ask:
   1) When the conversation touches a person, place, object, date, or event that may have a history,
-     call recall_memories BEFORE responding, so your reply can naturally reference or connect to the past.
-  2) When the conversation involves medications, plans, appointments, progress, or expiring actionable details,
-     call recall_key_records FIRST to retrieve the relevant structured state.
+     call breath(query=...) BEFORE responding, so your reply can naturally reference or connect to the past.
+  2) Structured key records (medications, plans, appointments, expiring actionable details) are
+     auto-injected by get_current_state at conversation start — reference them directly; no active recall call needed.
   2b) When the conversation involves stable attributes, preferences, body/profile baselines, or background facts,
       call recall_world_book FIRST; do not use key_records for stable profile facts.
   3) When an emotion, situation, or topic the user describes reminds you of something — even vaguely —
-     call recall_memories to check whether there is a relevant past event or state snapshot.
+     call breath(query=...) to check whether there is a relevant past event, feeling, or snapshot.
   3c) When the conversation touches one of the themes in the injected「珍贵记忆·相册目录」
       (the anchor album index), or a precious shared experience between you two, call
       recall_anchors to open that page of the album — anchors are a separate, privileged
-      recall path from recall_memories.
+      recall path from the normal breath query.
   4) Do NOT wait for the user to say "do you remember" or "we talked about this before".
      Proactive recall is what makes memory feel alive.
   5) If conversation produces a narrative memory worth keeping, call hold / hold_feel in OB.
@@ -202,6 +200,79 @@ def _parse_plan_item_payload(raw: str) -> dict:
         return value if isinstance(value, dict) else {}
     except Exception:
         return {}
+
+
+def _compact_bucket_rows(rows: list[dict]) -> list[dict]:
+    """Strip OB bucket dicts to the model-facing essentials (id + content + date).
+
+    Drops the metadata blob / path / score / feel_decay diagnostic — internal
+    bookkeeping the model never acts on — which is the bulk of init-injection
+    tokens. Lossless for the reader: the model acts via id and reads content.
+    """
+    out: list[dict] = []
+    for r in rows or []:
+        meta = r.get("metadata") or {}
+        row: dict = {"id": r.get("id"), "content": r.get("content")}
+        date = str(meta.get("created") or "")[:10]
+        if date:
+            row["date"] = date
+        out.append(row)
+    return out
+
+
+_SCHEDULE_PLAN_DROP_FIELDS = {"raw_plan"}  # full duplicate of items; never inject
+
+
+def _compact_schedule_plan(plan: dict | None) -> dict | None:
+    """Drop raw_plan (a full JSON duplicate of items) and empty fields."""
+    if not plan:
+        return plan
+    return {
+        k: v for k, v in plan.items()
+        if k not in _SCHEDULE_PLAN_DROP_FIELDS and v not in (None, "", [], {})
+    }
+
+
+_SCHEDULE_ITEM_KEEP = ("id", "hour_start", "hour_end", "activity", "status")
+
+
+def _compact_schedule_items(items: list[dict]) -> list[dict]:
+    """Compact a day's schedule for the init read: the character needs time +
+    activity + status, plus a one-line objective and step progress. The heavy
+    action_payload scaffolding (progress_outline / dominant_mode / constraint_*
+    / flexibility / failure_cost / closure_condition / source_* …) is planning
+    machinery — it lives in the DB and breath_personal, not in every init.
+    """
+    out: list[dict] = []
+    for it in items or []:
+        it = it or {}
+        ap = it.get("action_payload")
+        ap = ap if isinstance(ap, dict) else {}
+        row: dict = {k: it.get(k) for k in _SCHEDULE_ITEM_KEEP}
+        objective = ap.get("intended_objective") or ap.get("objective")
+        if objective:
+            row["objective"] = objective
+        cur, exp, ps = ap.get("current_step"), ap.get("expected_steps"), ap.get("progress_status")
+        progress = []
+        if cur is not None and exp is not None:
+            progress.append(f"{cur}/{exp}")
+        if ps:
+            progress.append(str(ps))
+        if progress:
+            row["progress"] = " ".join(progress)
+        if ap.get("thread_id"):
+            row["thread_id"] = ap.get("thread_id")
+        out.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
+    return out
+
+
+def _log_inject_size(block: str, text: str) -> None:
+    """Per-block init-injection size instrumentation (chars), so the token
+    budget is optimised by data, not guesswork (profile/breath/state/schedule)."""
+    try:
+        logger.info("INJECT_SIZE block=%s chars=%d", block, len(text or ""))
+    except Exception:
+        pass
 
 
 def _schedule_item_dict(item: PlanItem) -> dict:
@@ -448,6 +519,7 @@ async def get_current_state(current_time: str, last_interaction_time: str | None
     except Exception as exc:
         tracer.finish_error(exc)
         raise
+    _log_inject_size("get_current_state", result)
     if _evolution_engine is None:
         tracer.finish_ok(evolution_check="skipped")
         notifications = await _state_machine.db.list_character_notifications(status="pending", limit=10)
@@ -564,14 +636,16 @@ async def schedule_bundle(
             result = {
                 "ok": True,
                 "action": mode,
-                "plan": plan_payload,
-                "items": item_payload,
+                "plan": _compact_schedule_plan(plan_payload),
+                "items": _compact_schedule_items(item_payload),
             }
             if include_history:
                 limit = max(1, min(50, int(history_limit or 10)))
                 history = await db.list_daily_plans(offset=0, limit=limit)
-                result["history"] = [item.model_dump() for item in history]
-            return json.dumps(result, ensure_ascii=False, indent=2)
+                result["history"] = [_compact_schedule_plan(item.model_dump()) for item in history]
+            out = json.dumps(result, ensure_ascii=False)
+            _log_inject_size("schedule_bundle", out)
+            return out
 
         if mode == "edit_item":
             target_item_id = int(item_id or 0)
@@ -677,7 +751,8 @@ async def reflect_on_conversation(conversation_summary: str) -> str:
         raise
 
 
-@mcp.tool()
+# Deprecated & 不再注册为 MCP 工具（防止模型误触）。历史事件/快照召回已改走
+# OB breath(query=...) / recall_anchors；REST 仍调用 state_machine.recall_memories。
 async def recall_memories(query: str, top_k: int = 5) -> str:
     """对话中主动调用。搜索凯尔希的过往记忆（OB/历史记忆 + 历史状态快照）。
 
@@ -792,28 +867,36 @@ async def breath(
     )
     if not buckets:
         return "未浮现相关 OB 记忆。"
-    return json.dumps(_ob_client.format_buckets(buckets), ensure_ascii=False, indent=2)
+    out = json.dumps(
+        _compact_bucket_rows(_ob_client.format_buckets(buckets)),
+        ensure_ascii=False,
+    )
+    _log_inject_size("breath", out)
+    return out
 
 
 @mcp.tool()
 async def breath_bundle(top_k: int = 8, feel_top_k: int = 3) -> str:
-    """OB 初始化打包呼吸：固定 10 槽，三组结构。
+    """OB 初始化打包呼吸：固定 13 槽，三组结构。
 
-    返回三个 list 字段：
+    返回三个 list 字段（每条仅 id + content + date，省 token；情感/分数等内部信号不浮现）：
       - personal   (3)：「个人事件·当下进行」(最新 environment_event_summary)
                      + 「个人事件·近期总结」(最新 environment_life_rollup)
                      + 「当下感受」(最新 character_life feel)。
                      三者覆盖当下→近期→心境，让角色看到自己最近做了什么、连成什么、感受如何。
-      - relational (5)：3 条非 character_life dynamic + 2 条非 character_life feel，自然浮现关系侧。
-      - free       (2)：不限标签/类型，按 score 自由联想，与前 8 条去重。
+      - relational (8)：4 条非 character_life dynamic + 4 条 feel，自然浮现关系侧。
+      - free       (2)：槽 A 纯随机自由联想；槽 B 偶发回声（一条珍贵旧记忆，带【不期然想起】）。
 
     pinned/protected 原则卡由 get_current_state 注入，不在这里重复出现。
-    自然浮现不会 touch。参数 top_k / feel_top_k 保留为兼容签名但已不生效（固定 3+5+2=10）。
+    自然浮现不会 touch。参数 top_k / feel_top_k 保留为兼容签名但已不生效（固定 3+8+2=13）。
     """
     if _ob_client is None:
         return _ob_unavailable()
     result = await _ob_client.breath_bundle(top_k=top_k, feel_top_k=feel_top_k)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    compact = {group: _compact_bucket_rows(rows) for group, rows in result.items()}
+    out = json.dumps(compact, ensure_ascii=False)
+    _log_inject_size("breath_bundle", out)
+    return out
 
 
 @mcp.tool()
@@ -1259,35 +1342,45 @@ async def review_standing() -> str:
 async def commit_standing_merge(
     merged_content: str,
     retired_ids: list[str],
+    preserve_as_anchor_ids: list[str] | None = None,
+    principle_injection: str = "",
     title: str = "",
     domain: list[str] | None = None,
     user_confirmed: bool = False,
 ) -> str:
-    """把若干条重叠的「长期准则」合并成一条新准则，原条目退役为 dynamic 自然衰减。
+    """把若干条重叠的「长期准则」合并成一条新准则，原条目退役。
 
     这是**最重的一步、必须与用户确认**：合并的是必须守住的硬规则，有损合并会丢掉边界。
-    所以：
-    - merged_content 必须是你**读完全部 standing 后**亲自写的、把可合并几条忠实糅合的新正文
-      （不能漏掉任何一条的约束力）。retired_ids 是被这条吸收的原条目 id。
-    - **只有在用户明确同意这次合并后**，才设 user_confirmed=True 调用；否则先把你的合并方案
-      讲给用户、等确认。未确认会被拒绝。
-    - 退役的原条目不删除：转为普通 dynamic（带 retired_from=standing 标记）自然衰减、仍可
-      recall。不能合并的条目不要放进 retired_ids，它们保持 standing 不变。
-    一次只合并一组；多组分多次调用。
+    - merged_content：你**读完全部 standing 后**亲自写的新正文。standing 走"**单一精简正文**"
+      路线——一条 invariant 本质就短，请**一次写到位、控制在 ~300 字内**（准则本身即注入内容，
+      不能漏任何一条的约束力）。`principle_injection` 为**可选逃生舱**：仅当某条多子句规则确实
+      超长时才补一句忠实精华；正常情况正文够短就不必写。
+    - **退役源分两类（关键）**：
+      · `retired_ids`：纯重复、无独有细节的源 → 转 dynamic 自然衰减（仍可 recall）。
+      · `preserve_as_anchor_ids`：含**不可还原的核心事件/推导**的源 → 转 **anchor 永久保留**
+        （仅检索、不衰减）。因为新 standing 只留精简准则，这些细节**必须转 anchor，否则会随
+        dynamic 衰减丢失**。拿不准就放这里、别放 retired_ids。
+    - **只有用户明确同意后**才设 user_confirmed=True；否则先把方案（新正文 + 哪些退役/哪些转
+      anchor）讲给用户。未确认会被拒绝。
+    - 返回里看 retired_count / preserved_as_anchor / skipped——**skipped 非空说明有源没退役成功**
+      （比如 id 错或非 permanent），别以为有 new_standing_id 就万事大吉。
+    一次合并一组；多组多次调用。
     """
     if _ob_client is None:
         return _ob_unavailable()
     if not user_confirmed:
         return (
-            "未执行：standing 合并必须先与用户确认。请把你的合并方案（新准则正文 + 将退役的"
-            "原条目）讲给用户，得到明确同意后再以 user_confirmed=True 调用。"
+            "未执行：standing 合并必须先与用户确认。请把你的合并方案（新准则精简正文 + 哪些源"
+            "退役为 dynamic / 哪些转 anchor 保留）讲给用户，得到明确同意后再以 user_confirmed=True 调用。"
         )
     try:
         result = await _ob_client.commit_standing_merge(
             merged_content=merged_content,
             retired_ids=retired_ids or [],
+            preserve_as_anchor_ids=preserve_as_anchor_ids or [],
             title=title,
             domain=domain,
+            principle_injection=principle_injection,
         )
     except ValueError as exc:
         return f"错误：{exc}"
@@ -1408,7 +1501,8 @@ async def upsert_key_record(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+# Deprecated & 不再注册为 MCP 工具（防止模型误触）。关键记录由 get_current_state
+# 自动注入；REST 仍调用 state_machine.recall_key_records。
 async def recall_key_records(
     query: str,
     top_k: int = 5,
