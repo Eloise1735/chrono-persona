@@ -5332,6 +5332,10 @@ class StateMachine:
     PRINCIPLE_INJECT_CHARS_STANDING = 480
     PRINCIPLE_INJECT_CHARS_EVOLVING = 240
     PRINCIPLE_INJECT_TOTAL_BUDGET = 2400  # ~ combined principle chars before trimming evolving
+    # get_current_state maintenance nudge: only fire when backlog is real, so the
+    # model knows to dream/consolidate without the hint nagging every turn.
+    MAINT_HINT_DYNAMIC_THRESHOLD = 12
+    MAINT_HINT_FEEL_THRESHOLD = 25
     # evolving floor: standing renders in full and can blow the budget once it
     # accumulates (12+ entries). Without a floor, evolving — the relationship's
     # *current* mode — gets fully starved (Phase 1 trimmed evolving first). The
@@ -5442,7 +5446,36 @@ class StateMachine:
         ]
         if album_text:
             parts.extend(["", album_text])
+        maint_text = await self._build_maintenance_hint()
+        if maint_text:
+            parts.extend(["", maint_text])
         return "\n".join(parts)
+
+    async def _build_maintenance_hint(self) -> str:
+        """Surface OB backlog at conversation start so the model knows to
+        dream/consolidate later. Silent until backlog crosses a threshold — the
+        precise per-cluster hint still lives in dream()'s tail."""
+        if self.ob_client is None:
+            return ""
+        try:
+            pressure = await self.ob_client.maintenance_pressure()
+        except Exception:
+            logger.exception("Failed to compute OB maintenance pressure.")
+            return ""
+        dyn = int(pressure.get("undigested_dynamic") or 0)
+        feel = int(pressure.get("pending_feel") or 0)
+        bits: list[str] = []
+        if dyn >= self.MAINT_HINT_DYNAMIC_THRESHOLD:
+            bits.append(f"{dyn} 条未消化 dynamic")
+        if feel >= self.MAINT_HINT_FEEL_THRESHOLD:
+            bits.append(f"{feel} 条未结晶 feel")
+        if not bits:
+            return ""
+        return (
+            "【维护提示】OB 积压：" + "、".join(bits)
+            + "。对话结束或维护时用 dream() 浏览未消化 dynamic（末尾会提示成熟可结晶的 feel 簇），"
+            "据此 resolve_bucket / hold_feel / feel_crystals 整理；不必当下处理。"
+        )
 
     async def _build_anchor_album_context(self) -> str:
         """A compact "album table of contents" of anchor memories — topic

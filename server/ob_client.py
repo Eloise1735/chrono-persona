@@ -2118,6 +2118,32 @@ class OBClient:
             updates["resolved_reason"] = str(reason).strip()
         return await self.update(bucket_id, **updates)
 
+    async def maintenance_pressure(self) -> dict[str, int]:
+        """Cheap backlog counts (no clustering) for a get_current_state nudge to
+        dream/consolidate. The precise "N feel clusters ready" stays in dream().
+
+        - undigested_dynamic: relational dynamics awaiting dream/resolve
+          (character_life is its own rolled-up stream, excluded so it can't nag).
+        - pending_feel: active feels not yet crystallized / demoted / folded into
+          a crystal — grows while you skip consolidation, drops once you do it.
+        """
+        buckets = await self.list_buckets(include_archive=False)
+        undigested = 0
+        pending_feel = 0
+        for b in buckets:
+            meta = b.metadata or {}
+            t = self._bucket_type(meta)
+            if t == "dynamic":
+                if not (meta.get("resolved") or meta.get("digested")
+                        or meta.get("pinned") or meta.get("protected")
+                        or self._is_character_life_bucket(b)):
+                    undigested += 1
+            elif t == "feel":
+                if not (meta.get("crystallized") or meta.get("demoted")
+                        or str(meta.get("consolidated_into") or "").strip()):
+                    pending_feel += 1
+        return {"undigested_dynamic": undigested, "pending_feel": pending_feel}
+
     async def trace(self, bucket_id: str, **updates: Any) -> OBBucket | None:
         if updates.pop("delete", False):
             ok = await self.delete(bucket_id)
